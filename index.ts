@@ -16,7 +16,7 @@ import {
 import { loadSummaryLanguage } from "./language.js";
 import { formatFooter, resolvePolicy, type ContextMode } from "./policy.js";
 import { appendMode, hasLegacyThreshold, restoreMode } from "./session-state.js";
-import { summarizeCompaction, summarizeTree } from "./summary.js";
+import { russianCompaction, russianTreeSummary } from "./summary.js";
 
 type ContextCompletion = { value: string; label: string; description: string };
 type Scope = { sessionId: string; branch: string };
@@ -292,17 +292,15 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		const op = currentOperation(ctx);
 		if (op?.lifecycle === "running" && reason === "manual") {
 			if (event.willRetry) op.continuationSuppressed = true;
-			const custom = await summarizeCompaction(event, ctx, language);
-			if (custom) return custom;
+			if (language === "ru") return russianCompaction(event, ctx);
 			return;
 		}
 		if (event.willRetry && op) op.continuationSuppressed = true;
 		if (reason === "threshold" && op?.lifecycle === "pending") cancel(ctx, op);
 		external(ctx, "contained", reason, Boolean(event.willRetry), event.preparation?.tokensBefore);
-		const custom = await summarizeCompaction(event, ctx, language);
-		if (custom) return custom;
+		if (language === "ru") return russianCompaction(event, ctx);
 	});
-	pi.on("session_before_tree", async (event: any, ctx) => summarizeTree(event, ctx, language));
+	if (language === "ru") pi.on("session_before_tree", async (event: any, ctx) => russianTreeSummary(event, ctx));
 	pi.on("session_compact", async (event: any, ctx) => {
 		const reason = event.reason as AuditReason;
 		const op = currentOperation(ctx);
