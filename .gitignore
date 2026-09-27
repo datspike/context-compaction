@@ -1,0 +1,11 @@
+node_modules/
+__pycache__/
+.ruff_cache/
+.pytest_cache/
+*.pyc
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.runtime/
