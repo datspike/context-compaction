@@ -1,5 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import type { SummaryLanguage } from "./language.js";
 
 export type ContinuationMode = "explicit_prompt" | "plan_phase" | "resume_existing_plan" | "goal_loop" | "auto_context_pressure";
 
@@ -62,21 +63,25 @@ export interface CheckpointParams {
 	extraContext?: string;
 }
 
-/** Схема и prepareArguments сохранены совместимыми со старым tool. */
-export const CheckpointParamsSchema = Type.Object({
-	mainObjective: Type.String({ description: "Главная цель пользователя, которую нужно продолжить после compact." }),
-	completedCheckpoint: Type.String({ description: "Что уже завершено перед compact." }),
-	continuationMode: Type.Optional(StringEnum(["explicit_prompt", "plan_phase", "resume_existing_plan", "goal_loop", "auto_context_pressure"] as const)),
-	continuationTarget: Type.String({ description: "Следующий конкретный шаг после compact." }),
-	planPath: Type.Optional(Type.String()),
-	currentPhase: Type.Optional(Type.String()),
-	nextPhase: Type.Optional(Type.String()),
-	importantFiles: Type.Optional(Type.Array(Type.String())),
-	verificationState: Type.Optional(Type.String()),
-	blockers: Type.Optional(Type.String()),
-	doNotDo: Type.Optional(Type.Array(Type.String())),
-	extraContext: Type.Optional(Type.String()),
-});
+/** Defines the same tool arguments in both languages without changing parameter names. */
+export function checkpointParamsSchema(language: SummaryLanguage) {
+	const en = language === "en";
+	return Type.Object({
+		mainObjective: Type.String({ description: en ? "The main user objective to continue after compaction." : "Главная цель пользователя, которую нужно продолжить после compact." }),
+		completedCheckpoint: Type.String({ description: en ? "Work already completed before compaction." : "Что уже завершено перед compact." }),
+		continuationMode: Type.Optional(StringEnum(["explicit_prompt", "plan_phase", "resume_existing_plan", "goal_loop", "auto_context_pressure"] as const)),
+		continuationTarget: Type.String({ description: en ? "The next concrete step after compaction." : "Следующий конкретный шаг после compact." }),
+		planPath: Type.Optional(Type.String()),
+		currentPhase: Type.Optional(Type.String()),
+		nextPhase: Type.Optional(Type.String()),
+		importantFiles: Type.Optional(Type.Array(Type.String())),
+		verificationState: Type.Optional(Type.String()),
+		blockers: Type.Optional(Type.String()),
+		doNotDo: Type.Optional(Type.Array(Type.String())),
+		extraContext: Type.Optional(Type.String()),
+	});
+}
+export const CheckpointParamsSchema = checkpointParamsSchema("ru");
 
 export function prepareArguments(args: unknown): CheckpointParams {
 	const input = (args && typeof args === "object" ? args : {}) as Partial<CheckpointParams> & {
@@ -98,25 +103,32 @@ export function compactedSinceLastUserMessage(ctx: { sessionManager: { getBranch
 	return compact > user;
 }
 
-/** Создаёт structured ledger исключительно для ручного tool-вызова. */
-export function buildLedger(params: CheckpointParams): string {
+/** Builds the manual checkpoint ledger in the configured language. */
+export function buildLedger(params: CheckpointParams, language: SummaryLanguage = "ru"): string {
 	const optional = (name: string, value?: string) => value?.trim() ? `\n\n## ${name}\n${value.trim()}` : "";
 	const list = (name: string, value?: string[]) => value?.length ? `\n\n## ${name}\n${value.map((item) => `- ${item}`).join("\n")}` : "";
-	return `## Главная цель\n${params.mainObjective}\n\n## Завершённый checkpoint\n${params.completedCheckpoint}\n\n## Следующий шаг\n${params.continuationTarget}`
-		+ optional("Режим продолжения", params.continuationMode)
-		+ optional("План", [params.planPath, params.currentPhase, params.nextPhase].filter(Boolean).join("; "))
-		+ list("Важные файлы", params.importantFiles)
-		+ optional("Проверка", params.verificationState)
-		+ optional("Блокеры", params.blockers)
-		+ list("Не повторять", params.doNotDo)
-		+ optional("Дополнительный контекст", params.extraContext);
+	const names = language === "ru"
+		? ["Главная цель", "Завершённый checkpoint", "Следующий шаг", "Режим продолжения", "План", "Важные файлы", "Проверка", "Блокеры", "Не повторять", "Дополнительный контекст"]
+		: ["Main objective", "Completed checkpoint", "Next step", "Continuation mode", "Plan", "Important files", "Verification", "Blockers", "Do not repeat", "Additional context"];
+	return `## ${names[0]}\n${params.mainObjective}\n\n## ${names[1]}\n${params.completedCheckpoint}\n\n## ${names[2]}\n${params.continuationTarget}`
+		+ optional(names[3], params.continuationMode)
+		+ optional(names[4], [params.planPath, params.currentPhase, params.nextPhase].filter(Boolean).join("; "))
+		+ list(names[5], params.importantFiles)
+		+ optional(names[6], params.verificationState)
+		+ optional(names[7], params.blockers)
+		+ list(names[8], params.doNotDo)
+		+ optional(names[9], params.extraContext);
 }
 
-export function buildInstructions(ledger: string): string {
-	return `Сформируй компактную карточку продолжения текущей задачи. Сохрани цель, ограничения, изменения, проверки, блокеры и ближайший шаг. Не копируй пустые разделы.\n\n${ledger}`;
+export function buildInstructions(ledger: string, language: SummaryLanguage = "ru"): string {
+	const instruction = language === "ru"
+		? "Сформируй компактную карточку продолжения текущей задачи. Сохрани цель, ограничения, изменения, проверки, блокеры и ближайший шаг. Не копируй пустые разделы."
+		: "Write a concise continuation note in English. Preserve the objective, constraints, changes, checks, blockers and next action. Omit empty sections.";
+	return `${instruction}\n\n${ledger}`;
 }
 
-export function continuationPrompt(params: CheckpointParams): string {
+export function continuationPrompt(params: CheckpointParams, language: SummaryLanguage = "ru"): string {
+	if (language === "en") return `Continue the main objective from the next unfinished step in the summary: ${params.continuationTarget}.${params.continuationMode ? ` Continuation mode: ${params.continuationMode}.` : ""} Do not replan from scratch.`;
 	const mode = params.continuationMode ? ` Режим продолжения: ${params.continuationMode}.` : "";
 	return `Продолжи основную цель по краткой сводке с ближайшего незавершённого действия: ${params.continuationTarget}.${mode} Не перепланируй работу с нуля.`;
 }

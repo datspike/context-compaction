@@ -6,6 +6,7 @@ import {
 	type SessionBeforeCompactEvent,
 	type SessionBeforeTreeEvent,
 } from "@earendil-works/pi-coding-agent";
+import type { SummaryLanguage } from "./language.js";
 
 const SUMMARIZATION_SYSTEM_PROMPT = "You are a context summarization assistant. Do not continue the conversation. Output only the requested structured summary.";
 const DEFAULT_RESERVE_TOKENS = 16_384;
@@ -56,6 +57,33 @@ export const RUSSIAN_TREE_SUMMARY_INSTRUCTIONS = `Составь краткое 
 1. [Что нужно сделать дальше]
 
 Сохраняй точные пути, имена файлов, функции, команды и сообщения ошибок. Не продолжай разговор и не добавляй ответов на вопросы из истории; выведи только summary. Не создавай machine-readable блоки: Pi добавит их сам.`.trim();
+
+export const ENGLISH_COMPACTION_FOCUS = `Write all natural-language text in English. Preserve the standard checkpoint structure using ## Goal, ## Constraints & Preferences, ## Progress, ### Done, ### In Progress, ### Blocked, ## Key Decisions, ## Next Steps and ## Critical Context.
+For a split turn use ## Original Request, ## Progress So Far and ## Context Needed to Continue. Do not continue the conversation or answer questions from its history. Keep unfinished work, constraints, decisions and reasons, errors and information needed to continue. Preserve exact paths, filenames, commands, identifiers, function names, APIs, error messages and code. Do not generate <read-files> or <modified-files> blocks: Pi will add them.`;
+
+export const ENGLISH_TREE_SUMMARY_INSTRUCTIONS = `Summarize the branch in English so work can be resumed later. Use this structure:
+
+## Goal
+[What the user wanted to accomplish]
+
+## Constraints & Preferences
+- [Constraints and preferences, or (none)]
+
+## Progress
+### Done
+- [x] [Completed work]
+### In Progress
+- [ ] [Unfinished work]
+### Blocked
+- [Blockers, or (none)]
+
+## Key Decisions
+- **[Decision]**: [Reason]
+
+## Next Steps
+1. [Next action]
+
+Preserve exact paths, filenames, commands, functions, and error messages. Do not continue the conversation or add answers from its history. Do not create machine-readable blocks: Pi will add them.`;
 
 const SUMMARY_HEADINGS: Readonly<Record<string, string>> = {
 	"## Goal": "## Цель",
@@ -123,12 +151,14 @@ function hasStructuralHeading(summary: string, headings: string[]): boolean {
 	return classifySummaryLines(summary).some(({ line, protected: isProtected }) => !isProtected && headings.includes(line));
 }
 
-function hasLocalizedSummaryStructure(summary: string, allowSplitTurn: boolean): boolean {
-	return hasStructuralHeading(summary, allowSplitTurn ? ["## Цель", "## Исходный запрос"] : ["## Цель"]);
+function hasSummaryStructure(summary: string, language: SummaryLanguage, allowSplitTurn: boolean): boolean {
+	const goal = language === "ru" ? "## Цель" : "## Goal";
+	const original = language === "ru" ? "## Исходный запрос" : "## Original Request";
+	return hasStructuralHeading(summary, allowSplitTurn ? [goal, original] : [goal]);
 }
 
-function hasLocalizedPrefixStructure(summary: string): boolean {
-	return hasStructuralHeading(summary, ["## Исходный запрос"]);
+function hasPrefixStructure(summary: string, language: SummaryLanguage): boolean {
+	return hasStructuralHeading(summary, [language === "ru" ? "## Исходный запрос" : "## Original Request"]);
 }
 
 type FileOps = { read?: Set<string>; written?: Set<string>; edited?: Set<string> };
@@ -217,8 +247,8 @@ async function summarizeMessages(ctx: ExtensionContext, messages: any[], instruc
 	return completeSummary(ctx, conversationPrompt(messages, instructions, previousSummary), maxTokens, signal);
 }
 
-async function summarizeTurnPrefix(ctx: ExtensionContext, messages: any[], signal: AbortSignal, maxTokens: number): Promise<SummaryResponse> {
-	const instructions = `Это ранняя часть пользовательского хода, а его недавняя часть сохранена отдельно. Составь краткий контекст для продолжения на русском языке и используй ровно этот формат:
+async function summarizeTurnPrefix(ctx: ExtensionContext, messages: any[], signal: AbortSignal, maxTokens: number, language: SummaryLanguage): Promise<SummaryResponse> {
+	const instructions = language === "ru" ? `Это ранняя часть пользовательского хода, а его недавняя часть сохранена отдельно. Составь краткий контекст для продолжения на русском языке и используй ровно этот формат:
 
 ## Исходный запрос
 [Что пользователь просил в этом ходу]
@@ -229,45 +259,60 @@ async function summarizeTurnPrefix(ctx: ExtensionContext, messages: any[], signa
 ## Контекст для продолжения
 - [Что нужно знать, чтобы понять сохранённую недавнюю часть]
 
-Сохраняй точные пути, команды, имена функций и сообщения ошибок. Выведи только summary.`;
+Сохраняй точные пути, команды, имена функций и сообщения ошибок. Выведи только summary.`
+		: `This is the early part of a user turn; its recent part is preserved separately. Summarize the context needed to continue in English, using exactly this format:
+
+## Original Request
+[What the user requested]
+
+## Progress So Far
+- [Decisions and actions in the early part]
+
+## Context Needed to Continue
+- [What is needed to understand the preserved recent part]
+
+Preserve exact paths, commands, function names and error messages. Output only the summary.`;
 	return summarizeMessages(ctx, messages, instructions, undefined, maxTokens, signal);
 }
 
-/**
- * Генерирует русское summary для automatic/manual compaction через runtime-routed API.
- * При любой ошибке возвращает undefined, чтобы Pi использовал штатный summarizer.
- */
-export async function russianCompaction(event: SessionBeforeCompactEvent, ctx: ExtensionContext): Promise<{ compaction: any } | undefined> {
+/** Generates a localized summary for compact, falling back to Pi on failure. */
+export async function summarizeCompaction(event: SessionBeforeCompactEvent, ctx: ExtensionContext, language: SummaryLanguage = "ru"): Promise<{ compaction: any } | undefined> {
 	if (!ctx.model) return undefined;
 	try {
 		const preparation = event.preparation;
+		const focus = language === "ru" ? RUSSIAN_COMPACTION_FOCUS : ENGLISH_COMPACTION_FOCUS;
 		const instructions = event.customInstructions
-			? `${RUSSIAN_COMPACTION_FOCUS}\n\nДополнительный checkpoint-контекст и инструкции текущей операции:\n${event.customInstructions}`
-			: RUSSIAN_COMPACTION_FOCUS;
+			? `${focus}\n\n${language === "ru" ? "Дополнительный checkpoint-контекст и инструкции текущей операции:" : "Additional checkpoint context and instructions for this operation:"}\n${event.customInstructions}`
+			: focus;
 		const maxTokens = Math.min(Math.floor(preparation.settings.reserveTokens * 0.8), ctx.model.maxTokens > 0 ? ctx.model.maxTokens : Number.POSITIVE_INFINITY);
 		let summary: string;
 		let usage: unknown;
 		if (preparation.isSplitTurn && preparation.turnPrefixMessages.length > 0) {
-			let historyText = preparation.previousSummary ? localizeSummaryStructure(preparation.previousSummary) : "Предыдущей истории нет.";
+			let historyText = preparation.previousSummary ? (language === "ru" ? localizeSummaryStructure(preparation.previousSummary) : preparation.previousSummary) : (language === "ru" ? "Предыдущей истории нет." : "No previous history.");
 			let historyUsage: unknown;
 			if (preparation.messagesToSummarize.length > 0) {
 				const history = await summarizeMessages(ctx, preparation.messagesToSummarize, instructions, preparation.previousSummary, maxTokens, event.signal);
-				historyText = localizeSummaryStructure(history.text);
+				historyText = language === "ru" ? localizeSummaryStructure(history.text) : history.text;
 				historyUsage = history.usage;
-				if (!hasLocalizedSummaryStructure(historyText, false)) return undefined;
-			} else if (preparation.previousSummary && !hasLocalizedSummaryStructure(historyText, false) && !hasLocalizedPrefixStructure(historyText)) {
-				return undefined;
+				if (!hasSummaryStructure(historyText, language, false)) return undefined;
+			} else if (preparation.previousSummary && !hasSummaryStructure(historyText, language, false) && !hasPrefixStructure(historyText, language)) {
+				if (language !== "en" || !hasSummaryStructure(historyText, "ru", true)) return undefined;
+				// The stored Russian summary remains untouched; only the new English summary is regenerated.
+				const history = await summarizeMessages(ctx, [], instructions, preparation.previousSummary, maxTokens, event.signal);
+				historyText = history.text;
+				historyUsage = history.usage;
+				if (!hasSummaryStructure(historyText, "en", false)) return undefined;
 			}
-			const prefix = await summarizeTurnPrefix(ctx, preparation.turnPrefixMessages, event.signal, Math.min(Math.floor(preparation.settings.reserveTokens * 0.5), ctx.model.maxTokens > 0 ? ctx.model.maxTokens : Number.POSITIVE_INFINITY));
-			const prefixText = localizeSummaryStructure(prefix.text);
-			if (!hasLocalizedPrefixStructure(prefixText)) return undefined;
-			summary = `${historyText}\n\n**Контекст разрезанного хода:**\n${prefixText}`;
+			const prefix = await summarizeTurnPrefix(ctx, preparation.turnPrefixMessages, event.signal, Math.min(Math.floor(preparation.settings.reserveTokens * 0.5), ctx.model.maxTokens > 0 ? ctx.model.maxTokens : Number.POSITIVE_INFINITY), language);
+			const prefixText = language === "ru" ? localizeSummaryStructure(prefix.text) : prefix.text;
+			if (!hasPrefixStructure(prefixText, language)) return undefined;
+			summary = `${historyText}\n\n${language === "ru" ? "**Контекст разрезанного хода:**" : "**Turn Context (split turn):**"}\n${prefixText}`;
 			usage = combineUsage(historyUsage, prefix.usage);
 		} else {
 			const result = await summarizeMessages(ctx, preparation.messagesToSummarize, instructions, preparation.previousSummary, maxTokens, event.signal);
-			summary = localizeSummaryStructure(result.text);
+			summary = language === "ru" ? localizeSummaryStructure(result.text) : result.text;
 			usage = result.usage;
-			if (!hasLocalizedSummaryStructure(summary, false)) return undefined;
+			if (!hasSummaryStructure(summary, language, false)) return undefined;
 		}
 		const files = collectCumulativeFileLists(preparation.fileOps, event.branchEntries);
 		return {
@@ -284,8 +329,8 @@ export async function russianCompaction(event: SessionBeforeCompactEvent, ctx: E
 	}
 }
 
-/** Генерирует русское summary для /tree, сохраняя native token budget, usage и cumulative file tracking. */
-export async function russianTreeSummary(event: SessionBeforeTreeEvent, ctx: ExtensionContext): Promise<{ summary: any } | undefined> {
+/** Summarizes /tree in the chosen language while preserving usage and file tracking. */
+export async function summarizeTree(event: SessionBeforeTreeEvent, ctx: ExtensionContext, language: SummaryLanguage = "ru"): Promise<{ summary: any } | undefined> {
 	if (!event.preparation.userWantsSummary || !ctx.model) return undefined;
 	try {
 		const reserveTokens = DEFAULT_RESERVE_TOKENS;
@@ -293,14 +338,16 @@ export async function russianTreeSummary(event: SessionBeforeTreeEvent, ctx: Ext
 		const prepared = prepareBranchEntries(event.preparation.entriesToSummarize, tokenBudget);
 		if (prepared.messages.length === 0) return undefined;
 		const replaceInstructions = Boolean(event.preparation.replaceInstructions && event.preparation.customInstructions);
+		const focus = language === "ru" ? RUSSIAN_TREE_SUMMARY_INSTRUCTIONS : ENGLISH_TREE_SUMMARY_INSTRUCTIONS;
 		const instructions = replaceInstructions
 			? event.preparation.customInstructions!
 			: event.preparation.customInstructions
-				? `${RUSSIAN_TREE_SUMMARY_INSTRUCTIONS}\n\nДополнительные инструкции текущего перехода по дереву:\n${event.preparation.customInstructions}`
-				: RUSSIAN_TREE_SUMMARY_INSTRUCTIONS;
+				? `${focus}\n\n${language === "ru" ? "Дополнительные инструкции текущего перехода по дереву:" : "Additional instructions for this tree transition:"}\n${event.preparation.customInstructions}`
+				: focus;
 		const result = await completeSummary(ctx, conversationPrompt(prepared.messages, instructions), Math.min(4096, ctx.model.maxTokens > 0 ? ctx.model.maxTokens : Number.POSITIVE_INFINITY), event.signal);
-		const summary = localizeSummaryStructure(stripBranchSummaryPreamble(result.text));
-		if (!replaceInstructions && !hasLocalizedSummaryStructure(summary, false)) return undefined;
+		const stripped = stripBranchSummaryPreamble(result.text);
+		const summary = language === "ru" ? localizeSummaryStructure(stripped) : stripped;
+		if (!replaceInstructions && !hasSummaryStructure(summary, language, false)) return undefined;
 		const files = collectCumulativeFileLists(prepared.fileOps, event.preparation.entriesToSummarize);
 		return {
 			summary: {

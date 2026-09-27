@@ -1,11 +1,31 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadSummaryLanguage } from "./language.js";
 import {
+	ENGLISH_COMPACTION_FOCUS,
+	ENGLISH_TREE_SUMMARY_INSTRUCTIONS,
 	RUSSIAN_COMPACTION_FOCUS,
 	RUSSIAN_TREE_SUMMARY_INSTRUCTIONS,
 	localizeSummaryStructure,
-	russianCompaction,
+	summarizeCompaction,
+	summarizeTree,
 	stripBranchSummaryPreamble,
 } from "./summary.js";
+
+test("summary language is independently configurable and validates the Pi profile", () => {
+ const dir = mkdtempSync(join(tmpdir(), "compaction-language-"));
+ try {
+  expect(loadSummaryLanguage(dir)).toBe("ru");
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { summaryLanguage: "en" } }));
+  expect(loadSummaryLanguage(dir)).toBe("en");
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { summaryLanguage: "fr" } }));
+  expect(() => loadSummaryLanguage(dir)).toThrow("contextCompaction.summaryLanguage must be ru or en");
+ } finally {
+  rmSync(dir, { recursive: true, force: true });
+ }
+});
 
 describe("Russian summary formatting", () => {
 	test("translates only native structural headings and preserves technical markers", () => {
@@ -74,6 +94,52 @@ describe("Russian summary formatting", () => {
 	test("falls back when no model is selected", async () => {
 		const event = { preparation: {}, reason: "threshold", willRetry: false, signal: new AbortController().signal } as any;
 		const ctx = { model: undefined } as any;
-		expect(await russianCompaction(event, ctx)).toBeUndefined();
+		expect(await summarizeCompaction(event, ctx)).toBeUndefined();
 	});
+});
+
+test("English compaction keeps English headings and cumulative files in normal and split turns", async () => {
+ const prompts: string[] = [];
+ const responses = ["## Goal\nContinue work", "## Goal\nExisting work", "## Original Request\nComplete the feature"];
+ const ctx = {
+  model: { maxTokens: 8192 },
+  modelRegistry: { complete: async (_model: unknown, request: any) => { prompts.push(request.messages[0].content[0].text); return { content: [{ type: "text", text: responses.shift() }], usage: { input: 1 } }; } },
+ } as any;
+ const preparation = { settings: { reserveTokens: 8192 }, isSplitTurn: false, messagesToSummarize: [], previousSummary: undefined, turnPrefixMessages: [], fileOps: { read: new Set(["src/a.ts"]), edited: new Set(["src/b.ts"]) }, firstKeptEntryId: "kept", tokensBefore: 100 };
+ const event = { preparation, branchEntries: [], signal: new AbortController().signal } as any;
+ const normal = await summarizeCompaction(event, ctx, "en");
+ expect(normal?.compaction.summary).toContain("## Goal\nContinue work");
+ expect(normal?.compaction.summary).toContain("<modified-files>\nsrc/b.ts\n</modified-files>");
+ expect(prompts[0]).toContain(ENGLISH_COMPACTION_FOCUS);
+ const message = { role: "user", content: [{ type: "text", text: "Continue the feature" }], timestamp: 1 };
+ const split = await summarizeCompaction({ ...event, preparation: { ...preparation, isSplitTurn: true, messagesToSummarize: [message], turnPrefixMessages: [message] } }, ctx, "en");
+ expect(split?.compaction.summary).toContain("**Turn Context (split turn):**\n## Original Request");
+ expect(prompts[2]).toContain("## Context Needed to Continue");
+ expect(prompts[2]).not.toContain("## Контекст для продолжения");
+});
+
+test("English split-turn regenerates a prior Russian summary before writing the new prefix", async () => {
+ const prompts: string[] = [];
+ const responses = ["## Goal\nFinish src/a.ts", "## Original Request\nContinue src/a.ts"];
+ const ctx = { model: { maxTokens: 8192 }, modelRegistry: { complete: async (_model: unknown, request: any) => { prompts.push(request.messages[0].content[0].text); return { content: [{ type: "text", text: responses.shift() }], usage: { input: 2 } }; } } } as any;
+ const message = { role: "user", content: [{ type: "text", text: "continue" }], timestamp: 1 };
+ const event = { branchEntries: [], preparation: { settings: { reserveTokens: 8192 }, isSplitTurn: true, messagesToSummarize: [], previousSummary: "## Цель\nЗавершить src/a.ts", turnPrefixMessages: [message], fileOps: { read: new Set(["src/a.ts"]) }, firstKeptEntryId: "kept", tokensBefore: 100 }, signal: new AbortController().signal } as any;
+ const result = await summarizeCompaction(event, ctx, "en");
+ expect(result?.compaction.summary).toContain("## Goal\nFinish src/a.ts\n\n**Turn Context (split turn):**\n## Original Request");
+ expect(result?.compaction.summary).toContain("<read-files>\nsrc/a.ts\n</read-files>");
+ expect(result?.compaction.usage.input).toBe(4);
+ expect(prompts[0]).toContain("## Цель\nЗавершить src/a.ts");
+ expect(prompts[0]).toContain(ENGLISH_COMPACTION_FOCUS);
+ expect(prompts).toHaveLength(2);
+});
+
+test("English /tree uses English instructions and preserves paths and usage", async () => {
+ let prompt = "";
+ const ctx = { model: { contextWindow: 128000, maxTokens: 8192 }, modelRegistry: { complete: async (_model: unknown, request: any) => { prompt = request.messages[0].content[0].text; return { content: [{ type: "text", text: "## Goal\nRead src/a.ts" }], usage: { input: 3 } }; } } } as any;
+ const event = { preparation: { userWantsSummary: true, entriesToSummarize: [{ type: "message", message: { role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 } }] }, signal: new AbortController().signal } as any;
+ const result = await summarizeTree(event, ctx, "en");
+ expect(result?.summary.summary).toContain("## Goal\nRead src/a.ts");
+ expect(result?.summary.usage).toEqual({ input: 3 });
+ expect(prompt).toContain(ENGLISH_TREE_SUMMARY_INSTRUCTIONS);
+ expect(prompt).not.toContain("Пиши весь естественный текст");
 });
