@@ -12,6 +12,7 @@
     "index.ts",
     "audit.ts",
     "checkpoint.ts",
+    "language.ts",
     "policy.ts",
     "session-state.ts",
     "summary.ts",

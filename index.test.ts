@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import extension from "./index.js";
 
 const params = { mainObjective: "Продолжить цель", completedCheckpoint: "Завершён этап", continuationTarget: "Сделать следующий шаг" };
 let sequence = 0;
 
-function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: boolean; thinkingLevel?: string; modelSwitchThinkingLevel?: string } = {}) {
+function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: boolean; thinkingLevel?: string; modelSwitchThinkingLevel?: string; language?: "ru" | "en" } = {}) {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	let tool: any;
 	let command: any;
@@ -47,9 +50,20 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 		setThinkingLevel(value: string) { thinkingLevel = value; },
 		sendUserMessage(text: string) { if (!compactionInProgress) sent.push(text); },
 	};
-	extension(pi);
+	const agentDir = mkdtempSync(join(tmpdir(), "context-compaction-test-profile-"));
+	const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+	try {
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ contextCompaction: { summaryLanguage: options.language ?? "ru" } }));
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		extension(pi);
+	} finally {
+		if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+		rmSync(agentDir, { recursive: true, force: true });
+	}
 	return {
 		ctx, tool, command, audits, compactOptions, sent, notices,
+		hasEvent(name: string) { return handlers.has(name); },
 		get thinkingLevel() { return thinkingLevel; },
 		setBranch(value: any[]) { branch = value; },
 		getBranch() { return branch; },
@@ -106,6 +120,26 @@ describe("public compaction lifecycle", () => {
 		expect(runtime.audits.filter((entry) => entry.data.phase === "send-attempted")).toHaveLength(1);
 		callback.onError(new Error("late"));
 		expect(runtime.sent).toHaveLength(1);
+	});
+
+	test("English compact delegates manual, threshold and overflow summaries to Pi", async () => {
+		const runtime = setup({ language: "en" });
+		let customCalls = 0;
+		runtime.ctx.modelRegistry.complete = () => { customCalls++; throw new Error("Custom summarizer must not run in English mode"); };
+		expect(runtime.hasEvent("session_before_tree")).toBe(false);
+		const callback = await startManual(runtime);
+		expect(callback.customInstructions).toContain("## Main objective");
+		expect(callback.customInstructions).not.toContain("## Главная цель");
+		expect(await runtime.event("session_before_compact", { reason: "manual", willRetry: false, preparation: { tokensBefore: 100 } })).toBeUndefined();
+		await runtime.event("session_compact", { reason: "manual", willRetry: false, compactionEntry: { tokensBefore: 100 } });
+		callback.onComplete({});
+		await runtime.flush();
+		expect(runtime.sent).toHaveLength(1);
+		expect(runtime.sent[0]).toContain("Continue the main objective");
+		for (const reason of ["threshold", "overflow"]) {
+			expect(await runtime.event("session_before_compact", { reason, willRetry: reason === "overflow", preparation: { tokensBefore: 100 } })).toBeUndefined();
+		}
+		expect(customCalls).toBe(0);
 	});
 
 	test("failed manual compact records an error and never synthesizes continuation", async () => {

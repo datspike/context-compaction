@@ -1,11 +1,29 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadSummaryLanguage } from "./language.js";
 import {
 	RUSSIAN_COMPACTION_FOCUS,
 	RUSSIAN_TREE_SUMMARY_INSTRUCTIONS,
 	localizeSummaryStructure,
 	russianCompaction,
+	russianTreeSummary,
 	stripBranchSummaryPreamble,
 } from "./summary.js";
+
+test("summary language is independently configurable and validates the Pi profile", () => {
+	const dir = mkdtempSync(join(tmpdir(), "compaction-language-"));
+	try {
+		expect(loadSummaryLanguage(dir)).toBe("ru");
+		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { summaryLanguage: "en" } }));
+		expect(loadSummaryLanguage(dir)).toBe("en");
+		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { summaryLanguage: "fr" } }));
+		expect(() => loadSummaryLanguage(dir)).toThrow("contextCompaction.summaryLanguage must be ru or en");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
 
 describe("Russian summary formatting", () => {
 	test("translates only native structural headings and preserves technical markers", () => {
@@ -76,4 +94,28 @@ describe("Russian summary formatting", () => {
 		const ctx = { model: undefined } as any;
 		expect(await russianCompaction(event, ctx)).toBeUndefined();
 	});
+});
+
+test("Russian compact keeps localized headings, split-turn context and cumulative files", async () => {
+	const responses = ["## Goal\nContinue work", "## Goal\nExisting work", "## Original Request\nComplete the feature"];
+	const ctx = {
+		model: { maxTokens: 8192 },
+		modelRegistry: { complete: async () => ({ content: [{ type: "text", text: responses.shift() }], usage: { input: 1 } }) },
+	} as any;
+	const preparation = { settings: { reserveTokens: 8192 }, isSplitTurn: false, messagesToSummarize: [], previousSummary: undefined, turnPrefixMessages: [], fileOps: { read: new Set(["src/a.ts"]), edited: new Set(["src/b.ts"]) }, firstKeptEntryId: "kept", tokensBefore: 100 };
+	const event = { preparation, branchEntries: [], signal: new AbortController().signal } as any;
+	const normal = await russianCompaction(event, ctx);
+	expect(normal?.compaction.summary).toContain("## Цель\nContinue work");
+	expect(normal?.compaction.summary).toContain("<modified-files>\nsrc/b.ts\n</modified-files>");
+	const message = { role: "user", content: [{ type: "text", text: "Continue the feature" }], timestamp: 1 };
+	const split = await russianCompaction({ ...event, preparation: { ...preparation, isSplitTurn: true, messagesToSummarize: [message], turnPrefixMessages: [message] } }, ctx);
+	expect(split?.compaction.summary).toContain("**Контекст разрезанного хода:**\n## Исходный запрос");
+});
+
+test("Russian /tree keeps localized headings and usage", async () => {
+	const ctx = { model: { contextWindow: 128000, maxTokens: 8192 }, modelRegistry: { complete: async () => ({ content: [{ type: "text", text: "## Goal\nRead src/a.ts" }], usage: { input: 3 } }) } } as any;
+	const event = { preparation: { userWantsSummary: true, entriesToSummarize: [{ type: "message", message: { role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 } }] }, signal: new AbortController().signal } as any;
+	const result = await russianTreeSummary(event, ctx);
+	expect(result?.summary.summary).toContain("## Цель\nRead src/a.ts");
+	expect(result?.summary.usage).toEqual({ input: 3 });
 });

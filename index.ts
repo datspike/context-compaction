@@ -5,6 +5,7 @@ import {
 	buildInstructions,
 	buildLedger,
 	CheckpointParamsSchema,
+	checkpointParamsSchema,
 	compactedSinceLastUserMessage,
 	contextCompactionFollowUp,
 	continuationPrompt,
@@ -12,6 +13,7 @@ import {
 	prepareArguments,
 	type CheckpointParams,
 } from "./checkpoint.js";
+import { loadSummaryLanguage } from "./language.js";
 import { formatFooter, resolvePolicy, type ContextMode } from "./policy.js";
 import { appendMode, hasLegacyThreshold, restoreMode } from "./session-state.js";
 import { russianCompaction, russianTreeSummary } from "./summary.js";
@@ -45,9 +47,12 @@ const STATUS_KEY = "context-compaction";
 const GLOBAL_STATE = globalThis as typeof globalThis & { __piContextCompactionLegacyNoticesV2?: Set<string> };
 const LEGACY_NOTICE_SESSIONS = GLOBAL_STATE.__piContextCompactionLegacyNoticesV2 ??= new Set<string>();
 
-export function getContextArgumentCompletions(prefix: string): ContextCompletion[] | null {
+export function getContextArgumentCompletions(prefix: string, language: "ru" | "en" = "ru"): ContextCompletion[] | null {
 	const items = CONTEXT_COMPLETIONS.filter((item) => item.value.startsWith(prefix.trimStart()));
-	return items.length > 0 ? items : null;
+	if (!items.length) return null;
+	if (language === "ru") return items;
+	const descriptions: Record<string, string> = { status: "Show the current mode, window and threshold", economy: "Conservative window bounded by model capability", "long-once": "Extended window until the next compaction", "long-chat": "Persistent extended window within model capability", off: "Restore the declared registry window" };
+	return items.map((item) => ({ ...item, description: descriptions[item.value] }));
 }
 
 function modelDeclaration(ctx: ExtensionContext): number | undefined {
@@ -121,6 +126,8 @@ function continuationGoalIsValid(snapshot: GoalSnapshot, entries: readonly Sessi
 
 /** Public-API extension: Pi owns automatic compaction and automatic continuation. */
 export default function contextCompaction(pi: ExtensionAPI): void {
+	const language = loadSummaryLanguage();
+	const text = (ru: string, en: string): string => language === "ru" ? ru : en;
 	let mode: ContextMode = "economy";
 	let operation: ManualOperation | undefined;
 	let sequence = 0;
@@ -170,7 +177,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 			if (mode !== "economy") setMode("economy", true);
 			useActualWindowFallback = true;
 			updateFooter(ctx);
-			notice(ctx, "Не удалось применить окно контекста; включён безопасный режим economy", "error");
+			notice(ctx, text("Не удалось применить окно контекста; включён безопасный режим economy", "Could not apply the context window; switched to safe economy mode"), "error");
 			windowErrorNotified = true;
 			return false;
 		}
@@ -214,12 +221,12 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		try {
 			const revalidated = ctx.sessionManager.getBranch() as SessionEntry[];
 			if (!isCurrent(ctx, op, "success") || op.continuationSuppressed || userWatermark(revalidated) !== op.userWatermark || !continuationGoalIsValid(op.goal, revalidated)) return;
-			pi.sendUserMessage(contextCompactionFollowUp(continuationPrompt(op.params), op.correlation), { deliverAs: "followUp" });
+			pi.sendUserMessage(contextCompactionFollowUp(continuationPrompt(op.params, language), op.correlation), { deliverAs: "followUp" });
 			audit(ctx, op, "continuation-claimed", "manual");
 			audit(ctx, op, "send-attempted", "manual");
 		} catch {
 			audit(ctx, op, "error", "manual");
-			notice(ctx, "Не удалось поставить continuation после compact", "error");
+			notice(ctx, text("Не удалось поставить continuation после compact", "Could not queue continuation after compaction"), "error");
 		} finally {
 			operation = undefined;
 		}
@@ -228,34 +235,34 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "checkpoint_compact_continue",
 		label: "Checkpoint Compact Continue",
-		description: "Сохраняет checkpoint, сжимает контекст и продолжает ту же цель после успешного compact.",
+		description: language === "ru" ? "Сохраняет checkpoint, сжимает контекст и продолжает ту же цель после успешного compact." : "Saves a checkpoint, compacts context, and continues the same objective after successful compaction.",
 		promptSnippet: "Checkpoint current progress, compact context, and continue the same objective after compaction",
-		promptGuidelines: ["Используй checkpoint_compact_continue только по явной просьбе пользователя или при инструкции сохранить checkpoint перед сжатием.", "Перед вызовом заверши текущую атомарную работу и вызывай tool последним действием checkpoint.", "Для работы по плану передавай planPath/currentPhase/nextPhase, когда они известны."],
-		parameters: CheckpointParamsSchema,
+		promptGuidelines: language === "ru" ? ["Используй checkpoint_compact_continue только по явной просьбе пользователя или при инструкции сохранить checkpoint перед сжатием.", "Перед вызовом заверши текущую атомарную работу и вызывай tool последним действием checkpoint.", "Для работы по плану передавай planPath/currentPhase/nextPhase, когда они известны."] : ["Use checkpoint_compact_continue only on explicit user request or when instructed to checkpoint before compaction.", "Finish the current atomic task first and call this tool as the final checkpoint action.", "For plan-based work pass planPath/currentPhase/nextPhase when known."],
+		parameters: language === "ru" ? CheckpointParamsSchema : checkpointParamsSchema("en"),
 		prepareArguments,
 		async execute(_id, raw, _signal, _onUpdate, ctx) {
-			if (currentOperation(ctx)) return { content: [{ type: "text" as const, text: "Compact уже ожидает или выполняется." }], details: { reason: "manual", params: raw, result: "in_progress" }, terminate: true };
-			if (compactedSinceLastUserMessage(ctx)) return { content: [{ type: "text" as const, text: "Compact уже был выполнен после последнего сообщения пользователя." }], details: { reason: "manual", params: raw, result: "already_compacted" }, terminate: false };
+			if (currentOperation(ctx)) return { content: [{ type: "text" as const, text: text("Compact уже ожидает или выполняется.", "Compaction is already pending or running.") }], details: { reason: "manual", params: raw, result: "in_progress" }, terminate: true };
+			if (compactedSinceLastUserMessage(ctx)) return { content: [{ type: "text" as const, text: text("Compact уже был выполнен после последнего сообщения пользователя.", "Compaction already ran after the last user message.") }], details: { reason: "manual", params: raw, result: "already_compacted" }, terminate: false };
 			const entries = ctx.sessionManager.getBranch() as SessionEntry[];
 			const op: ManualOperation = { correlation: nextCorrelation(), origin: "manual-tool", reason: "manual", params: raw as CheckpointParams, scope: scopeOf(ctx, anonymousIdentities), userWatermark: userWatermark(entries), goal: goalSnapshot(entries), lifecycle: "pending", continuationClaimed: false, continuationSuppressed: false };
 			operation = op;
 			audit(ctx, { ...op, origin: "manual-tool" }, "pending", "manual");
-			return { content: [{ type: "text" as const, text: "Checkpoint compact запланирован после завершения текущего хода." }], details: { reason: "manual", params: raw, result: "scheduled" }, terminate: true };
+			return { content: [{ type: "text" as const, text: text("Checkpoint compact запланирован после завершения текущего хода.", "Checkpoint compaction is scheduled after the current turn.") }], details: { reason: "manual", params: raw, result: "scheduled" }, terminate: true };
 		},
 	});
 
 	pi.registerCommand("context", {
-		description: "Показывает или меняет именованный режим context compaction.",
-		getArgumentCompletions: getContextArgumentCompletions,
+		description: text("Показывает или меняет именованный режим context compaction.", "Show or change the named context compaction mode."),
+		getArgumentCompletions: (prefix) => getContextArgumentCompletions(prefix, language),
 		handler: async (args, ctx) => {
 			const command = args.trim() || "status";
-			if (!CONTEXT_COMPLETIONS.some((item) => item.value === command)) { notice(ctx, "Использование: /context [status|economy|long-once|long-chat|off]", "error"); return; }
+			if (!CONTEXT_COMPLETIONS.some((item) => item.value === command)) { notice(ctx, text("Использование: /context [status|economy|long-once|long-chat|off]", "Usage: /context [status|economy|long-once|long-chat|off]"), "error"); return; }
 			if (command !== "status") {
 				setMode(command as ContextMode, true);
-				if (!(await ensureWindow(ctx)) && command !== "economy" && !windowErrorNotified) notice(ctx, "Выбранный режим недоступен для точной текущей модели; оставлен economy", "error");
+				if (!(await ensureWindow(ctx)) && command !== "economy" && !windowErrorNotified) notice(ctx, text("Выбранный режим недоступен для точной текущей модели; оставлен economy", "This mode is unavailable for the exact current model; economy is retained"), "error");
 			}
 			const policy = currentPolicy(ctx);
-			notice(ctx, `context: ${mode}; model=${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "модель не выбрана"}; окно=${policy.window}; compact@${policy.threshold ?? "native"}; source=${policy.source}`);
+			notice(ctx, `context: ${mode}; model=${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : text("модель не выбрана", "no model selected")}; ${text("окно", "window")}=${policy.window}; compact@${policy.threshold ?? "native"}; source=${policy.source}`);
 			updateFooter(ctx);
 		},
 	});
@@ -266,7 +273,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		const key = scopeOf(ctx, anonymousIdentities).sessionId;
 		if (hasLegacyThreshold(ctx.sessionManager.getEntries()) && !LEGACY_NOTICE_SESSIONS.has(key)) {
 			LEGACY_NOTICE_SESSIONS.add(key);
-			notice(ctx, "Старый сессионный порог обнаружен и проигнорирован; используйте /context с именованным режимом.");
+			notice(ctx, text("Старый сессионный порог обнаружен и проигнорирован; используйте /context с именованным режимом.", "Legacy session threshold ignored; use a named /context mode."));
 		}
 		await ensureWindow(ctx);
 		updateFooter(ctx);
@@ -278,24 +285,22 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		if (!op || !ctx.isIdle() || !isCurrent(ctx, op, "pending")) return;
 		op.lifecycle = "running";
 		audit(ctx, { ...op, origin: "manual-tool" }, "running", "manual");
-		ctx.compact({ customInstructions: buildInstructions(buildLedger(op.params)), onComplete: () => { void continueManualAfterCompaction(ctx, op); }, onError: () => fail(ctx, op) });
+		ctx.compact({ customInstructions: buildInstructions(buildLedger(op.params, language), language), onComplete: () => { void continueManualAfterCompaction(ctx, op); }, onError: () => fail(ctx, op) });
 	});
 	pi.on("session_before_compact", async (event: any, ctx) => {
 		const reason = event.reason as AuditReason;
 		const op = currentOperation(ctx);
 		if (op?.lifecycle === "running" && reason === "manual") {
 			if (event.willRetry) op.continuationSuppressed = true;
-			const custom = await russianCompaction(event, ctx);
-			if (custom) return custom;
+			if (language === "ru") return russianCompaction(event, ctx);
 			return;
 		}
 		if (event.willRetry && op) op.continuationSuppressed = true;
 		if (reason === "threshold" && op?.lifecycle === "pending") cancel(ctx, op);
 		external(ctx, "contained", reason, Boolean(event.willRetry), event.preparation?.tokensBefore);
-		const custom = await russianCompaction(event, ctx);
-		if (custom) return custom;
+		if (language === "ru") return russianCompaction(event, ctx);
 	});
-	pi.on("session_before_tree", async (event: any, ctx) => russianTreeSummary(event, ctx));
+	if (language === "ru") pi.on("session_before_tree", async (event: any, ctx) => russianTreeSummary(event, ctx));
 	pi.on("session_compact", async (event: any, ctx) => {
 		const reason = event.reason as AuditReason;
 		const op = currentOperation(ctx);
