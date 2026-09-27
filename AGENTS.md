@@ -1,6 +1,6 @@
 # AGENTS.md — context-compaction
 
-Локальное Pi-расширение. Исходник истины — этот репозиторий; в Pi подключается как local package через `pi install -l`.
+Публичное Pi-расширение. Исходник истины — этот репозиторий; в Pi устанавливается из unpinned Git-источника через `pi install git:github.com/datspike/context-compaction`, а локально проверяется через `pi install -l`.
 
 ## Проверки
 
