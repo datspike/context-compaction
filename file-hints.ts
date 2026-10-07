@@ -6,10 +6,27 @@ const MAX_HINTS = 24;
 const MAX_GROUPS = 8;
 const FILE_TAGS = new Set(["read-files", "modified-files", "file-hints"]);
 
+/** Exact legacy serialization disambiguates path lines that resemble closing tags. */
+function legacyBodies(sources: readonly unknown[]): Map<string, string[][]> {
+	const bodies = new Map<string, string[][]>();
+	for (const source of sources) {
+		if (!source || typeof source !== "object") continue;
+		for (const [tag, field] of [["read-files", "readFiles"], ["modified-files", "modifiedFiles"]]) {
+			const paths = (source as Record<string, unknown>)[field];
+			if (!Array.isArray(paths) || !paths.every((path): path is string => typeof path === "string")) continue;
+			if (!paths.some((path) => path.split(/\r?\n/).includes(`</${tag}>`))) continue;
+			const variants = new Set([paths.join("\n"), [...paths].sort().join("\n")]);
+			bodies.set(tag, [...(bodies.get(tag) ?? []), ...[...variants].map((body) => body.split(/\r?\n/))]);
+		}
+	}
+	return bodies;
+}
+
 /** Removes generated tracking blocks, never fenced examples or incomplete blocks. */
-export function withoutFileTracking(summary: string): string {
+export function withoutFileTracking(summary: string, sources: readonly unknown[] = []): string {
 	const lines = summary.split("\n");
 	const kept: string[] = [];
+	const bodies = legacyBodies(sources);
 	let fence: { character: string; length: number } | undefined;
 	for (let i = 0; i < lines.length; i++) {
 		const trimmed = lines[i].trim();
@@ -28,11 +45,22 @@ export function withoutFileTracking(summary: string): string {
 		const tag = /^<(read-files|modified-files|file-hints)>$/.exec(lines[i].replace(/\r$/, ""))?.[1];
 		if (tag && FILE_TAGS.has(tag)) {
 			let end = i + 1;
+			let verifiedEnd = false;
+			for (const body of bodies.get(tag) ?? []) {
+				if (body.every((line, offset) => lines[i + 1 + offset]?.replace(/\r$/, "") === line)
+					&& lines[i + 1 + body.length]?.replace(/\r$/, "") === `</${tag}>`) {
+					end = i + 1 + body.length;
+					verifiedEnd = true;
+					break;
+				}
+			}
 			while (end < lines.length && lines[end].replace(/\r$/, "") !== `</${tag}>`) {
 				// Legacy paths are unescaped: markup-like names and backticks are data here.
 				end++;
 			}
-			if (lines[end]?.replace(/\r$/, "") === `</${tag}>`) { i = end; continue; }
+			const ambiguousEnd = !verifiedEnd && (bodies.get(tag) ?? []).some((body) => end - i - 1 < body.length
+				&& body.slice(0, end - i).every((line, offset) => lines[i + 1 + offset]?.replace(/\r$/, "") === line));
+			if (!ambiguousEnd && lines[end]?.replace(/\r$/, "") === `</${tag}>`) { i = end; continue; }
 			// An incomplete block is ambiguous; preserve it and the remaining text verbatim.
 			return kept.concat(lines.slice(i)).join("\n").trimEnd();
 		}
@@ -56,9 +84,9 @@ export function collectFileLists(fileOps: FileOps | undefined, entries: readonly
 }
 
 /** Copies only summary messages; user/tool text is not ours to sanitize. */
-export function withoutMessageFileTracking(messages: readonly any[]): any[] {
+export function withoutMessageFileTracking(messages: readonly any[], sources: readonly unknown[] = []): any[] {
 	return messages.map((message) => (message.role === "compactionSummary" || message.role === "branchSummary") && typeof message.summary === "string"
-		? { ...message, summary: withoutFileTracking(message.summary) }
+		? { ...message, summary: withoutFileTracking(message.summary, sources) }
 		: message);
 }
 

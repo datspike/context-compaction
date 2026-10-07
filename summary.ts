@@ -185,17 +185,17 @@ async function completeSummary(ctx: ExtensionContext, prompt: string, maxTokens:
 	return { text, usage: response.usage };
 }
 
-function conversationPrompt(messages: any[], instructions: string, previousSummary?: string): string {
-	const conversationText = serializeConversation(convertToLlm(withoutMessageFileTracking(messages)));
-	const previous = previousSummary ? withoutFileTracking(previousSummary) : undefined;
+function conversationPrompt(messages: any[], instructions: string, previousSummary?: string, sources: readonly unknown[] = []): string {
+	const conversationText = serializeConversation(convertToLlm(withoutMessageFileTracking(messages, sources)));
+	const previous = previousSummary ? withoutFileTracking(previousSummary, sources) : undefined;
 	return `<conversation>\n${conversationText}\n</conversation>\n\n${previous ? `<previous-summary>\n${previous}\n</previous-summary>\n\n` : ""}${instructions}`;
 }
 
-async function summarizeMessages(ctx: ExtensionContext, messages: any[], instructions: string, previousSummary: string | undefined, maxTokens: number, signal: AbortSignal): Promise<SummaryResponse> {
-	return completeSummary(ctx, conversationPrompt(messages, instructions, previousSummary), maxTokens, signal);
+async function summarizeMessages(ctx: ExtensionContext, messages: any[], instructions: string, previousSummary: string | undefined, maxTokens: number, signal: AbortSignal, sources: readonly unknown[]): Promise<SummaryResponse> {
+	return completeSummary(ctx, conversationPrompt(messages, instructions, previousSummary, sources), maxTokens, signal);
 }
 
-async function summarizeTurnPrefix(ctx: ExtensionContext, messages: any[], signal: AbortSignal, maxTokens: number): Promise<SummaryResponse> {
+async function summarizeTurnPrefix(ctx: ExtensionContext, messages: any[], signal: AbortSignal, maxTokens: number, sources: readonly unknown[]): Promise<SummaryResponse> {
 	const instructions = `Это ранняя часть пользовательского хода, а его недавняя часть сохранена отдельно. Составь краткий контекст для продолжения на русском языке и используй ровно этот формат:
 
 ## Исходный запрос
@@ -208,7 +208,7 @@ async function summarizeTurnPrefix(ctx: ExtensionContext, messages: any[], signa
 - [Что нужно знать, чтобы понять сохранённую недавнюю часть]
 
 Сохраняй точные пути, команды, имена функций и сообщения ошибок. Выведи только summary.`;
-	return summarizeMessages(ctx, messages, instructions, undefined, maxTokens, signal);
+	return summarizeMessages(ctx, messages, instructions, undefined, maxTokens, signal, sources);
 }
 
 /**
@@ -219,6 +219,7 @@ export async function russianCompaction(event: SessionBeforeCompactEvent, ctx: E
 	if (!ctx.model) return undefined;
 	try {
 		const preparation = event.preparation;
+		const sources = event.branchEntries.flatMap((entry) => entry.type === "compaction" || entry.type === "branch_summary" ? [entry.details] : []);
 		const instructions = event.customInstructions
 			? `${RUSSIAN_COMPACTION_FOCUS}\n\nДополнительный checkpoint-контекст и инструкции текущей операции:\n${event.customInstructions}`
 			: RUSSIAN_COMPACTION_FOCUS;
@@ -226,23 +227,23 @@ export async function russianCompaction(event: SessionBeforeCompactEvent, ctx: E
 		let summary: string;
 		let usage: unknown;
 		if (preparation.isSplitTurn && preparation.turnPrefixMessages.length > 0) {
-			let historyText = preparation.previousSummary ? localizeSummaryStructure(withoutFileTracking(preparation.previousSummary)) : "Предыдущей истории нет.";
+			let historyText = preparation.previousSummary ? localizeSummaryStructure(withoutFileTracking(preparation.previousSummary, sources)) : "Предыдущей истории нет.";
 			let historyUsage: unknown;
 			if (preparation.messagesToSummarize.length > 0) {
-				const history = await summarizeMessages(ctx, preparation.messagesToSummarize, instructions, preparation.previousSummary, maxTokens, event.signal);
+				const history = await summarizeMessages(ctx, preparation.messagesToSummarize, instructions, preparation.previousSummary, maxTokens, event.signal, sources);
 				historyText = localizeSummaryStructure(history.text);
 				historyUsage = history.usage;
 				if (!hasLocalizedSummaryStructure(historyText, false)) return undefined;
 			} else if (preparation.previousSummary && !hasLocalizedSummaryStructure(historyText, false) && !hasLocalizedPrefixStructure(historyText)) {
 				return undefined;
 			}
-			const prefix = await summarizeTurnPrefix(ctx, preparation.turnPrefixMessages, event.signal, Math.min(Math.floor(preparation.settings.reserveTokens * 0.5), ctx.model.maxTokens > 0 ? ctx.model.maxTokens : Number.POSITIVE_INFINITY));
+			const prefix = await summarizeTurnPrefix(ctx, preparation.turnPrefixMessages, event.signal, Math.min(Math.floor(preparation.settings.reserveTokens * 0.5), ctx.model.maxTokens > 0 ? ctx.model.maxTokens : Number.POSITIVE_INFINITY), sources);
 			const prefixText = localizeSummaryStructure(prefix.text);
 			if (!hasLocalizedPrefixStructure(prefixText)) return undefined;
 			summary = `${historyText}\n\n**Контекст разрезанного хода:**\n${prefixText}`;
 			usage = combineUsage(historyUsage, prefix.usage);
 		} else {
-			const result = await summarizeMessages(ctx, preparation.messagesToSummarize, instructions, preparation.previousSummary, maxTokens, event.signal);
+			const result = await summarizeMessages(ctx, preparation.messagesToSummarize, instructions, preparation.previousSummary, maxTokens, event.signal, sources);
 			summary = localizeSummaryStructure(result.text);
 			usage = result.usage;
 			if (!hasLocalizedSummaryStructure(summary, false)) return undefined;
@@ -271,7 +272,7 @@ export async function russianTreeSummary(event: SessionBeforeTreeEvent, ctx: Ext
 		const reserveTokens = DEFAULT_RESERVE_TOKENS;
 		const tokenBudget = Math.max(0, (ctx.model.contextWindow || 128_000) - reserveTokens);
 		const entries = event.preparation.entriesToSummarize.map((entry) => entry.type === "compaction" || entry.type === "branch_summary"
-			? { ...entry, summary: withoutFileTracking(entry.summary) } : entry);
+			? { ...entry, summary: withoutFileTracking(entry.summary, [entry.details]) } : entry);
 		const prepared = prepareBranchEntries(entries, tokenBudget);
 		if (prepared.messages.length === 0) return undefined;
 		const replaceInstructions = Boolean(event.preparation.replaceInstructions && event.preparation.customInstructions);

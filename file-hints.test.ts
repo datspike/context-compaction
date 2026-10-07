@@ -197,3 +197,63 @@ describe("tracking boundary regressions", () => {
 		}
 	});
 });
+
+describe("metadata-backed legacy boundaries", () => {
+	for (const tag of ["read-files", "modified-files"]) {
+		test(`${tag}: literal closing path stays in metadata, not compact/tree input`, async () => {
+			const paths = [`</${tag}>`, ...Array.from({ length: 10000 }, (_, i) => `archive/${i}.ts`)].sort();
+			const details = { readFiles: tag === "read-files" ? paths : [], modifiedFiles: tag === "modified-files" ? paths : [] };
+			const previous = `${BODY}\n\n<${tag}>\n${paths.join("\n")}\n</${tag}>`;
+			expect(withoutFileTracking(previous, [details])).toBe(BODY);
+			const entry: any = { type: "compaction", summary: previous, details, timestamp: new Date(0).toISOString() };
+			const { ctx, event, prompts } = fixture();
+			event.branchEntries = [entry];
+			event.preparation.previousSummary = previous;
+			event.preparation.messagesToSummarize.push({ role: "compactionSummary", summary: previous, timestamp: 0 });
+			const compact = (await russianCompaction(event, ctx))!.compaction;
+			expect(prompts[0]).not.toContain("archive/9999.ts");
+			const field = tag === "read-files" ? "readFiles" : "modifiedFiles";
+			expect(compact.details[field]).toContain(`</${tag}>`);
+			expect(compact.details[field]).toContain("archive/9999.ts");
+			ctx.model.contextWindow = 18000;
+			const tree: any = { signal: event.signal, preparation: { userWantsSummary: true, entriesToSummarize: [
+				{ type: "message", message: { role: "user", content: "EARLIER_SEMANTIC_OBLIGATION", timestamp: 0 }, timestamp: new Date(0).toISOString() },
+				{ ...entry, type: "branch_summary", fromId: "a" },
+			] } };
+			const branch = (await russianTreeSummary(tree, ctx))!.summary;
+			expect(prompts[1]).not.toContain("archive/9999.ts");
+			expect(prompts[1]).toContain("EARLIER_SEMANTIC_OBLIGATION");
+			expect(branch.details[field]).toEqual(paths);
+			expect(entry.summary).toBe(previous);
+			const split = fixture(["## Исходный запрос\nKeep prefix"]);
+			split.event.branchEntries = [entry];
+			Object.assign(split.event.preparation, { previousSummary: previous, isSplitTurn: true, messagesToSummarize: [], turnPrefixMessages: [tool("current.ts")] });
+			const splitResult = (await russianCompaction(split.event, split.ctx))!.compaction;
+			expect(splitResult.summary).not.toContain("archive/9999.ts");
+			expect(splitResult.details[field]).toContain(`</${tag}>`);
+		});
+	}
+
+	test("exact serialization does not swallow prose between separate lists or fenced samples", () => {
+		const details = { readFiles: ["</read-files>", "a.ts"], modifiedFiles: [] };
+		const block = `<read-files>\n${details.readFiles.join("\n")}\n</read-files>`;
+		expect(withoutFileTracking(`${BODY}\n${block}\nKEEP_BETWEEN\n${block}`, [details])).toBe(`${BODY}\nKEEP_BETWEEN`);
+		const fenced = `\`\`\`text\n${block}\n\`\`\``;
+		expect(withoutFileTracking(fenced, [details])).toBe(fenced);
+		expect(withoutFileTracking(`${BODY}\r\n${block.replaceAll("\n", "\r\n")}`, [details])).toBe(BODY);
+		const multiline = { readFiles: ["prefix\n</read-files>\nsuffix", "z.ts"] };
+		const multiBlock = `<read-files>\n${multiline.readFiles.join("\n")}\n</read-files>`;
+		expect(withoutFileTracking(`${BODY}\n${multiBlock}`, [multiline])).toBe(BODY);
+	});
+});
+
+test("known closing-tag paths do not make incomplete legacy lists look complete", () => {
+	for (const tag of ["read-files", "modified-files"]) {
+		const paths = [`</${tag}>`, "a.ts", "z.ts"];
+		const details = { [tag === "read-files" ? "readFiles" : "modifiedFiles"]: paths };
+		for (const body of [paths, paths.slice(0, 2), paths.slice(0, 1)]) {
+			const incomplete = `${BODY}\n<${tag}>\n${body.join("\n")}`;
+			expect(withoutFileTracking(incomplete, [details])).toBe(incomplete);
+		}
+	}
+});
