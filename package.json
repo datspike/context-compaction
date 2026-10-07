@@ -18,6 +18,7 @@
     "summary.ts",
     "file-hints.ts",
     "README.md",
+    "docs/workflows.md",
     "LICENSE",
     "package.json"
   ],

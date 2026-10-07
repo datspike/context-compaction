@@ -9,3 +9,14 @@ __pycache__/
 *.log
 .DS_Store
 .runtime/
+.task_files/
+.pi/
+AGENTS.local.md
+sessions/
+session-state/
+provider-state/
+local-config/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
