@@ -29,11 +29,12 @@ export function withoutFileTracking(summary: string): string {
 		if (tag && FILE_TAGS.has(tag)) {
 			let end = i + 1;
 			while (end < lines.length && lines[end].replace(/\r$/, "") !== `</${tag}>`) {
-				// Nested markup/fences are not a generated file list. Keep it verbatim.
-				if (/^\s*(?:<|`{3,}|~{3,})/.test(lines[end])) break;
+				// Legacy paths are unescaped: markup-like names and backticks are data here.
 				end++;
 			}
 			if (lines[end]?.replace(/\r$/, "") === `</${tag}>`) { i = end; continue; }
+			// An incomplete block is ambiguous; preserve it and the remaining text verbatim.
+			return kept.concat(lines.slice(i)).join("\n").trimEnd();
 		}
 		kept.push(lines[i]);
 	}

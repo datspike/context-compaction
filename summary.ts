@@ -179,7 +179,8 @@ async function completeSummary(ctx: ExtensionContext, prompt: string, maxTokens:
 	);
 	if (response.stopReason === "aborted" || response.stopReason === "error" || response.stopReason === "length") throw new Error(response.errorMessage ?? "Summary generation failed");
 	if (Array.isArray(response.content) && response.content.some((block: any) => block?.type === "toolCall")) throw new Error("Summary attempted to call a tool");
-	const text = Array.isArray(response.content) ? response.content.filter((block: any) => block?.type === "text").map((block: any) => block.text).join("\n") : "";
+	const rawText = Array.isArray(response.content) ? response.content.filter((block: any) => block?.type === "text").map((block: any) => block.text).join("\n") : "";
+	const text = withoutFileTracking(rawText);
 	if (!text.trim()) throw new Error("Summary was empty");
 	return { text, usage: response.usage };
 }

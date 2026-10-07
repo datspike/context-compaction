@@ -30,7 +30,7 @@ describe("bounded file navigation", () => {
 		expect(withoutFileTracking(OLD.replaceAll("\n", "\r\n"))).toBe(BODY.replaceAll("\n", "\r\n"));
 		const fenced = "````markdown\n```\n<read-files>\nexample.ts\n</read-files>\n````";
 		expect(withoutFileTracking(fenced)).toBe(fenced);
-		for (const raw of ["<read-files>\nunfinished", "before\n<read-files>\n<important>\nkeep\n</read-files>", "inline <read-files>literal</read-files>"]) expect(withoutFileTracking(raw)).toBe(raw);
+		for (const raw of ["<read-files>\nunfinished", "before\n<read-files>\n<important>\nkeep", "inline <read-files>literal</read-files>"]) expect(withoutFileTracking(raw)).toBe(raw);
 		const hints = formatFileHints({ readFiles: ["a.ts"], modifiedFiles: [] }, [tool("a.ts")], "");
 		expect(withoutFileTracking(BODY + hints)).toBe(BODY);
 	});
@@ -144,6 +144,56 @@ describe("summary integration", () => {
 			expect(event.preparation.previousSummary).toBe(OLD);
 			const tree: any = { signal: event.signal, preparation: { userWantsSummary: true, entriesToSummarize: [{ type: "branch_summary", id: "b", summary: OLD, fromId: "a", timestamp: new Date(0).toISOString() }] } };
 			expect(await russianTreeSummary(tree, ctx)).toBeUndefined();
+		}
+	});
+});
+
+describe("tracking boundary regressions", () => {
+	const trackingOnly = (heading: string) => `<file-hints>\n${heading}\nNOT-SEMANTIC-BODY\n</file-hints>`;
+	test("tracking-only generated history and prefix use fallback independently", async () => {
+		for (const mode of ["normal", "history", "prefix", "prefix-no-history"]) {
+			const responses = mode === "history" ? [trackingOnly("## Цель"), "## Исходный запрос\nKeep prefix"]
+				: mode === "prefix" ? [BODY, trackingOnly("## Исходный запрос")]
+				: [trackingOnly(mode === "normal" ? "## Цель" : "## Исходный запрос")];
+			const { ctx, event } = fixture(responses);
+			if (mode !== "normal") {
+				event.preparation.isSplitTurn = true;
+				event.preparation.turnPrefixMessages = [tool("src/current.ts")];
+				if (mode === "prefix-no-history") event.preparation.messagesToSummarize = [];
+			}
+			expect(await russianCompaction(event, ctx)).toBeUndefined();
+			expect(event.preparation.previousSummary).toBe(OLD);
+		}
+	});
+
+	test("tree rejects tracking-only output even with replaceInstructions", async () => {
+		for (const replaceInstructions of [false, true]) {
+			const { ctx } = fixture([trackingOnly("## Цель")]);
+			const event: any = { signal: new AbortController().signal, preparation: { userWantsSummary: true, replaceInstructions, customInstructions: "Custom summary", entriesToSummarize: [{ type: "branch_summary", summary: OLD, fromId: "a", timestamp: new Date(0).toISOString() }] } };
+			expect(await russianTreeSummary(event, ctx)).toBeUndefined();
+		}
+	});
+
+	test("legacy filenames cannot keep a large completed list in the next compact or displace tree context", async () => {
+		for (const unusual of ["<draft>.ts", "<draft>", "```notes.ts", "~~~notes.ts"]) {
+			const paths = [unusual, ...Array.from({ length: 10000 }, (_, i) => `archive/${i}.ts`)];
+			const previous = `${BODY}\n\n<read-files>\n${paths.join("\n")}\n</read-files>`;
+			const { ctx, event, prompts } = fixture();
+			event.preparation.previousSummary = previous;
+			event.branchEntries = [{ type: "compaction", details: { readFiles: paths } }];
+			const result = (await russianCompaction(event, ctx))!.compaction;
+			expect(prompts[0]).not.toContain("archive/9999.ts");
+			expect(result.details.readFiles).toContain(unusual);
+			expect(result.details.readFiles).toContain("archive/9999.ts");
+			ctx.model.contextWindow = 18000;
+			const tree: any = { signal: event.signal, preparation: { userWantsSummary: true, entriesToSummarize: [
+				{ type: "message", message: { role: "user", content: "EARLIER_SEMANTIC_OBLIGATION", timestamp: 0 }, timestamp: new Date(0).toISOString() },
+				{ type: "branch_summary", summary: previous, fromId: "a", timestamp: new Date(1).toISOString(), details: { readFiles: paths } },
+			] } };
+			const treeResult = (await russianTreeSummary(tree, ctx))!.summary;
+			expect(prompts[1]).not.toContain("archive/9999.ts");
+			expect(prompts[1]).toContain("EARLIER_SEMANTIC_OBLIGATION");
+			expect(treeResult.details.readFiles).toContain(unusual);
 		}
 	});
 });
