@@ -1,3 +1,4 @@
+import { collectFileLists, formatFileHints, withoutFileTracking, withoutMessageFileTracking } from "./file-hints.js";
 import {
 	convertToLlm,
 	prepareBranchEntries,
@@ -26,7 +27,7 @@ export const RUSSIAN_COMPACTION_FOCUS = `
 
 Не продолжай разговор и не отвечай на вопросы из истории: выведи только структурированное summary. Будь кратким, но не выбрасывай незавершённую работу, ограничения, принятые решения, причины решений, ошибки и данные, необходимые для продолжения.
 Пиши по-русски также контекст разрезанного хода. Для него используй разделы «## Исходный запрос», «## Прогресс на текущий момент» и «## Контекст для продолжения».
-Не переводи и не изменяй точные технические фрагменты: пути, имена файлов, команды, идентификаторы, имена функций, API, сообщения ошибок и код. Не создавай и не дублируй machine-readable блоки вроде <read-files> и <modified-files>: Pi добавит их сам.`.trim();
+Не переводи и не изменяй точные технические фрагменты: пути, имена файлов, команды, идентификаторы, имена функций, API, сообщения ошибок и код. Сохраняй в смысловом тексте точные пути, необходимые для незавершённой работы, проверок и ограничений. Не создавай блоки <read-files>, <modified-files> или <file-hints>: расширение добавит ограниченные файловые наводки отдельно.`.trim();
 
 export const RUSSIAN_TREE_SUMMARY_INSTRUCTIONS = `Составь краткое структурированное summary оставляемой ветки, чтобы к ней можно было вернуться позже.
 
@@ -55,7 +56,7 @@ export const RUSSIAN_TREE_SUMMARY_INSTRUCTIONS = `Составь краткое 
 ## Следующие шаги
 1. [Что нужно сделать дальше]
 
-Сохраняй точные пути, имена файлов, функции, команды и сообщения ошибок. Не продолжай разговор и не добавляй ответов на вопросы из истории; выведи только summary. Не создавай machine-readable блоки: Pi добавит их сам.`.trim();
+Сохраняй точные пути, имена файлов, функции, команды и сообщения ошибок. Не продолжай разговор и не добавляй ответов на вопросы из истории; выведи только summary. Сохраняй в смысловом тексте точные пути для незавершённой работы и проверок. Не создавай блоки <read-files>, <modified-files> или <file-hints>: расширение добавит файловые наводки отдельно.`.trim();
 
 const SUMMARY_HEADINGS: Readonly<Record<string, string>> = {
 	"## Goal": "## Цель",
@@ -131,36 +132,11 @@ function hasLocalizedPrefixStructure(summary: string): boolean {
 	return hasStructuralHeading(summary, ["## Исходный запрос"]);
 }
 
-type FileOps = { read?: Set<string>; written?: Set<string>; edited?: Set<string> };
-type FileLists = { readFiles: string[]; modifiedFiles: string[] };
 
 type SummaryResponse = {
 	text: string;
 	usage?: unknown;
 };
-
-function collectCumulativeFileLists(fileOps: FileOps | undefined, entries: readonly any[]): FileLists {
-	const read = new Set<string>(fileOps?.read ?? []);
-	const modified = new Set<string>([...(fileOps?.written ?? []), ...(fileOps?.edited ?? [])]);
-	for (const entry of entries) {
-		if (entry?.type !== "compaction" && entry?.type !== "branch_summary") continue;
-		const details = entry.details;
-		if (!details || typeof details !== "object") continue;
-		for (const path of Array.isArray(details.readFiles) ? details.readFiles : []) if (typeof path === "string") read.add(path);
-		for (const path of Array.isArray(details.modifiedFiles) ? details.modifiedFiles : []) if (typeof path === "string") modified.add(path);
-	}
-	return {
-		readFiles: [...read].filter((path) => !modified.has(path)).sort(),
-		modifiedFiles: [...modified].sort(),
-	};
-}
-
-function formatFileOperations(files: FileLists): string {
-	const sections: string[] = [];
-	if (files.readFiles.length > 0) sections.push(`<read-files>\n${files.readFiles.join("\n")}\n</read-files>`);
-	if (files.modifiedFiles.length > 0) sections.push(`<modified-files>\n${files.modifiedFiles.join("\n")}\n</modified-files>`);
-	return sections.length > 0 ? `\n\n${sections.join("\n\n")}` : "";
-}
 
 function combineUsage(first: any, second: any): any {
 	if (!first) return second;
@@ -209,8 +185,9 @@ async function completeSummary(ctx: ExtensionContext, prompt: string, maxTokens:
 }
 
 function conversationPrompt(messages: any[], instructions: string, previousSummary?: string): string {
-	const conversationText = serializeConversation(convertToLlm(messages));
-	return `<conversation>\n${conversationText}\n</conversation>\n\n${previousSummary ? `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n` : ""}${instructions}`;
+	const conversationText = serializeConversation(convertToLlm(withoutMessageFileTracking(messages)));
+	const previous = previousSummary ? withoutFileTracking(previousSummary) : undefined;
+	return `<conversation>\n${conversationText}\n</conversation>\n\n${previous ? `<previous-summary>\n${previous}\n</previous-summary>\n\n` : ""}${instructions}`;
 }
 
 async function summarizeMessages(ctx: ExtensionContext, messages: any[], instructions: string, previousSummary: string | undefined, maxTokens: number, signal: AbortSignal): Promise<SummaryResponse> {
@@ -248,7 +225,7 @@ export async function russianCompaction(event: SessionBeforeCompactEvent, ctx: E
 		let summary: string;
 		let usage: unknown;
 		if (preparation.isSplitTurn && preparation.turnPrefixMessages.length > 0) {
-			let historyText = preparation.previousSummary ? localizeSummaryStructure(preparation.previousSummary) : "Предыдущей истории нет.";
+			let historyText = preparation.previousSummary ? localizeSummaryStructure(withoutFileTracking(preparation.previousSummary)) : "Предыдущей истории нет.";
 			let historyUsage: unknown;
 			if (preparation.messagesToSummarize.length > 0) {
 				const history = await summarizeMessages(ctx, preparation.messagesToSummarize, instructions, preparation.previousSummary, maxTokens, event.signal);
@@ -269,10 +246,12 @@ export async function russianCompaction(event: SessionBeforeCompactEvent, ctx: E
 			usage = result.usage;
 			if (!hasLocalizedSummaryStructure(summary, false)) return undefined;
 		}
-		const files = collectCumulativeFileLists(preparation.fileOps, event.branchEntries);
+		summary = withoutFileTracking(summary);
+		const files = collectFileLists(preparation.fileOps, event.branchEntries);
+		const hints = formatFileHints(files, [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages], summary);
 		return {
 			compaction: {
-				summary: `${summary}${formatFileOperations(files)}`,
+				summary: `${summary}${hints}`,
 				firstKeptEntryId: preparation.firstKeptEntryId,
 				tokensBefore: preparation.tokensBefore,
 				usage,
@@ -290,7 +269,9 @@ export async function russianTreeSummary(event: SessionBeforeTreeEvent, ctx: Ext
 	try {
 		const reserveTokens = DEFAULT_RESERVE_TOKENS;
 		const tokenBudget = Math.max(0, (ctx.model.contextWindow || 128_000) - reserveTokens);
-		const prepared = prepareBranchEntries(event.preparation.entriesToSummarize, tokenBudget);
+		const entries = event.preparation.entriesToSummarize.map((entry) => entry.type === "compaction" || entry.type === "branch_summary"
+			? { ...entry, summary: withoutFileTracking(entry.summary) } : entry);
+		const prepared = prepareBranchEntries(entries, tokenBudget);
 		if (prepared.messages.length === 0) return undefined;
 		const replaceInstructions = Boolean(event.preparation.replaceInstructions && event.preparation.customInstructions);
 		const instructions = replaceInstructions
@@ -299,12 +280,12 @@ export async function russianTreeSummary(event: SessionBeforeTreeEvent, ctx: Ext
 				? `${RUSSIAN_TREE_SUMMARY_INSTRUCTIONS}\n\nДополнительные инструкции текущего перехода по дереву:\n${event.preparation.customInstructions}`
 				: RUSSIAN_TREE_SUMMARY_INSTRUCTIONS;
 		const result = await completeSummary(ctx, conversationPrompt(prepared.messages, instructions), Math.min(4096, ctx.model.maxTokens > 0 ? ctx.model.maxTokens : Number.POSITIVE_INFINITY), event.signal);
-		const summary = localizeSummaryStructure(stripBranchSummaryPreamble(result.text));
+		const summary = withoutFileTracking(localizeSummaryStructure(stripBranchSummaryPreamble(result.text)));
 		if (!replaceInstructions && !hasLocalizedSummaryStructure(summary, false)) return undefined;
-		const files = collectCumulativeFileLists(prepared.fileOps, event.preparation.entriesToSummarize);
+		const files = collectFileLists(prepared.fileOps, event.preparation.entriesToSummarize);
 		return {
 			summary: {
-				summary: `${summary}${formatFileOperations(files)}`,
+				summary: `${summary}${formatFileHints(files, prepared.messages, summary)}`,
 				usage: result.usage,
 				details: files,
 			},

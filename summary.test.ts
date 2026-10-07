@@ -106,7 +106,9 @@ test("Russian compact keeps localized headings, split-turn context and cumulativ
 	const event = { preparation, branchEntries: [], signal: new AbortController().signal } as any;
 	const normal = await russianCompaction(event, ctx);
 	expect(normal?.compaction.summary).toContain("## Цель\nContinue work");
-	expect(normal?.compaction.summary).toContain("<modified-files>\nsrc/b.ts\n</modified-files>");
+	expect(normal?.compaction.summary).toContain("<file-hints>");
+	expect(normal?.compaction.summary).not.toContain("<modified-files>");
+	expect(normal?.compaction.details.modifiedFiles).toEqual(["src/b.ts"]);
 	const message = { role: "user", content: [{ type: "text", text: "Continue the feature" }], timestamp: 1 };
 	const split = await russianCompaction({ ...event, preparation: { ...preparation, isSplitTurn: true, messagesToSummarize: [message], turnPrefixMessages: [message] } }, ctx);
 	expect(split?.compaction.summary).toContain("**Контекст разрезанного хода:**\n## Исходный запрос");

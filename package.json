@@ -16,6 +16,7 @@
     "policy.ts",
     "session-state.ts",
     "summary.ts",
+    "file-hints.ts",
     "README.md",
     "LICENSE",
     "package.json"

@@ -1,0 +1,149 @@
+import { describe, expect, test } from "bun:test";
+import { collectFileLists, FILE_HINTS_MAX_CHARS, formatFileHints, withoutFileTracking, withoutMessageFileTracking } from "./file-hints.js";
+import { russianCompaction, russianTreeSummary } from "./summary.js";
+
+const BODY = "## Цель\nСохранить смысл задачи.\n## Ограничения и предпочтения\nНе менять production.\n## Прогресс\nИсправить src/current.ts.\n## Следующие шаги\nПроверить tests/current.test.ts; старый результат не повторять.";
+const OLD = `${BODY}\n\n<read-files>\narchive/old.ts\n</read-files>\n\n<modified-files>\narchive/changed.ts\n</modified-files>`;
+const usage = { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 30 };
+const tool = (path: string, name = "read") => ({ role: "assistant", content: [{ type: "toolCall", name, arguments: { path } }] });
+function fixture(texts = [BODY]) {
+	const prompts: string[] = [];
+	const options: any[] = [];
+	const ctx: any = {
+		model: { maxTokens: 16384, contextWindow: 272000 },
+		modelRegistry: { complete: async (_model: any, context: any, opts: any) => {
+			prompts.push(context.messages[0].content[0].text); options.push(opts);
+			return { stopReason: "stop", content: [{ type: "text", text: texts.shift() ?? BODY }], usage };
+		} },
+	};
+	const event: any = { signal: new AbortController().signal, branchEntries: [{ type: "compaction", details: { readFiles: ["archive/old.ts"], modifiedFiles: ["archive/changed.ts"] } }], preparation: {
+		previousSummary: OLD, messagesToSummarize: [tool("src/current.ts", "edit")], turnPrefixMessages: [],
+		fileOps: { read: new Set(["tests/current.test.ts"]), edited: new Set(["src/current.ts"]), written: new Set() },
+		settings: { reserveTokens: 16384 }, firstKeptEntryId: "retained", tokensBefore: 256000, isSplitTurn: false,
+	} };
+	return { ctx, event, prompts, options };
+}
+
+describe("bounded file navigation", () => {
+	test("removes old and new tracking without removing prose or fenced examples", () => {
+		expect(withoutFileTracking(OLD)).toBe(BODY);
+		expect(withoutFileTracking(OLD.replaceAll("\n", "\r\n"))).toBe(BODY.replaceAll("\n", "\r\n"));
+		const fenced = "````markdown\n```\n<read-files>\nexample.ts\n</read-files>\n````";
+		expect(withoutFileTracking(fenced)).toBe(fenced);
+		for (const raw of ["<read-files>\nunfinished", "before\n<read-files>\n<important>\nkeep\n</read-files>", "inline <read-files>literal</read-files>"]) expect(withoutFileTracking(raw)).toBe(raw);
+		const hints = formatFileHints({ readFiles: ["a.ts"], modifiedFiles: [] }, [tool("a.ts")], "");
+		expect(withoutFileTracking(BODY + hints)).toBe(BODY);
+	});
+
+	test("never sanitizes user/tool contents; copies summary messages only", () => {
+		const input = [{ role: "user", content: OLD }, { role: "toolResult", content: OLD }, { role: "branchSummary", summary: OLD }];
+		const result = withoutMessageFileTracking(input);
+		expect(result[0]).toBe(input[0]); expect(result[1]).toBe(input[1]);
+		expect(result[2].summary).toBe(BODY); expect(input[2].summary).toBe(OLD);
+	});
+
+	test("keeps cumulative metadata exact, filters malformed details, and preserves roots", () => {
+		const files = collectFileLists({ read: new Set(["a.ts", "/repo/a.ts"]) }, [
+			{ type: "compaction", fromHook: true, details: { modifiedFiles: ["a.ts", "other/a.ts", 123], readFiles: ["space name.ts"] } },
+			{ type: "branch_summary", details: { readFiles: "invalid" } },
+			{ type: "message", details: { modifiedFiles: ["not-a-ledger.ts"] } },
+		]);
+		expect(files).toEqual({ readFiles: ["/repo/a.ts", "space name.ts"], modifiedFiles: ["a.ts", "other/a.ts"] });
+	});
+
+	test("groups exact names, does not claim current diff, and keeps historical files out of exact hints", () => {
+		const files = { readFiles: ["/repo/src/a.ts", "/repo/src/b.ts", "/other/src/a.ts", "archive/old.ts"], modifiedFiles: ["tests/test.ts"] };
+		const hints = formatFileHints(files, [tool("/repo/src/b.ts"), tool("/repo/src/a.ts"), tool("/other/src/a.ts")], "tests/test.ts");
+		expect(hints).toContain('"/repo/src/":'); expect(hints).toContain('"/other/src/":');
+		expect(hints).toContain('"test.ts" [изменялся]');
+		expect(hints).not.toContain("old.ts"); expect(hints).toContain("не список текущих изменений");
+	});
+
+	test("bounds even huge histories and long/unusual names without truncating exact paths", () => {
+		const paths = Array.from({ length: 10000 }, (_, i) => `/root/${i}/` + "long".repeat(70) + ".ts");
+		paths.push("/root/" + "x".repeat(20000), "new\nline.ts", 'quote"name.ts');
+		const files = { readFiles: paths, modifiedFiles: [] };
+		const hints = formatFileHints(files, paths.map((path) => tool(path)), BODY);
+		expect(hints.length).toBeLessThanOrEqual(FILE_HINTS_MAX_CHARS);
+		expect(hints).toContain('new\\nline.ts'); expect(hints).toContain('quote\\"name.ts');
+		expect(hints).not.toContain("x".repeat(500));
+		expect(files.readFiles.length).toBe(10003);
+	});
+});
+
+describe("summary integration", () => {
+	test("normal compact excludes the historical appendix from input and output but preserves metadata and prose", async () => {
+		const { ctx, event, prompts, options } = fixture();
+		const original = JSON.stringify(event, (_key, value) => value instanceof Set ? [...value] : value);
+		const result = (await russianCompaction(event, ctx))!.compaction;
+		expect(prompts[0]).not.toContain("archive/old.ts");
+		expect(prompts[0]).toContain(BODY);
+		expect(result.summary.startsWith(BODY + "\n\n<file-hints>")).toBe(true);
+		expect(result.summary).not.toContain("<read-files>");
+		expect(result.details).toEqual({ readFiles: ["archive/old.ts", "tests/current.test.ts"], modifiedFiles: ["archive/changed.ts", "src/current.ts"] });
+		expect(result.firstKeptEntryId).toBe("retained"); expect(result.usage).toEqual(usage);
+		expect(options[0].signal).toBe(event.signal);
+		expect(JSON.stringify(event, (_key, value) => value instanceof Set ? [...value] : value)).toBe(original);
+	});
+
+	test("split turn with no history generation carries semantic history, not its appendices", async () => {
+		const prefix = "## Исходный запрос\nПродолжить работу.\n## Контекст для продолжения\nНе повторять старый запуск.";
+		const { ctx, event, prompts } = fixture([prefix]);
+		event.preparation.isSplitTurn = true;
+		event.preparation.messagesToSummarize = [];
+		event.preparation.turnPrefixMessages = [tool("src/current.ts")];
+		const result = (await russianCompaction(event, ctx))!.compaction;
+		expect(prompts.length).toBe(1);
+		expect(result.summary).toContain(BODY);
+		expect(result.summary).toContain(prefix);
+		expect(result.summary.match(/<file-hints>/g)?.length).toBe(1);
+		expect(result.summary).not.toContain("<read-files>");
+	});
+
+	test("split turn with history generation cleans nested summary messages and sums usage", async () => {
+		const { ctx, event, prompts } = fixture([BODY, "## Исходный запрос\nНовый шаг"]);
+		event.preparation.isSplitTurn = true;
+		event.preparation.messagesToSummarize.push({ role: "compactionSummary", summary: OLD, tokensBefore: 256000, timestamp: 0 });
+		event.preparation.turnPrefixMessages = [tool("src/current.ts")];
+		const result = (await russianCompaction(event, ctx))!.compaction;
+		expect(prompts.length).toBe(2); expect(prompts[0]).not.toContain("archive/old.ts");
+		expect(result.usage.totalTokens).toBe(60);
+	});
+
+	test("50 compacts keep hints bounded and all historical paths in details", async () => {
+		const { ctx, event } = fixture();
+		for (let i = 0; i < 50; i++) {
+			event.preparation.fileOps.edited.add(`.runtime/run-${i}/result.json`);
+			const result = (await russianCompaction(event, ctx))!.compaction;
+			expect(result.summary.length - BODY.length).toBeLessThanOrEqual(FILE_HINTS_MAX_CHARS);
+			expect(withoutFileTracking(result.summary)).toBe(BODY);
+			event.branchEntries.push({ type: "compaction", details: result.details });
+			event.preparation.previousSummary = result.summary;
+		}
+		expect(event.branchEntries.at(-1).details.modifiedFiles.length).toBe(52);
+	});
+
+	test("tree summarizes cleaned branch entries without mutating originals or losing inherited metadata", async () => {
+		const { ctx, prompts } = fixture();
+		const entry: any = { type: "branch_summary", id: "b1", parentId: null, timestamp: new Date(0).toISOString(), fromId: "source", summary: OLD, fromHook: true, details: { readFiles: ["archive/old.ts"], modifiedFiles: ["archive/changed.ts"] } };
+		const event: any = { signal: new AbortController().signal, preparation: { userWantsSummary: true, entriesToSummarize: [entry] } };
+		const result = (await russianTreeSummary(event, ctx))!.summary;
+		expect(prompts[0]).not.toContain("archive/old.ts"); expect(prompts[0]).toContain("Сохранить смысл задачи");
+		expect(result.details.modifiedFiles).toEqual(["archive/changed.ts"]); expect(entry.summary).toBe(OLD);
+		expect(result.usage).toEqual(usage);
+		event.preparation.replaceInstructions = true; event.preparation.customInstructions = "ONLY CUSTOM";
+		await russianTreeSummary(event, ctx);
+		expect(prompts[1]).toContain("ONLY CUSTOM"); expect(prompts[1]).not.toContain("Чего пользователь пытался добиться");
+	});
+
+	test("failed or invalid generation leaves native fallback available and inputs unchanged", async () => {
+		for (const response of [new Error("offline"), { stopReason: "length", content: [] }, { stopReason: "stop", content: [{ type: "text", text: "invalid" }] }]) {
+			const { ctx, event } = fixture();
+			ctx.modelRegistry.complete = async () => { if (response instanceof Error) throw response; return response; };
+			expect(await russianCompaction(event, ctx)).toBeUndefined();
+			expect(event.preparation.previousSummary).toBe(OLD);
+			const tree: any = { signal: event.signal, preparation: { userWantsSummary: true, entriesToSummarize: [{ type: "branch_summary", id: "b", summary: OLD, fromId: "a", timestamp: new Date(0).toISOString() }] } };
+			expect(await russianTreeSummary(tree, ctx)).toBeUndefined();
+		}
+	});
+});
