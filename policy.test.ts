@@ -3,6 +3,7 @@ import { formatFooter, resolvePolicy } from "./policy.js";
 
 describe("policy", () => {
 	const model = { provider: "custom", id: "large", contextWindow: 272_000 };
+	const longTier = { longPricingTierAvailable: true };
 
 	test.each([
 		[undefined, 272_000, 256_000],
@@ -14,7 +15,7 @@ describe("policy", () => {
 		[600_000, 372_000, 356_000],
 		[1_050_000, 372_000, 356_000],
 	])("long-once capability %p", (declared, window, threshold) => {
-		const policy = resolvePolicy("long-once", model, declared);
+		const policy = resolvePolicy("long-once", model, declared, longTier);
 		expect(policy).toMatchObject({ window, threshold, longOnceAvailable: declared !== undefined && declared > 272_000 });
 	});
 
@@ -28,7 +29,7 @@ describe("policy", () => {
 		[600_000, 600_000, 584_000],
 		[1_050_000, 600_000, 584_000],
 	])("long-chat capability %p", (declared, window, threshold) => {
-		const policy = resolvePolicy("long-chat", model, declared);
+		const policy = resolvePolicy("long-chat", model, declared, longTier);
 		expect(policy).toMatchObject({ window, threshold, longChatAvailable: declared !== undefined && declared > 272_000 });
 	});
 
@@ -36,6 +37,19 @@ describe("policy", () => {
 		const overridden = { ...model, contextWindow: 600_000 };
 		expect(resolvePolicy("long-once", overridden)).toMatchObject({ mode: "economy", window: 600_000, longOnceAvailable: false, source: "fallback" });
 		expect(resolvePolicy("long-chat", overridden, 272_000)).toMatchObject({ mode: "economy", window: 272_000, threshold: 256_000, longChatAvailable: false, source: "exact-registry" });
+	});
+
+	test("declared capability does not enable long without an exact pricing tier", () => {
+		expect(resolvePolicy("long-chat", model, 600_000)).toMatchObject({ mode: "economy", window: 272_000, threshold: 256_000, source: "exact-registry", longChatAvailable: false });
+		expect(resolvePolicy("long-chat", model, 600_000, longTier)).toMatchObject({ mode: "long-chat", window: 600_000, threshold: 584_000, source: "exact-registry", longChatAvailable: true });
+	});
+
+	test("session override enables explicit long modes without changing economy", () => {
+		const options = { sessionOverrideWindow: 600_000, longPricingTierAvailable: true };
+		expect(resolvePolicy("economy", model, 272_000, options)).toMatchObject({ mode: "economy", window: 272_000, threshold: 256_000, source: "exact-registry" });
+		expect(resolvePolicy("long-once", model, 272_000, options)).toMatchObject({ mode: "long-once", window: 372_000, threshold: 356_000, source: "session-override", longOnceAvailable: true });
+		expect(resolvePolicy("long-chat", model, 272_000, options)).toMatchObject({ mode: "long-chat", window: 600_000, threshold: 584_000, source: "session-override", longChatAvailable: true });
+		expect(resolvePolicy("off", model, 272_000, options)).toMatchObject({ mode: "off", window: 272_000, threshold: undefined, source: "off" });
 	});
 
 	test("economy is bounded by registry capability and off restores declared base window", () => {

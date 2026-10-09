@@ -7,7 +7,7 @@ import extension from "./index.js";
 const params = { mainObjective: "Продолжить цель", completedCheckpoint: "Завершён этап", continuationTarget: "Сделать следующий шаг" };
 let sequence = 0;
 
-function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: boolean; thinkingLevel?: string; modelSwitchThinkingLevel?: string; language?: "ru" | "en" } = {}) {
+function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: boolean; setModelResults?: Array<boolean | "reject">; emitModelSelect?: boolean; thinkingLevel?: string; modelSwitchThinkingLevel?: string; language?: "ru" | "en"; modelProvider?: string; modelId?: string; registryContextWindow?: number; registryTiers?: Array<{ inputTokensAbove: number }> } = {}) {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	let tool: any;
 	let command: any;
@@ -19,14 +19,15 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 	const audits: any[] = [];
 	const compactOptions: any[] = [];
 	const sent: string[] = [];
+	const setModelCalls: any[] = [];
 	const notices: Array<{ text: string; level: string }> = [];
 	const sessionManager = { getEntries: () => branch, getBranch: () => branch, getSessionId: () => sessionId, getSessionFile: () => undefined };
 	const ctx: any = {
 		cwd: "/tmp/context-compaction-test",
 		hasUI: true,
 		ui: { notify(text: string, level: string) { notices.push({ text, level }); }, setStatus() {} },
-		model: { provider: "openai", id: "gpt-5.6-sol", contextWindow: 272_000 },
-		modelRegistry: { getAll: () => [{ provider: "openai", id: "gpt-5.6-sol", contextWindow: 600_000 }] },
+		model: { provider: options.modelProvider ?? "openai", id: options.modelId ?? "gpt-5.6-sol", contextWindow: 272_000 },
+		modelRegistry: { getAll: () => [{ provider: options.modelProvider ?? "openai", id: options.modelId ?? "gpt-5.6-sol", contextWindow: options.registryContextWindow ?? 600_000, cost: { tiers: options.registryTiers ?? [{ inputTokensAbove: options.registryContextWindow ?? 600_000 }] } }] },
 		sessionManager,
 		getContextUsage: () => ({ tokens: 1_000, contextWindow: ctx.model.contextWindow, percent: 1 }),
 		isIdle: () => idle,
@@ -40,11 +41,15 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 			audits.push({ type, data });
 			branch = [...branch, { id: `append-${audits.length}`, type: "custom", customType: type, data }];
 		},
-		setModel(next: any) {
-			if (options.setModelResult === false) return Promise.resolve(false);
+		async setModel(next: any) {
+			setModelCalls.push(next);
+			const result = options.setModelResults?.shift() ?? options.setModelResult ?? true;
+			if (result === false) return false;
 			ctx.model = next;
+			if (options.emitModelSelect) await handlers.get("model_select")?.({}, ctx);
+			if (result === "reject") throw new Error("session transcript write failed");
 			if (options.modelSwitchThinkingLevel) thinkingLevel = options.modelSwitchThinkingLevel;
-			return Promise.resolve(true);
+			return true;
 		},
 		getThinkingLevel() { return thinkingLevel; },
 		setThinkingLevel(value: string) { thinkingLevel = value; },
@@ -62,7 +67,7 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 		rmSync(agentDir, { recursive: true, force: true });
 	}
 	return {
-		ctx, tool, command, audits, compactOptions, sent, notices,
+		ctx, tool, command, audits, compactOptions, sent, notices, setModelCalls,
 		hasEvent(name: string) { return handlers.has(name); },
 		get thinkingLevel() { return thinkingLevel; },
 		setBranch(value: any[]) { branch = value; },
@@ -185,6 +190,27 @@ describe("session-local context modes", () => {
 		expect(runtime.ctx.model.contextWindow).toBe(272_000);
 	});
 
+	test("long modes use a session override for any provider with an exact long pricing tier", async () => {
+		const runtime = setup({ modelProvider: "custom", registryContextWindow: 272_000, registryTiers: [{ inputTokensAbove: 272_000 }] });
+		await runtime.command("long-chat", runtime.ctx);
+		expect(runtime.ctx.model.contextWindow).toBe(600_000);
+		expect(runtime.notices.some((entry) => entry.text.includes("source=session-override"))).toBe(true);
+	});
+
+	test("long modes stay conservative without an exact long pricing tier", async () => {
+		const runtime = setup({ modelProvider: "custom", registryContextWindow: 272_000, registryTiers: [] });
+		await runtime.command("long-chat", runtime.ctx);
+		expect(runtime.ctx.model.contextWindow).toBe(272_000);
+		expect(runtime.notices.some((entry) => entry.text.includes("нет доступного long-tier"))).toBe(true);
+	});
+
+	test("declared capability without a long pricing tier stays conservative", async () => {
+		const runtime = setup({ modelProvider: "custom", registryContextWindow: 600_000, registryTiers: [] });
+		await runtime.command("long-chat", runtime.ctx);
+		expect(runtime.ctx.model.contextWindow).toBe(272_000);
+		expect(runtime.notices.some((entry) => entry.text.includes("нет доступного long-tier"))).toBe(true);
+	});
+
 	test("long-once returns to economy only after a successful native compact", async () => {
 		const runtime = setup();
 		await runtime.command("long-once", runtime.ctx);
@@ -212,5 +238,30 @@ describe("session-local context modes", () => {
 		expect(runtime.ctx.model.contextWindow).toBe(272_000);
 		expect(runtime.notices.some((entry) => entry.level === "error")).toBe(true);
 		expect(runtime.audits.some((entry) => entry.type === "context-compaction-mode" && entry.data.mode === "economy")).toBe(true);
+	});
+
+	test("restores the previous model after a partial setModel rejection", async () => {
+		const runtime = setup({ setModelResults: ["reject", true], emitModelSelect: true });
+		await runtime.command("long-chat", runtime.ctx);
+		expect(runtime.ctx.model.contextWindow).toBe(272_000);
+		expect(runtime.setModelCalls.map((model) => model.contextWindow)).toEqual([600_000, 272_000]);
+		expect(runtime.notices.some((entry) => entry.level === "error")).toBe(true);
+	});
+
+	test("retains the long mode when an economy transition fails after partial mutation", async () => {
+		const runtime = setup({ setModelResults: [true, "reject", true], emitModelSelect: true });
+		await runtime.command("long-chat", runtime.ctx);
+		await runtime.command("economy", runtime.ctx);
+		expect(runtime.ctx.model.contextWindow).toBe(600_000);
+		expect(runtime.notices.some((entry) => entry.text.includes("сохранён прежний режим"))).toBe(true);
+		expect(runtime.notices.some((entry) => entry.text.includes("context: long-chat") && entry.text.includes("600000"))).toBe(true);
+	});
+
+	test("keeps fallback visible after a repeated economy failure", async () => {
+		const runtime = setup({ setModelResults: ["reject", false, "reject", true], emitModelSelect: true });
+		await runtime.command("long-chat", runtime.ctx);
+		await runtime.command("economy", runtime.ctx);
+		expect(runtime.ctx.model.contextWindow).toBe(600_000);
+		expect(runtime.notices.some((entry) => entry.text.includes("context: economy") && entry.text.includes("600000") && entry.text.includes("source=fallback"))).toBe(true);
 	});
 });

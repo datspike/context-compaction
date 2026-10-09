@@ -14,7 +14,13 @@ import {
 	type CheckpointParams,
 } from "./checkpoint.js";
 import { loadSummaryLanguage } from "./language.js";
-import { formatFooter, resolvePolicy, type ContextMode } from "./policy.js";
+import {
+	ECONOMY_WINDOW,
+	formatFooter,
+	LONG_CHAT_MAXIMUM,
+	resolvePolicy,
+	type ContextMode,
+} from "./policy.js";
 import { appendMode, hasLegacyThreshold, restoreMode } from "./session-state.js";
 import { russianCompaction, russianTreeSummary } from "./summary.js";
 
@@ -55,9 +61,17 @@ export function getContextArgumentCompletions(prefix: string, language: "ru" | "
 	return items.map((item) => ({ ...item, description: descriptions[item.value] }));
 }
 
-function modelDeclaration(ctx: ExtensionContext): number | undefined {
+type RegistryDeclaration = { contextWindow?: number; hasLongPricingTier: boolean };
+
+function modelDeclaration(ctx: ExtensionContext): RegistryDeclaration {
 	const model = ctx.model;
-	return model && ctx.modelRegistry.getAll().find((candidate) => candidate.provider === model.provider && candidate.id === model.id)?.contextWindow;
+	const candidate = model && ctx.modelRegistry.getAll().find((entry) => entry.provider === model.provider && entry.id === model.id);
+	const contextWindow = candidate?.contextWindow;
+	const hasLongPricingTier =
+		Number.isFinite(contextWindow) &&
+		contextWindow! >= ECONOMY_WINDOW &&
+		(candidate?.cost?.tiers?.some((tier) => Number.isFinite(tier.inputTokensAbove) && tier.inputTokensAbove >= contextWindow!) ?? false);
+	return { contextWindow, hasLongPricingTier };
 }
 
 function notice(ctx: ExtensionContext, text: string, level: "info" | "error" = "info"): void {
@@ -132,11 +146,16 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 	let operation: ManualOperation | undefined;
 	let sequence = 0;
 	let useActualWindowFallback = false;
+	let internalModelTransition = false;
 	let windowErrorNotified = false;
 	const runtimeId = randomUUID();
 	const anonymousIdentities = new WeakMap<object, Map<string, string>>();
 	const nextCorrelation = (): string => `${runtimeId}-${++sequence}`;
-	const resolvedPolicy = (ctx: ExtensionContext) => resolvePolicy(mode, ctx.model, modelDeclaration(ctx));
+	const resolvedPolicy = (ctx: ExtensionContext) => {
+		const declaration = modelDeclaration(ctx);
+		const sessionOverrideWindow = declaration.hasLongPricingTier ? LONG_CHAT_MAXIMUM : undefined;
+		return resolvePolicy(mode, ctx.model, declaration.contextWindow, { sessionOverrideWindow, longPricingTierAvailable: declaration.hasLongPricingTier });
+	};
 	const currentPolicy = (ctx: ExtensionContext) => {
 		const policy = resolvedPolicy(ctx);
 		const actualWindow = ctx.model?.contextWindow;
@@ -147,6 +166,14 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 			threshold: mode === "off" ? undefined : Math.floor(actualWindow * 0.75),
 			source: mode === "off" ? "off" as const : "fallback" as const,
 		};
+	};
+	const setModelInternally = async (model: any): Promise<boolean> => {
+		internalModelTransition = true;
+		try {
+			return await pi.setModel(model);
+		} finally {
+			internalModelTransition = false;
+		}
 	};
 	const audit = (ctx: ExtensionContext, op: { correlation: string; origin: AuditEntry["origin"]; scope: Scope }, phase: AuditEntry["phase"], reason: AuditReason, willRetry = false, tokensOverride?: number | null): void => {
 		const policy = currentPolicy(ctx);
@@ -163,21 +190,44 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		if (operation && !isCurrent(ctx, operation)) operation = undefined;
 		return operation;
 	};
-	const ensureWindow = async (ctx: ExtensionContext): Promise<boolean> => {
+	const ensureWindow = async (ctx: ExtensionContext, fallbackMode: ContextMode = "economy"): Promise<boolean> => {
 		useActualWindowFallback = false;
 		windowErrorNotified = false;
 		const policy = resolvedPolicy(ctx);
 		if (policy.mode !== mode) { setMode("economy", true); await ensureWindow(ctx); updateFooter(ctx); return false; }
 		if (!ctx.model || policy.window <= 0 || ctx.model.contextWindow === policy.window) return true;
+		const previousModel = ctx.model;
 		const thinkingLevel = pi.getThinkingLevel();
+		const restorePreviousModel = async (): Promise<boolean> => {
+			const matchesPrevious = () => ctx.model?.provider === previousModel.provider && ctx.model?.id === previousModel.id && ctx.model?.contextWindow === previousModel.contextWindow;
+			if (matchesPrevious()) return true;
+			try {
+				if (!await setModelInternally(previousModel)) return false;
+				pi.setThinkingLevel(thinkingLevel);
+				return matchesPrevious();
+			} catch {
+				return false;
+			}
+		};
 		try {
-			if (!await pi.setModel({ ...ctx.model, contextWindow: policy.window })) throw new Error("setModel returned false");
+			if (!await setModelInternally({ ...ctx.model, contextWindow: policy.window })) throw new Error("setModel returned false");
 			pi.setThinkingLevel(thinkingLevel);
 		} catch {
-			if (mode !== "economy") setMode("economy", true);
-			useActualWindowFallback = true;
+			const restored = await restorePreviousModel();
+			let safeMode = false;
+			if (restored) {
+				setMode(fallbackMode, true);
+				safeMode = ctx.model?.contextWindow === resolvedPolicy(ctx).window;
+				useActualWindowFallback = !safeMode;
+			} else {
+				setMode("economy", true);
+				useActualWindowFallback = true;
+			}
+			const message = safeMode
+				? text("Не удалось применить окно контекста; сохранён прежний режим", "Could not apply the context window; retained the previous mode")
+				: text("Не удалось применить окно контекста и восстановить согласованное окно; отображается фактическое окно, повторите выбор economy", "Could not apply the context window or restore a consistent window; showing the actual window, select economy again");
 			updateFooter(ctx);
-			notice(ctx, text("Не удалось применить окно контекста; включён безопасный режим economy", "Could not apply the context window; switched to safe economy mode"), "error");
+			notice(ctx, message, "error");
 			windowErrorNotified = true;
 			return false;
 		}
@@ -198,7 +248,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		updateFooter(ctx);
 	};
 	const restoreAfterSuccessfulCompact = async (ctx: ExtensionContext): Promise<void> => {
-		if (mode === "long-once") { setMode("economy", true); await ensureWindow(ctx); }
+		if (mode === "long-once") { setMode("economy", true); await ensureWindow(ctx, "long-once"); }
 		else if (mode === "long-chat") await ensureWindow(ctx);
 		updateFooter(ctx);
 	};
@@ -258,8 +308,9 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 			const command = args.trim() || "status";
 			if (!CONTEXT_COMPLETIONS.some((item) => item.value === command)) { notice(ctx, text("Использование: /context [status|economy|long-once|long-chat|off]", "Usage: /context [status|economy|long-once|long-chat|off]"), "error"); return; }
 			if (command !== "status") {
+				const previousMode = mode;
 				setMode(command as ContextMode, true);
-				if (!(await ensureWindow(ctx)) && command !== "economy" && !windowErrorNotified) notice(ctx, text("Выбранный режим недоступен для точной текущей модели; оставлен economy", "This mode is unavailable for the exact current model; economy is retained"), "error");
+				if (!(await ensureWindow(ctx, previousMode)) && command !== "economy" && !windowErrorNotified) notice(ctx, text("Для точной записи модели нет доступного long-tier; оставлен economy", "The exact model entry has no available long tier; economy is retained"), "error");
 			}
 			const policy = currentPolicy(ctx);
 			notice(ctx, `context: ${mode}; model=${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : text("модель не выбрана", "no model selected")}; ${text("окно", "window")}=${policy.window}; compact@${policy.threshold ?? "native"}; source=${policy.source}`);
@@ -278,7 +329,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		await ensureWindow(ctx);
 		updateFooter(ctx);
 	});
-	pi.on("model_select", async (_event, ctx) => { await ensureWindow(ctx); updateFooter(ctx); });
+	pi.on("model_select", async (_event, ctx) => { if (internalModelTransition) { updateFooter(ctx); return; } await ensureWindow(ctx); updateFooter(ctx); });
 	pi.on("turn_end", (_event, ctx) => { updateFooter(ctx); });
 	pi.on("agent_settled", (_event, ctx) => {
 		const op = currentOperation(ctx);

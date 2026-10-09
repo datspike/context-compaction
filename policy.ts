@@ -1,10 +1,15 @@
 export type ContextMode = "economy" | "long-once" | "long-chat" | "off";
-export type PolicySource = "exact-registry" | "fallback" | "off";
+export type PolicySource = "exact-registry" | "session-override" | "fallback" | "off";
 
 export interface ModelIdentity {
 	provider?: string;
 	id?: string;
 	contextWindow?: number;
+}
+
+export interface PolicyOptions {
+	sessionOverrideWindow?: number;
+	longPricingTierAvailable?: boolean;
 }
 
 export interface ContextPolicy {
@@ -34,17 +39,22 @@ export function resolvePolicy(
 	mode: ContextMode,
 	model: ModelIdentity | undefined,
 	declaredWindow?: number,
+	options: PolicyOptions = {},
 ): ContextPolicy {
 	const registryWindow = validWindow(declaredWindow);
 	const actualWindow = validWindow(model?.contextWindow) ?? 0;
-	const source: PolicySource = registryWindow === undefined ? "fallback" : "exact-registry";
+	const sessionOverrideWindow = validWindow(options.sessionOverrideWindow);
+	const hasLongPricingTier = options.longPricingTierAvailable === true;
+	const useSessionOverride = hasLongPricingTier && mode !== "economy" && mode !== "off" && registryWindow !== undefined && sessionOverrideWindow !== undefined && sessionOverrideWindow > registryWindow;
+	const longCapabilityWindow = hasLongPricingTier ? (useSessionOverride ? sessionOverrideWindow : registryWindow) : undefined;
+	const source: PolicySource = registryWindow === undefined ? "fallback" : useSessionOverride ? "session-override" : "exact-registry";
 	const baseWindow = registryWindow ?? actualWindow;
 	const economyWindow = registryWindow === undefined ? actualWindow : Math.min(ECONOMY_WINDOW, registryWindow);
 	const economyThreshold = economyWindow === ECONOMY_WINDOW
 		? ECONOMY_THRESHOLD
 		: economyWindow > 0 ? Math.floor(economyWindow * 0.75) : undefined;
-	const longOnceWindow = registryWindow === undefined ? undefined : Math.min(LONG_ONCE_WINDOW, registryWindow);
-	const longChatWindow = registryWindow === undefined ? undefined : Math.min(LONG_CHAT_MAXIMUM, registryWindow);
+	const longOnceWindow = longCapabilityWindow === undefined ? undefined : Math.min(LONG_ONCE_WINDOW, longCapabilityWindow);
+	const longChatWindow = longCapabilityWindow === undefined ? undefined : Math.min(LONG_CHAT_MAXIMUM, longCapabilityWindow);
 	const longOnceAvailable = longOnceWindow !== undefined && longOnceWindow > economyWindow;
 	const longChatAvailable = longChatWindow !== undefined && longChatWindow > economyWindow;
 
@@ -57,7 +67,7 @@ export function resolvePolicy(
 	if (mode === "long-chat" && longChatAvailable) {
 		return { mode, window: longChatWindow!, threshold: longChatWindow! - COMPACTION_RESERVE, source, longOnceAvailable, longChatAvailable };
 	}
-	return { mode: "economy", window: economyWindow, threshold: economyThreshold, source, longOnceAvailable, longChatAvailable };
+	return { mode: "economy", window: economyWindow, threshold: economyThreshold, source: registryWindow === undefined ? "fallback" : "exact-registry", longOnceAvailable, longChatAvailable };
 }
 
 export function formatTokenCount(tokens: number): string {
