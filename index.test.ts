@@ -7,7 +7,7 @@ import extension from "./index.js";
 const params = { mainObjective: "Продолжить цель", completedCheckpoint: "Завершён этап", continuationTarget: "Сделать следующий шаг" };
 let sequence = 0;
 
-function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: boolean; setModelResults?: Array<boolean | "reject">; emitModelSelect?: boolean; thinkingLevel?: string; modelSwitchThinkingLevel?: string; language?: "ru" | "en"; modelProvider?: string; modelId?: string; registryContextWindow?: number; registryTiers?: Array<{ inputTokensAbove: number }> } = {}) {
+function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: boolean; setModelResults?: Array<boolean | "reject">; emitModelSelect?: boolean; thinkingLevel?: string; modelSwitchThinkingLevel?: string; language?: "ru" | "en"; appendCompaction?: boolean; modelProvider?: string; modelId?: string; registryContextWindow?: number; registryTiers?: Array<{ inputTokensAbove: number }> } = {}) {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	let tool: any;
 	let command: any;
@@ -58,7 +58,7 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 	const agentDir = mkdtempSync(join(tmpdir(), "context-compaction-test-profile-"));
 	const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
 	try {
-		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ contextCompaction: { summaryLanguage: options.language ?? "ru" } }));
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ contextCompaction: { summaryLanguage: options.language ?? "ru", appendCompaction: options.appendCompaction ?? false } }));
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		extension(pi);
 	} finally {
@@ -127,11 +127,14 @@ describe("public compaction lifecycle", () => {
 		expect(runtime.sent).toHaveLength(1);
 	});
 
-	test("English compact delegates manual, threshold and overflow summaries to Pi", async () => {
-		const runtime = setup({ language: "en" });
+	for (const appendCompaction of [false, true]) test(`English compact delegates manual, threshold and overflow summaries to Pi (append=${appendCompaction})`, async () => {
+		const runtime = setup({ language: "en", appendCompaction });
 		let customCalls = 0;
 		runtime.ctx.modelRegistry.complete = () => { customCalls++; throw new Error("Custom summarizer must not run in English mode"); };
+		runtime.ctx.modelRegistry.streamSimple = () => { customCalls++; throw new Error("Append summarizer must not run in English mode"); };
 		expect(runtime.hasEvent("session_before_tree")).toBe(false);
+		expect(runtime.hasEvent("context_with_system")).toBe(false);
+		expect(runtime.hasEvent("before_provider_request")).toBe(false);
 		const callback = await startManual(runtime);
 		expect(callback.customInstructions).toContain("## Main objective");
 		expect(callback.customInstructions).not.toContain("## Главная цель");

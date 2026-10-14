@@ -120,7 +120,7 @@ export function stripBranchSummaryPreamble(summary: string): string {
 		: summary.trim();
 }
 
-function hasStructuralHeading(summary: string, headings: string[]): boolean {
+export function hasStructuralHeading(summary: string, headings: string[]): boolean {
 	return classifySummaryLines(summary).some(({ line, protected: isProtected }) => !isProtected && headings.includes(line));
 }
 

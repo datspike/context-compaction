@@ -16,6 +16,7 @@
     "policy.ts",
     "session-state.ts",
     "summary.ts",
+    "append-compaction.ts",
     "file-hints.ts",
     "README.md",
     "docs/workflows.md",

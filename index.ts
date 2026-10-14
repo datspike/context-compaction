@@ -13,7 +13,8 @@ import {
 	prepareArguments,
 	type CheckpointParams,
 } from "./checkpoint.js";
-import { loadSummaryLanguage } from "./language.js";
+import { loadSummarySettings } from "./language.js";
+import { AppendCapture, appendCompaction, shouldUseStandardCompactFallback } from "./append-compaction.js";
 import {
 	ECONOMY_WINDOW,
 	formatFooter,
@@ -74,7 +75,7 @@ function modelDeclaration(ctx: ExtensionContext): RegistryDeclaration {
 	return { contextWindow, hasLongPricingTier };
 }
 
-function notice(ctx: ExtensionContext, text: string, level: "info" | "error" = "info"): void {
+function notice(ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "info"): void {
 	if (ctx.hasUI) ctx.ui.notify(text, level);
 }
 
@@ -140,7 +141,26 @@ function continuationGoalIsValid(snapshot: GoalSnapshot, entries: readonly Sessi
 
 /** Public-API extension: Pi owns automatic compaction and automatic continuation. */
 export default function contextCompaction(pi: ExtensionAPI): void {
-	const language = loadSummaryLanguage();
+	const settings = loadSummarySettings();
+	const language = settings.summaryLanguage;
+	const appendCapture = new AppendCapture();
+	const summarize = async (event: any, ctx: ExtensionContext) => {
+		if (!settings.appendCompaction) return russianCompaction(event, ctx);
+		const snapshot = appendCapture.get();
+		appendCapture.clear();
+		const started = Date.now();
+		const outcome = await appendCompaction(event, ctx, snapshot);
+		pi.appendEntry("context-compaction-append", { version: 1, outcome: outcome.kind, reason: "reason" in outcome ? outcome.reason : undefined, durationMs: Date.now() - started, usage: outcome.kind === "cancel" ? outcome.usage : undefined });
+		if (outcome.kind === "success") return { compaction: outcome.compaction };
+		if (shouldUseStandardCompactFallback(outcome)) {
+			notice(ctx, text(`Предупреждение: append compact не применён (${outcome.reason}); выполнен стандартный compact.`, `Warning: append compaction was not applied (${outcome.reason}); standard compaction was used.`), "warning");
+			return russianCompaction(event, ctx);
+		}
+		const op = currentOperation(ctx);
+		if (op) fail(ctx, op);
+		notice(ctx, text("Append compact не применён; история сохранена, автоматический повтор не выполняется.", "Append compaction was not applied; history is unchanged and no automatic retry is made."), "error");
+		return { cancel: true };
+	};
 	const text = (ru: string, en: string): string => language === "ru" ? ru : en;
 	let mode: ContextMode = "economy";
 	let operation: ManualOperation | undefined;
@@ -318,7 +338,12 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		},
 	});
 
+	if (settings.appendCompaction && language === "ru") {
+		pi.on("context_with_system", (event, ctx) => { appendCapture.context(event.messages, ctx); });
+		pi.on("before_provider_request", (event, ctx) => { appendCapture.payload(event.payload, ctx); });
+	}
 	pi.on("session_start", async (_event, ctx) => {
+		appendCapture.clear();
 		operation = undefined;
 		mode = restoreMode(ctx.sessionManager.getEntries());
 		const key = scopeOf(ctx, anonymousIdentities).sessionId;
@@ -343,16 +368,17 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		const op = currentOperation(ctx);
 		if (op?.lifecycle === "running" && reason === "manual") {
 			if (event.willRetry) op.continuationSuppressed = true;
-			if (language === "ru") return russianCompaction(event, ctx);
+			if (language === "ru") return summarize(event, ctx);
 			return;
 		}
 		if (event.willRetry && op) op.continuationSuppressed = true;
 		if (reason === "threshold" && op?.lifecycle === "pending") cancel(ctx, op);
 		external(ctx, "contained", reason, Boolean(event.willRetry), event.preparation?.tokensBefore);
-		if (language === "ru") return russianCompaction(event, ctx);
+		if (language === "ru") return summarize(event, ctx);
 	});
 	if (language === "ru") pi.on("session_before_tree", async (event: any, ctx) => russianTreeSummary(event, ctx));
 	pi.on("session_compact", async (event: any, ctx) => {
+		appendCapture.clear();
 		const reason = event.reason as AuditReason;
 		const op = currentOperation(ctx);
 		if (op?.lifecycle === "running" && reason === "manual") { markManualSuccess(ctx, op); return; }
