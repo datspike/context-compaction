@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-responses";
 import { Type } from "typebox";
-import { AppendCapture, appendCompaction, appendTask, preservesPayloadPrefix, shouldUseStandardCompactFallback } from "./append-compaction.js";
+import { APPEND_CANDIDATE_END, APPEND_CANDIDATE_START, AppendCapture, appendCompaction, appendTask, preservesPayloadPrefix, shouldUseStandardCompactFallback } from "./append-compaction.js";
 import { loadSummarySettings } from "./language.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -42,6 +42,14 @@ function fixture() {
 }
 
 describe("append compaction", () => {
+	test("exposes one empty candidate block without changing the surrounding prompt", () => {
+		const f = fixture();
+		const task = appendTask([...f.messages, f.progress, f.tail], f.event)!;
+		const block = `${APPEND_CANDIDATE_START}\n${APPEND_CANDIDATE_END}`;
+		expect(task).toContain(block);
+		const candidate = task.replace(block, `${APPEND_CANDIDATE_START}\nCANDIDATE\n${APPEND_CANDIDATE_END}`);
+		expect(candidate.replace(`${APPEND_CANDIDATE_START}\nCANDIDATE\n${APPEND_CANDIDATE_END}`, block)).toBe(task);
+	});
 	test("keeps input prefix, tools and system envelope verbatim; checks each separately", () => {
 		const f = fixture();
 		expect(preservesPayloadPrefix(f.payload, { ...f.payload, input: [...f.payload.input, { role: "user", content: "compact" }] })).toBe(true);

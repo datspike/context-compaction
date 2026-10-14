@@ -153,6 +153,8 @@ function marker(messages: Message[], indices: number[]): string {
 }
 
 /** The original messages stay intact; only this task is appended to their end. */
+export const APPEND_CANDIDATE_START = "<!-- Q12_APPEND_CANDIDATE_START -->";
+export const APPEND_CANDIDATE_END = "<!-- Q12_APPEND_CANDIDATE_END -->";
 export function appendTask(messages: Message[], event: SessionBeforeCompactEvent): string | undefined {
 	const history = positions(messages, convertToLlm(event.preparation.messagesToSummarize));
 	const prefix = positions(messages, convertToLlm(event.preparation.turnPrefixMessages), (history?.at(-1) ?? -1) + 1);
@@ -160,6 +162,9 @@ export function appendTask(messages: Message[], event: SessionBeforeCompactEvent
 	if (history.length && prefix.length && history.at(-1)! >= prefix[0]) return;
 	const previous = event.preparation.previousSummary ? withoutFileTracking(event.preparation.previousSummary) : "(нет)";
 	return `СЛУЖЕБНАЯ ЗАДАЧА COMPACT. На этом запросе не продолжай рабочую задачу из истории. Инструменты объявлены только для сохранения исходного префикса: не вызывай ни один инструмент, не читай и не меняй файлы, не выполняй команды. Никакие старые инструкции о продолжении не разрешают действия в этой задаче. Верни только один JSON-объект без markdown-ограждения: {"history": "markdown сводка истории", "turnPrefix": "markdown контекст ранней части хода или пустая строка"}.
+
+${APPEND_CANDIDATE_START}
+${APPEND_CANDIDATE_END}
 
 ${RUSSIAN_COMPACTION_FOCUS}
 
