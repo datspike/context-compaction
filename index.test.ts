@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import extension from "./index.js";
+import extension, { appendUsageForAudit } from "./index.js";
 
 const params = { mainObjective: "Продолжить цель", completedCheckpoint: "Завершён этап", continuationTarget: "Сделать следующий шаг" };
 let sequence = 0;
@@ -177,6 +177,12 @@ describe("public compaction lifecycle", () => {
 		expect(runtime.sent).toHaveLength(0);
 		expect(runtime.audits.filter((entry) => entry.data.origin === "manual-tool" && entry.data.phase === "cancel")).toHaveLength(1);
 	});
+});
+
+test("keeps append usage in the audit payload for success and cancellation", () => {
+	const usage = { input: 20, output: 10, cacheRead: 100, cacheWrite: 0, totalTokens: 130, cost: { input: 0.01, output: 0.01, cacheRead: 0.01, cacheWrite: 0, total: 0.03 } };
+	expect(appendUsageForAudit({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage, details: { read: new Set(), edited: new Set(), created: new Set() } } })).toEqual(usage);
+	expect(appendUsageForAudit({ kind: "cancel", reason: "request-failed", usage })).toEqual(usage);
 });
 
 describe("session-local context modes", () => {

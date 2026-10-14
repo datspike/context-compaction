@@ -25,6 +25,10 @@ import {
 import { appendMode, hasLegacyThreshold, restoreMode } from "./session-state.js";
 import { russianCompaction, russianTreeSummary } from "./summary.js";
 
+export function appendUsageForAudit(outcome: Awaited<ReturnType<typeof appendCompaction>>): unknown {
+	return outcome.kind === "success" ? outcome.compaction.usage : outcome.kind === "cancel" ? outcome.usage : undefined;
+}
+
 type ContextCompletion = { value: string; label: string; description: string };
 type Scope = { sessionId: string; branch: string };
 type UserWatermark = string | null;
@@ -150,7 +154,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		appendCapture.clear();
 		const started = Date.now();
 		const outcome = await appendCompaction(event, ctx, snapshot);
-		pi.appendEntry("context-compaction-append", { version: 1, outcome: outcome.kind, reason: "reason" in outcome ? outcome.reason : undefined, durationMs: Date.now() - started, usage: outcome.kind === "cancel" ? outcome.usage : undefined });
+		pi.appendEntry("context-compaction-append", { version: 1, outcome: outcome.kind, reason: "reason" in outcome ? outcome.reason : undefined, durationMs: Date.now() - started, usage: appendUsageForAudit(outcome) });
 		if (outcome.kind === "success") return { compaction: outcome.compaction };
 		if (shouldUseStandardCompactFallback(outcome)) {
 			notice(ctx, text(`Предупреждение: append compact не применён (${outcome.reason}); выполнен стандартный compact.`, `Warning: append compaction was not applied (${outcome.reason}); standard compaction was used.`), "warning");
