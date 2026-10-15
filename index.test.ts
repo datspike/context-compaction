@@ -21,12 +21,11 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 	const sent: string[] = [];
 	const setModelCalls: any[] = [];
 	const notices: Array<{ text: string; level: string }> = [];
-	const statuses: Array<{ key: string; text: string | undefined }> = [];
 	const sessionManager = { getEntries: () => branch, getBranch: () => branch, getSessionId: () => sessionId, getSessionFile: () => undefined };
 	const ctx: any = {
 		cwd: "/tmp/context-compaction-test",
 		hasUI: true,
-		ui: { notify(text: string, level: string) { notices.push({ text, level }); }, setStatus(key: string, text?: string) { statuses.push({ key, text }); } },
+		ui: { notify(text: string, level: string) { notices.push({ text, level }); }, setStatus() {} },
 		model: { provider: options.modelProvider ?? "openai", id: options.modelId ?? "gpt-5.6-sol", contextWindow: 272_000 },
 		modelRegistry: { getAll: () => [{ provider: options.modelProvider ?? "openai", id: options.modelId ?? "gpt-5.6-sol", contextWindow: options.registryContextWindow ?? 600_000, cost: { tiers: options.registryTiers ?? [{ inputTokensAbove: options.registryContextWindow ?? 600_000 }] } }] },
 		sessionManager,
@@ -68,7 +67,7 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 		rmSync(agentDir, { recursive: true, force: true });
 	}
 	return {
-		ctx, tool, command, audits, compactOptions, sent, notices, statuses, setModelCalls,
+		ctx, tool, command, audits, compactOptions, sent, notices, setModelCalls,
 		hasEvent(name: string) { return handlers.has(name); },
 		get thinkingLevel() { return thinkingLevel; },
 		setBranch(value: any[]) { branch = value; },
@@ -196,7 +195,7 @@ test("persists only the bounded mismatch diagnostic on the existing append audit
 
 test("formats append result warnings without affecting standard compact", () => {
 	const hit = formatAppendNotice({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: { cacheRead: 100, cost: { total: 0.03 } }, details: { read: new Set(), edited: new Set(), created: new Set() } } }, 12_345, "ru");
-	expect(hit).toEqual({ text: "append compact: cache hit · 12.3 s · $0.0300", level: "info" });
+	expect(hit).toEqual({ text: "append compact: cache hit · 12.3 s · $0.0300", level: "warning" });
 	const miss = formatAppendNotice({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: { cacheRead: 0, cost: { total: 0.08 } }, details: { read: new Set(), edited: new Set(), created: new Set() } } }, 1_000, "ru");
 	expect(miss).toEqual({ text: "append compact: cache miss · 1.0 s · $0.0800", level: "warning" });
 	expect(shouldNotifyAppendOutcome({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: {}, details: { read: new Set(), edited: new Set(), created: new Set() } } })).toBe(true);
@@ -213,12 +212,11 @@ test("formats append result warnings without affecting standard compact", () => 
 	expect(requestFailedWithoutUsage).toEqual({ text: "append compact: fallback (request-failed) · cache unavailable · standard compact · 2.5 s · cost unavailable", level: "warning" });
 });
 
-test("keeps the latest append result visible in the persistent status bar", () => {
+test("shows a successful append result in the same warning toast as fallback", () => {
 	const runtime = setup({ appendCompaction: true });
 	const success = { kind: "success" as const, compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: { cacheRead: 37_376, cost: { total: 0.02076512 } }, details: { read: new Set(), edited: new Set(), created: new Set() } } };
 	publishAppendNotice(runtime.ctx, success, 40_088, "ru");
-	expect(runtime.notices.at(-1)).toEqual({ text: "append compact: cache hit · 40.1 s · $0.0208", level: "info" });
-	expect(runtime.statuses.at(-1)).toEqual({ key: "context-compaction-append", text: "append compact: cache hit · 40.1 s · $0.0208" });
+	expect(runtime.notices.at(-1)).toEqual({ text: "append compact: cache hit · 40.1 s · $0.0208", level: "warning" });
 });
 
 describe("session-local context modes", () => {

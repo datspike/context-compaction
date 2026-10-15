@@ -54,7 +54,7 @@ export function formatAppendNotice(outcome: Awaited<ReturnType<typeof appendComp
 	const cache = usage ? (usage.cacheRead && usage.cacheRead > 0 ? "cache hit" : "cache miss") : requestFailedWithoutUsage ? "cache unavailable" : "cache not attempted";
 	const cost = usage ? (typeof usage.cost?.total === "number" ? ` · $${usage.cost.total.toFixed(4)}` : " · cost unavailable") : requestFailedWithoutUsage ? " · cost unavailable" : " · $0.0000";
 	if (outcome.kind === "success") {
-		return { text: language === "ru" ? `append compact: ${cache} · ${duration}${cost}` : `append compact: ${cache} · ${duration}${cost}`, level: usage?.cacheRead && usage.cacheRead > 0 ? "info" : "warning" };
+		return { text: language === "ru" ? `append compact: ${cache} · ${duration}${cost}` : `append compact: ${cache} · ${duration}${cost}`, level: "warning" };
 	}
 	if (shouldUseStandardCompactFallback(outcome)) {
 		return { text: language === "ru" ? `append compact: fallback (${outcome.reason}) · ${cache} · standard compact · ${duration}${cost}` : `append compact: fallback (${outcome.reason}) · ${cache} · standard compact · ${duration}${cost}`, level: "warning" };
@@ -65,7 +65,7 @@ export function formatAppendNotice(outcome: Awaited<ReturnType<typeof appendComp
 export function publishAppendNotice(ctx: ExtensionContext, outcome: Awaited<ReturnType<typeof appendCompaction>>, durationMs: number, language: "ru" | "en"): void {
 	if (!shouldNotifyAppendOutcome(outcome)) return;
 	const appendNotice = formatAppendNotice(outcome, durationMs, language);
-	notice(ctx, appendNotice.text, appendNotice.level, "context-compaction-append");
+	notice(ctx, appendNotice.text, appendNotice.level);
 }
 
 type ContextCompletion = { value: string; label: string; description: string };
@@ -118,10 +118,8 @@ function modelDeclaration(ctx: ExtensionContext): RegistryDeclaration {
 	return { contextWindow, hasLongPricingTier };
 }
 
-function notice(ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "info", statusKey?: string): void {
-	if (!ctx.hasUI) return;
-	ctx.ui.notify(text, level);
-	if (statusKey) ctx.ui.setStatus(statusKey, text);
+function notice(ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "info"): void {
+	if (ctx.hasUI) ctx.ui.notify(text, level);
 }
 
 function scopeOf(ctx: ExtensionContext, anonymousIdentities: WeakMap<object, Map<string, string>>): Scope {
