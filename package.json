@@ -11,6 +11,7 @@
   "files": [
     "index.ts",
     "audit.ts",
+    "card.ts",
     "checkpoint.ts",
     "language.ts",
     "policy.ts",

@@ -2,13 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import extension, { appendAuditPayload, appendUsageForAudit, formatAppendNotice, publishAppendNotice, shouldNotifyAppendOutcome } from "./index.js";
+import extension, { appendAuditPayload, appendUsageForAudit } from "./index.js";
 
 const params = { mainObjective: "Продолжить цель", completedCheckpoint: "Завершён этап", continuationTarget: "Сделать следующий шаг" };
 let sequence = 0;
 
 function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: boolean; setModelResults?: Array<boolean | "reject">; emitModelSelect?: boolean; thinkingLevel?: string; modelSwitchThinkingLevel?: string; language?: "ru" | "en"; appendCompaction?: boolean; modelProvider?: string; modelId?: string; registryContextWindow?: number; registryTiers?: Array<{ inputTokensAbove: number }> } = {}) {
 	const handlers = new Map<string, (...args: any[]) => any>();
+	const renderers = new Map<string, any>();
 	let tool: any;
 	let command: any;
 	let idle = false;
@@ -37,6 +38,7 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 		registerTool(value: any) { tool = value; },
 		registerCommand(_name: string, value: any) { command = value.handler; },
 		on(name: string, value: any) { handlers.set(name, value); },
+		registerEntryRenderer(type: string, renderer: any) { renderers.set(type, renderer); },
 		appendEntry(type: string, data: any) {
 			audits.push({ type, data });
 			branch = [...branch, { id: `append-${audits.length}`, type: "custom", customType: type, data }];
@@ -67,7 +69,7 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 		rmSync(agentDir, { recursive: true, force: true });
 	}
 	return {
-		ctx, tool, command, audits, compactOptions, sent, notices, setModelCalls,
+		ctx, tool, command, audits, renderers, compactOptions, sent, notices, setModelCalls,
 		hasEvent(name: string) { return handlers.has(name); },
 		get thinkingLevel() { return thinkingLevel; },
 		setBranch(value: any[]) { branch = value; },
@@ -193,30 +195,18 @@ test("persists only the bounded mismatch diagnostic on the existing append audit
 	expect(appendAuditPayload({ kind: "fallback", reason: "snapshot-unavailable" }, 0, undefined)).not.toHaveProperty("payloadMismatch");
 });
 
-test("formats append result warnings without affecting standard compact", () => {
-	const hit = formatAppendNotice({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: { cacheRead: 100, cost: { total: 0.03 } }, details: { read: new Set(), edited: new Set(), created: new Set() } } }, 12_345, "ru");
-	expect(hit).toEqual({ text: "append compact: cache hit · 12.3 s · $0.0300", level: "warning" });
-	const miss = formatAppendNotice({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: { cacheRead: 0, cost: { total: 0.08 } }, details: { read: new Set(), edited: new Set(), created: new Set() } } }, 1_000, "ru");
-	expect(miss).toEqual({ text: "append compact: cache miss · 1.0 s · $0.0800", level: "warning" });
-	expect(shouldNotifyAppendOutcome({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: {}, details: { read: new Set(), edited: new Set(), created: new Set() } } })).toBe(true);
-	expect(shouldNotifyAppendOutcome({ kind: "fallback", reason: "unsupported" })).toBe(true);
-	expect(shouldNotifyAppendOutcome({ kind: "cancel", reason: "aborted" })).toBe(false);
-	expect(shouldNotifyAppendOutcome({ kind: "fallback", reason: "context-changed" })).toBe(true);
-	const fallback = formatAppendNotice({ kind: "fallback", reason: "unsupported" }, 2_000, "ru");
-	expect(fallback).toEqual({ text: "append compact: fallback (unsupported) · cache not attempted · standard compact · 2.0 s · $0.0000", level: "warning" });
-	const contextChanged = formatAppendNotice({ kind: "fallback", reason: "context-changed" }, 300, "ru");
-	expect(contextChanged).toEqual({ text: "append compact: fallback (context-changed) · cache not attempted · standard compact · 0.3 s · $0.0000", level: "warning" });
-	const requestFailed = formatAppendNotice({ kind: "cancel", reason: "request-failed", usage: { cacheRead: 0, cost: { total: 0.08 } } }, 2_500, "ru");
-	expect(requestFailed).toEqual({ text: "append compact: fallback (request-failed) · cache miss · standard compact · 2.5 s · $0.0800", level: "warning" });
-	const requestFailedWithoutUsage = formatAppendNotice({ kind: "cancel", reason: "request-failed" }, 2_500, "ru");
-	expect(requestFailedWithoutUsage).toEqual({ text: "append compact: fallback (request-failed) · cache unavailable · standard compact · 2.5 s · cost unavailable", level: "warning" });
-});
-
-test("shows a successful append result in the same warning toast as fallback", () => {
-	const runtime = setup({ appendCompaction: true });
-	const success = { kind: "success" as const, compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: { cacheRead: 37_376, cost: { total: 0.02076512 } }, details: { read: new Set(), edited: new Set(), created: new Set() } } };
-	publishAppendNotice(runtime.ctx, success, 40_088, "ru");
-	expect(runtime.notices.at(-1)).toEqual({ text: "append compact: cache hit · 40.1 s · $0.0208", level: "warning" });
+test("writes a durable compact card after session_compact and never before it", async () => {
+	const runtime = setup({ language: "en" });
+	await runtime.event("session_before_compact", { reason: "threshold", willRetry: false });
+	expect(runtime.audits.filter((entry) => entry.type === "context-compaction-card")).toHaveLength(0);
+	await runtime.event("session_compact", { reason: "threshold", willRetry: false, compactionEntry: { tokensBefore: 258_796, summary: "x".repeat(400), usage: { input: 250_000, cacheRead: 0, cost: { total: 0.04 } } } });
+	const cards = runtime.audits.filter((entry) => entry.type === "context-compaction-card");
+	expect(cards).toHaveLength(1);
+	expect(cards[0].data).toMatchObject({ version: 1, kind: "standard", trigger: "threshold", tokensBefore: 258_796, summaryTokens: 100 });
+	expect(JSON.stringify(cards[0].data)).not.toContain("xxxx");
+	const rendered = runtime.renderers.get("context-compaction-card")({ data: cards[0].data }, { expanded: false }, { fg: (_c: string, text: string) => text });
+	expect(rendered.render(200)[0]).toContain("standard compact");
+	expect(runtime.notices.filter((notice) => notice.text.includes("append compact"))).toHaveLength(0);
 });
 
 describe("session-local context modes", () => {

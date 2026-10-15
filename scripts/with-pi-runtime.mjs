@@ -31,7 +31,7 @@ if (mode === "typecheck") {
   if (result.error || result.status !== 0) throw result.error ?? new Error(`Unable to execute TypeScript compiler at ${typeScriptBin}`);
 }
 const runtimeNodeModules = join(runtime, "node_modules");
-const dependencies = [["@earendil-works/pi-coding-agent", runtime], ["@earendil-works/pi-agent-core", core], ["@earendil-works/pi-ai", join(runtimeNodeModules, "@earendil-works/pi-ai")], ["typebox", join(runtimeNodeModules, "typebox")], ["@types/node", join(runtimeNodeModules, "@types/node")]];
+const dependencies = [["@earendil-works/pi-coding-agent", runtime], ["@earendil-works/pi-agent-core", core], ["@earendil-works/pi-ai", join(runtimeNodeModules, "@earendil-works/pi-ai")], ["@earendil-works/pi-tui", join(runtimeNodeModules, "@earendil-works/pi-tui")], ["typebox", join(runtimeNodeModules, "typebox")], ["@types/node", join(runtimeNodeModules, "@types/node")]];
 for (const [, path] of dependencies) if (!existsSync(path)) throw new Error(`Installed Pi runtime is missing required resolver closure: ${path}`);
 const created = [];
 for (const [name, target] of dependencies) {
@@ -41,7 +41,7 @@ for (const [name, target] of dependencies) {
 }
 try {
   const command = mode === "test"
-    ? ["bun", "test", "index.test.ts", "policy.test.ts", "session-state.test.ts", "summary.test.ts", "append-compaction.test.ts", "file-hints.test.ts", "scripts/discover-pi-runtime.test.mjs", "audit.test.ts"]
+    ? ["bun", "test", "index.test.ts", "policy.test.ts", "session-state.test.ts", "summary.test.ts", "append-compaction.test.ts", "file-hints.test.ts", "scripts/discover-pi-runtime.test.mjs", "audit.test.ts", "card.test.ts"]
     : [typeScriptBin, "-p", "tsconfig.json"];
   const result = spawnSync(command[0], command.slice(1), { cwd: extensionDir, stdio: "inherit", env: process.env });
   if (result.error) throw result.error;

@@ -13,6 +13,7 @@ import {
 	prepareArguments,
 	type CheckpointParams,
 } from "./checkpoint.js";
+import { COMPACT_CARD_TYPE, estimateSummaryTokens, renderCompactCard, type CompactCardData } from "./card.js";
 import { loadSummarySettings } from "./language.js";
 import { AppendCapture, appendCompaction, shouldUseStandardCompactFallback } from "./append-compaction.js";
 import {
@@ -41,31 +42,6 @@ export function appendAuditPayload(outcome: Awaited<ReturnType<typeof appendComp
 		usage: appendUsageForAudit(outcome),
 		...(outcome.kind === "fallback" && outcome.reason === "payload-mismatch" && outcome.payloadMismatch ? { payloadMismatch: outcome.payloadMismatch } : {}),
 	};
-}
-
-export function shouldNotifyAppendOutcome(outcome: Awaited<ReturnType<typeof appendCompaction>>): boolean {
-	return outcome.kind === "success" || shouldUseStandardCompactFallback(outcome);
-}
-
-export function formatAppendNotice(outcome: Awaited<ReturnType<typeof appendCompaction>>, durationMs: number, language: "ru" | "en"): { text: string; level: "info" | "warning" | "error" } {
-	const usage = appendUsageForAudit(outcome) as { cacheRead?: number; cost?: { total?: number } } | undefined;
-	const duration = `${(durationMs / 1000).toFixed(1)} s`;
-	const requestFailedWithoutUsage = outcome.kind === "cancel" && outcome.reason === "request-failed" && !usage;
-	const cache = usage ? (usage.cacheRead && usage.cacheRead > 0 ? "cache hit" : "cache miss") : requestFailedWithoutUsage ? "cache unavailable" : "cache not attempted";
-	const cost = usage ? (typeof usage.cost?.total === "number" ? ` · $${usage.cost.total.toFixed(4)}` : " · cost unavailable") : requestFailedWithoutUsage ? " · cost unavailable" : " · $0.0000";
-	if (outcome.kind === "success") {
-		return { text: language === "ru" ? `append compact: ${cache} · ${duration}${cost}` : `append compact: ${cache} · ${duration}${cost}`, level: "warning" };
-	}
-	if (shouldUseStandardCompactFallback(outcome)) {
-		return { text: language === "ru" ? `append compact: fallback (${outcome.reason}) · ${cache} · standard compact · ${duration}${cost}` : `append compact: fallback (${outcome.reason}) · ${cache} · standard compact · ${duration}${cost}`, level: "warning" };
-	}
-	return { text: language === "ru" ? `append compact: не применён (${outcome.reason}) · ${duration}` : `append compact: not applied (${outcome.reason}) · ${duration}`, level: "error" };
-}
-
-export function publishAppendNotice(ctx: ExtensionContext, outcome: Awaited<ReturnType<typeof appendCompaction>>, durationMs: number, language: "ru" | "en"): void {
-	if (!shouldNotifyAppendOutcome(outcome)) return;
-	const appendNotice = formatAppendNotice(outcome, durationMs, language);
-	notice(ctx, appendNotice.text, appendNotice.level);
 }
 
 type ContextCompletion = { value: string; label: string; description: string };
@@ -187,6 +163,8 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 	const settings = loadSummarySettings();
 	const language = settings.summaryLanguage;
 	const appendCapture = new AppendCapture();
+	/** Итог append между session_before_compact и session_compact: карточку пишем только после сохранения compaction. */
+	let pendingCard: Pick<CompactCardData, "kind" | "fallbackReason" | "provider" | "model" | "durationMs" | "repairAttempts"> | undefined;
 	const summarize = async (event: any, ctx: ExtensionContext) => {
 		if (!settings.appendCompaction) return russianCompaction(event, ctx);
 		const snapshot = appendCapture.get();
@@ -196,9 +174,14 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		const outcome = await appendCompaction(event, ctx, snapshot);
 		const durationMs = Date.now() - started;
 		pi.appendEntry("context-compaction-append", appendAuditPayload(outcome, durationMs, model));
-		publishAppendNotice(ctx, outcome, durationMs, language);
-		if (outcome.kind === "success") return { compaction: outcome.compaction };
-		if (shouldUseStandardCompactFallback(outcome)) return russianCompaction(event, ctx);
+		if (outcome.kind === "success") {
+			pendingCard = { kind: "append", provider: model?.provider, model: model?.id, durationMs, repairAttempts: outcome.repairAttempts ?? 0 };
+			return { compaction: outcome.compaction };
+		}
+		if (shouldUseStandardCompactFallback(outcome)) {
+			pendingCard = { kind: "standard", fallbackReason: outcome.reason, provider: model?.provider, model: model?.id };
+			return russianCompaction(event, ctx);
+		}
 		const op = currentOperation(ctx);
 		if (op) fail(ctx, op);
 		return { cancel: true };
@@ -419,8 +402,23 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		if (language === "ru") return summarize(event, ctx);
 	});
 	if (language === "ru") pi.on("session_before_tree", async (event: any, ctx) => russianTreeSummary(event, ctx));
+	if (typeof pi.registerEntryRenderer === "function") {
+		pi.registerEntryRenderer<CompactCardData>(COMPACT_CARD_TYPE, (entry, options, theme) => entry.data ? renderCompactCard(entry.data, options.expanded, theme, language) : undefined);
+	}
 	pi.on("session_compact", async (event: any, ctx) => {
 		appendCapture.clear();
+		const card = pendingCard;
+		pendingCard = undefined;
+		const entry = event.compactionEntry;
+		pi.appendEntry<CompactCardData>(COMPACT_CARD_TYPE, {
+			version: 1,
+			kind: "standard",
+			...card,
+			trigger: event.reason,
+			tokensBefore: entry?.tokensBefore,
+			summaryTokens: estimateSummaryTokens(entry?.summary),
+			usage: entry?.usage,
+		});
 		const reason = event.reason as AuditReason;
 		const op = currentOperation(ctx);
 		if (op?.lifecycle === "running" && reason === "manual") { markManualSuccess(ctx, op); return; }
@@ -429,6 +427,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		external(ctx, "success", reason, Boolean(event.willRetry), event.compactionEntry?.tokensBefore);
 	});
 	pi.on("session_compact_failed", (event: any, ctx) => {
+		pendingCard = undefined;
 		const reason = event.reason as AuditReason;
 		const op = currentOperation(ctx);
 		if (op?.lifecycle === "running" && reason === "manual") { fail(ctx, op, Boolean(event.willRetry)); return; }
