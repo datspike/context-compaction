@@ -215,9 +215,12 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 	const declared = ctx.modelRegistry.find(ctx.model!.provider, ctx.model!.id)?.contextWindow ?? ctx.model!.contextWindow;
 	const window = declared;
 	const maxTokens = Math.min(Math.floor(event.preparation.settings.reserveTokens * 0.8), ctx.model!.maxTokens);
-	const inputEstimate = Math.max(ctx.getContextUsage()?.tokens ?? 0,
-		Math.ceil(JSON.stringify(snapshot.payload).length / 3) + convertToLlm(additions.flatMap(sessionEntryToContextMessages)).reduce((sum, message) => sum + estimateTokens(message), 0));
-	if (!(window > 0 && maxTokens > 0) || inputEstimate + Math.ceil(task.length / 3) + maxTokens + WINDOW_MARGIN > window) return { kind: "fallback", reason: "insufficient-window" };
+	const contextUsage = ctx.getContextUsage()?.tokens;
+	const serializedPayloadEstimate = Math.ceil(JSON.stringify(snapshot.payload).length / 3);
+	const additionsEstimate = convertToLlm(additions.flatMap(sessionEntryToContextMessages)).reduce((sum, message) => sum + estimateTokens(message), 0);
+	const inputEstimate = contextUsage ?? serializedPayloadEstimate + additionsEstimate;
+	const taskEstimate = Math.ceil(task.length / 3);
+	if (!(window > 0 && maxTokens > 0) || inputEstimate + taskEstimate + maxTokens + WINDOW_MARGIN > window) return { kind: "fallback", reason: "insufficient-window" };
 	if (event.signal.aborted) return { kind: "cancel", reason: "aborted" };
 	const initialLeaf = leaf(ctx);
 	let payloadRejected = false;

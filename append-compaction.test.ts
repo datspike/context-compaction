@@ -200,8 +200,10 @@ describe("append compaction", () => {
 	test("window accounts for full envelope, output/reasoning and margin; session override cannot invent capability", async () => {
 		const f = fixture(); f.ctx.getContextUsage = () => ({ tokens: 269_000 }); f.ctx.model.contextWindow = 1_000_000;
 		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toEqual({ kind: "fallback", reason: "insufficient-window" }); expect(f.calls()).toBe(0);
-		const g = fixture(); g.snapshot.payload.tools = "x".repeat(900_000);
+		const g = fixture(); g.ctx.getContextUsage = () => undefined; g.snapshot.payload.tools = "x".repeat(900_000);
 		expect(await appendCompaction(g.event, g.ctx, g.snapshot)).toEqual({ kind: "fallback", reason: "insufficient-window" }); expect(g.calls()).toBe(0);
+		const h = fixture(); h.ctx.getContextUsage = () => ({ tokens: 197_661 }); h.snapshot.payload.instructions = "x".repeat(900_000);
+		expect(await appendCompaction(h.event, h.ctx, h.snapshot)).toMatchObject({ kind: "success" });
 	});
 	test("split-turn requires a prefix summary but keeps the same raw tail", async () => {
 		const f = fixture(); f.event.preparation.messagesToSummarize = [f.messages[1]]; f.event.preparation.turnPrefixMessages = [f.progress]; f.event.preparation.isSplitTurn = true;
