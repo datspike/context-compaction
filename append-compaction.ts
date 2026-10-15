@@ -38,7 +38,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { createInitialSystemMessage, getCurrentSystemPrompt, getCurrentTools, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
 import { convertToLlm, estimateTokens, sessionEntryToContextMessages, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 import { collectFileLists, formatFileHints, withoutFileTracking } from "./file-hints.js";
-import { hasStructuralHeading, localizeSummaryStructure, RUSSIAN_COMPACTION_FOCUS } from "./summary.js";
+import { hasStructuralHeading, localizeSummaryStructure, RUSSIAN_COMPACTION_FOCUS, SPLIT_TURN_HEADER } from "./summary.js";
 
 const MAX_SNAPSHOT_CHARS = 16 * 1024 * 1024;
 const WINDOW_MARGIN = 4096;
@@ -318,7 +318,7 @@ history отражает состояние НА КОНЦЕ ИСТОРИИ, turn
 Предыдущая сводка для объединения с историей:
 ${previous}
 
-Для history используй структуру с «## Цель» и сохрани критерии завершения и достаточности. Если новая история пуста, сохрани смысл предыдущей сводки. Для turnPrefix используй «## Исходный запрос», «## Прогресс на текущий момент», «## Контекст для продолжения»; если ранняя часть пуста, верни пустую строку. Файловые блоки не создавай.
+Для history используй структуру с «## Цель» и сохрани критерии завершения и достаточности. В «## Следующие шаги» помечай источник шага: «решение пользователя» или «предложение агента»; не записывай как шаг закрытие с отрицательным итогом, fallback или остановку без решения пользователя. Сохраняй испробованные пути с причиной отказа, непроверенные альтернативы, бюджет и дословные высказывания пользователя о достижимости. Если новая история пуста, сохрани смысл предыдущей сводки. Для turnPrefix используй «## Исходный запрос», «## Прогресс на текущий момент», «## Контекст для продолжения»; в «## Исходный запрос» назови, что из прежней цели, ограничений или плана этот запрос меняет; если ранняя часть пуста, верни пустую строку. Файловые блоки не создавай.
 ${event.customInstructions ? `\nДополнительные инструкции этой контрольной точки:\n${event.customInstructions}` : ""}`;
 }
 
@@ -468,7 +468,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
             const reason = "invalid-result" as const;
             return { kind: "cancel", reason, usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
         }
-        const body = `${result.parsed.history}${result.parsed.prefix ? `\n\n**Контекст разрезанного хода:**\n${result.parsed.prefix}` : ""}`;
+        const body = `${result.parsed.history}${result.parsed.prefix ? `\n\n${SPLIT_TURN_HEADER}\n${result.parsed.prefix}` : ""}`;
         const files = collectFileLists(event.preparation.fileOps, event.branchEntries);
         return { kind: "success", ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics(), compaction: {
             summary: `${body}${formatFileHints(files, [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages], body)}`,

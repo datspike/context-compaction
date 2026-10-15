@@ -4,6 +4,7 @@ import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { APPEND_CANDIDATE_END, APPEND_CANDIDATE_START, AppendCapture, appendCompaction, appendTask, preservesPayloadPrefix, shouldUseStandardCompactFallback } from "./append-compaction.js";
 import { loadSummarySettings } from "./language.js";
+import { SPLIT_TURN_HEADER } from "./summary.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -263,7 +264,7 @@ describe("append compaction", () => {
 		expect(task).toContain("Номера сообщений (с 1, включая system и toolResult): 2."); expect(task).toContain("Номера сообщений (с 1, включая system и toolResult): 3."); expect(task).not.toContain("НОВЫЙ ХВОСТ");
 		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nИстория", turnPrefix: "## Исходный запрос\nЛокальная проверка\n## Контекст для продолжения\nРабота ещё не завершена." }) }] }) });
 		const result = await appendCompaction(f.event, f.ctx, f.snapshot); expect(result.kind).toBe("success");
-		if (result.kind === "success") { expect(result.compaction.summary).toContain("**Контекст разрезанного хода:**"); expect(result.compaction.firstKeptEntryId).toBe("c"); }
+		if (result.kind === "success") { expect(result.compaction.summary).toContain(SPLIT_TURN_HEADER); expect(result.compaction.firstKeptEntryId).toBe("c"); }
 	});
 	test("repeated user text does not move the split-turn boundary backwards", () => {
 		const f = fixture();

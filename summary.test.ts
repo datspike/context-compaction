@@ -85,6 +85,8 @@ describe("Russian summary formatting", () => {
 	test("prompts require Russian prose without changing technical literals", () => {
 		expect(RUSSIAN_COMPACTION_FOCUS).toContain("Пиши весь естественный текст");
 		expect(RUSSIAN_COMPACTION_FOCUS).toContain("<read-files>");
+		expect(RUSSIAN_COMPACTION_FOCUS).toContain("«решение пользователя» или «предложение агента»");
+		expect(RUSSIAN_COMPACTION_FOCUS).toContain("испробованные пути с причиной отказа");
 		expect(RUSSIAN_TREE_SUMMARY_INSTRUCTIONS).toContain("## Цель");
 		expect(RUSSIAN_TREE_SUMMARY_INSTRUCTIONS).toContain("Сохраняй точные пути");
 	});
@@ -111,7 +113,8 @@ test("Russian compact keeps localized headings, split-turn context and cumulativ
 	expect(normal?.compaction.details.modifiedFiles).toEqual(["src/b.ts"]);
 	const message = { role: "user", content: [{ type: "text", text: "Continue the feature" }], timestamp: 1 };
 	const split = await russianCompaction({ ...event, preparation: { ...preparation, isSplitTurn: true, messagesToSummarize: [message], turnPrefixMessages: [message] } }, ctx);
-	expect(split?.compaction.summary).toContain("**Контекст разрезанного хода:**\n## Исходный запрос");
+	expect(split?.compaction.summary).toContain("**Контекст разрезанного хода:**\nЭтот ход начат после истории выше.");
+	expect(split?.compaction.summary).toContain("действует он; разделы выше описывают состояние до хода.\n## Исходный запрос");
 });
 
 test("Russian /tree keeps localized headings and usage", async () => {

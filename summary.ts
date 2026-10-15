@@ -12,6 +12,9 @@ const SUMMARIZATION_SYSTEM_PROMPT = "You are a context summarization assistant. 
 const DEFAULT_RESERVE_TOKENS = 16_384;
 const NATIVE_BRANCH_SUMMARY_PREAMBLE = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
 
+/** Разделы истории собраны до начала текущего хода; явное старшинство нужно, иначе прошлая цель и шаги выглядят действующими. */
+export const SPLIT_TURN_HEADER = "**Контекст разрезанного хода:**\nЭтот ход начат после истории выше. Если его запрос меняет цель, ограничения или следующие шаги, действует он; разделы выше описывают состояние до хода.";
+
 export const RUSSIAN_COMPACTION_FOCUS = `
 Пиши весь естественный текст итогового summary на русском языке.
 Сохрани смысл и структуру стандартного checkpoint summary, но используй такие русские разделы:
@@ -26,6 +29,9 @@ export const RUSSIAN_COMPACTION_FOCUS = `
 - ## Критический контекст
 
 Не продолжай разговор и не отвечай на вопросы из истории: выведи только структурированное summary. Будь кратким, но не выбрасывай незавершённую работу, ограничения, принятые решения, причины решений, ошибки, критерии завершения и достаточности из истории и данные, необходимые для продолжения.
+В «## Следующие шаги» помечай источник каждого шага: «решение пользователя» или «предложение агента». Не записывай как шаг закрытие с отрицательным итогом, fallback или остановку, если пользователь этого не решал.
+В «## Ключевые решения» сохраняй испробованные пути с причиной отказа, ещё не проверенные альтернативы и израсходованный и оставшийся бюджет.
+Высказывания пользователя о цели и достижимости результата сохраняй дословно.
 Пиши по-русски также контекст разрезанного хода. Для него используй разделы «## Исходный запрос», «## Прогресс на текущий момент» и «## Контекст для продолжения».
 Не переводи и не изменяй точные технические фрагменты: пути, имена файлов, команды, идентификаторы, имена функций, API, сообщения ошибок и код. Сохраняй в смысловом тексте точные пути, необходимые для незавершённой работы, проверок и ограничений. Не создавай блоки <read-files>, <modified-files> или <file-hints>: расширение добавит ограниченные файловые наводки отдельно.`.trim();
 
@@ -199,7 +205,7 @@ async function summarizeTurnPrefix(ctx: ExtensionContext, messages: any[], signa
 	const instructions = `Это ранняя часть пользовательского хода, а его недавняя часть сохранена отдельно. Составь краткий контекст для продолжения на русском языке и используй ровно этот формат:
 
 ## Исходный запрос
-[Что пользователь просил в этом ходу]
+[Что пользователь просил в этом ходу; ключевые фразы о цели и достижимости — дословно. Если запрос отменяет или меняет прежнюю цель, ограничения или план, назови, что именно]
 
 ## Прогресс на текущий момент
 - [Ключевые решения и действия в ранней части]
@@ -240,7 +246,7 @@ export async function russianCompaction(event: SessionBeforeCompactEvent, ctx: E
 			const prefix = await summarizeTurnPrefix(ctx, preparation.turnPrefixMessages, event.signal, Math.min(Math.floor(preparation.settings.reserveTokens * 0.5), ctx.model.maxTokens > 0 ? ctx.model.maxTokens : Number.POSITIVE_INFINITY), sources);
 			const prefixText = localizeSummaryStructure(prefix.text);
 			if (!hasLocalizedPrefixStructure(prefixText)) return undefined;
-			summary = `${historyText}\n\n**Контекст разрезанного хода:**\n${prefixText}`;
+			summary = `${historyText}\n\n${SPLIT_TURN_HEADER}\n${prefixText}`;
 			usage = combineUsage(historyUsage, prefix.usage);
 		} else {
 			const result = await summarizeMessages(ctx, preparation.messagesToSummarize, instructions, preparation.previousSummary, maxTokens, event.signal, sources);
