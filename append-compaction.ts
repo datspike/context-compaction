@@ -67,12 +67,14 @@ export function shouldUseStandardCompactFallback(outcome: AppendOutcome): boolea
 }
 
 export interface AppendSnapshot {
-	sessionId: string;
-	anchor: string;
-	provider: string;
-	modelId: string;
-	messages: Message[];
-	payload?: Payload;
+    sessionId: string;
+    anchor: string;
+    provider: string;
+    modelId: string;
+    messages: Message[];
+    systemShape?: SystemShape;
+    capturedInputContentChars?: number;
+    payload?: Payload;
 }
 
 function payloadValue(value: unknown): Payload | undefined {
@@ -92,37 +94,71 @@ export function preservesPayloadPrefix(previous: unknown, next: unknown): boolea
 }
 
 export interface PayloadMismatch {
-	fields: ("invalid-payload" | "model" | "input" | "tools" | "instructions" | "prompt_cache_key")[];
-	inputLengths?: [number, number];
-	firstInputMismatch?: number;
-	inputItemFields?: string[];
-	toolsChars?: [number, number];
-	instructionsChars?: [number, number];
-	cacheKeyTypes?: [string, string];
+    fields: ("invalid-payload" | "model" | "input" | "tools" | "instructions" | "prompt_cache_key")[];
+    inputLengths?: [number, number];
+    firstInputMismatch?: number;
+    inputItemFields?: string[];
+    inputContentChars?: [number, number];
+    sourceSystemShape?: SystemShape;
+    capturedInputContentChars?: number;
+    toolsChars?: [number, number];
+    instructionsChars?: [number, number];
+    cacheKeyTypes?: [string, string];
+}
+
+export interface SystemShape {
+    contentChars: number;
+    sectionsChars: number;
+    sectionCount: number;
+}
+
+function characterCount(value: unknown): number {
+    if (typeof value === "string") return value.length;
+    if (!Array.isArray(value)) return 0;
+    return value.reduce((sum, item) => sum + (item && typeof item === "object" && typeof (item as { text?: unknown }).text === "string" ? (item as { text: string }).text.length : 0), 0);
+}
+
+function systemShape(message: Message | undefined): SystemShape | undefined {
+    if (!message || message.role !== "system") return;
+    const sections = Object.values((message as Message & { sections?: Record<string, unknown> }).sections ?? {});
+    return { contentChars: characterCount(message.content), sectionsChars: sections.reduce<number>((sum, value) => sum + characterCount(value), 0), sectionCount: sections.length };
+}
+
+function inputContentChars(item: unknown): number | undefined {
+    if (!item || typeof item !== "object") return;
+    return characterCount((item as { content?: unknown }).content);
+}
+
+const SYSTEM_SHAPE_TOLERANCE = 256;
+
+function systemPayloadDistance(shape: SystemShape, contentChars: number): number {
+    return Math.abs(contentChars - shape.contentChars - shape.sectionsChars);
 }
 
 /** Reports only fixed field names and sizes; never persists text, key values, or hashes. */
-function describePayloadMismatch(previous: unknown, next: unknown): PayloadMismatch {
-	const a = payloadValue(previous), b = payloadValue(next);
-	if (!a || !b) return { fields: ["invalid-payload"] };
-	const result: PayloadMismatch = { fields: [], inputLengths: [a.input.length, b.input.length] };
-	if (a.model !== b.model) result.fields.push("model");
-	const index = a.input.findIndex((item, i) => JSON.stringify(item) !== JSON.stringify(b.input[i]));
-	if (index >= 0 || a.input.length > b.input.length) {
-		result.fields.push("input"); result.firstInputMismatch = index >= 0 ? index : b.input.length;
-		const left = a.input[result.firstInputMismatch] as Record<string, unknown> | undefined;
-		const right = b.input[result.firstInputMismatch] as Record<string, unknown> | undefined;
-		result.inputItemFields = ["type", "role", "content", "tools", "arguments", "name", "call_id", "id", "status", "phase"].filter((key) => JSON.stringify(left?.[key]) !== JSON.stringify(right?.[key]));
-	}
-	for (const key of ["tools", "instructions"] as const) {
-		const left = JSON.stringify(a[key]), right = JSON.stringify(b[key]);
-		if (left !== right) result.fields.push(key);
-		if (key === "tools") result.toolsChars = [left?.length ?? 0, right?.length ?? 0];
-		else result.instructionsChars = [left?.length ?? 0, right?.length ?? 0];
-	}
-	if (a.prompt_cache_key !== undefined && a.prompt_cache_key !== b.prompt_cache_key) result.fields.push("prompt_cache_key");
-	result.cacheKeyTypes = [typeof a.prompt_cache_key, typeof b.prompt_cache_key];
-	return result;
+function describePayloadMismatch(previous: unknown, next: unknown, source?: Pick<AppendSnapshot, "systemShape" | "capturedInputContentChars">): PayloadMismatch {
+    const a = payloadValue(previous), b = payloadValue(next);
+    if (!a || !b) return { fields: ["invalid-payload"] };
+    const result: PayloadMismatch = { fields: [], inputLengths: [a.input.length, b.input.length], ...(source?.systemShape ? { sourceSystemShape: source.systemShape } : {}), ...(source?.capturedInputContentChars === undefined ? {} : { capturedInputContentChars: source.capturedInputContentChars }) };
+    if (a.model !== b.model) result.fields.push("model");
+    const index = a.input.findIndex((item, i) => JSON.stringify(item) !== JSON.stringify(b.input[i]));
+    if (index >= 0 || a.input.length > b.input.length) {
+        result.fields.push("input"); result.firstInputMismatch = index >= 0 ? index : b.input.length;
+        const left = a.input[result.firstInputMismatch] as Record<string, unknown> | undefined;
+        const right = b.input[result.firstInputMismatch] as Record<string, unknown> | undefined;
+        result.inputItemFields = ["type", "role", "content", "tools", "arguments", "name", "call_id", "id", "status", "phase"].filter((key) => JSON.stringify(left?.[key]) !== JSON.stringify(right?.[key]));
+        const leftContent = inputContentChars(left), rightContent = inputContentChars(right);
+        if (leftContent !== undefined || rightContent !== undefined) result.inputContentChars = [leftContent ?? -1, rightContent ?? -1];
+    }
+    for (const key of ["tools", "instructions"] as const) {
+        const left = JSON.stringify(a[key]), right = JSON.stringify(b[key]);
+        if (left !== right) result.fields.push(key);
+        if (key === "tools") result.toolsChars = [left?.length ?? 0, right?.length ?? 0];
+        else result.instructionsChars = [left?.length ?? 0, right?.length ?? 0];
+    }
+    if (a.prompt_cache_key !== undefined && a.prompt_cache_key !== b.prompt_cache_key) result.fields.push("prompt_cache_key");
+    result.cacheKeyTypes = [typeof a.prompt_cache_key, typeof b.prompt_cache_key];
+    return result;
 }
 
 function supported(ctx: ExtensionContext): boolean {
@@ -135,25 +171,31 @@ function session(ctx: ExtensionContext): string | undefined { return ctx.session
 
 /** One in-memory snapshot per extension runtime; never saves prompts or provider payloads. */
 export class AppendCapture {
-	private snapshot: AppendSnapshot | undefined;
-	clear(): void { this.snapshot = undefined; }
-	context(messages: AgentMessage[], ctx: ExtensionContext): void {
-		const converted = convertToLlm(messages);
-		if (!matchesCurrentLeaf(converted, ctx)) return;
-		this.clear();
-		const anchor = leaf(ctx), sessionId = session(ctx);
-		if (!supported(ctx) || !anchor || !sessionId || messages[0]?.role !== "system") return;
-		if (JSON.stringify(converted).length > MAX_SNAPSHOT_CHARS) return;
-		this.snapshot = { sessionId, anchor, provider: ctx.model!.provider, modelId: ctx.model!.id, messages: structuredClone(converted) };
-	}
-	payload(value: unknown, ctx: ExtensionContext): void {
-		const snapshot = this.snapshot, payload = payloadValue(value);
-		if (!snapshot || snapshot.sessionId !== session(ctx) || snapshot.provider !== ctx.model?.provider || snapshot.modelId !== ctx.model?.id || !payload || payload.model !== snapshot.modelId) { this.clear(); return; }
-		if (snapshot.payload) return;
-		if (JSON.stringify(payload).length > MAX_SNAPSHOT_CHARS) { this.clear(); return; }
-		this.snapshot = { ...snapshot, payload: structuredClone(payload) };
-	}
-	get(): AppendSnapshot | undefined { return this.snapshot; }
+    private snapshot: AppendSnapshot | undefined;
+    clear(): void { this.snapshot = undefined; }
+    context(messages: AgentMessage[], ctx: ExtensionContext): void {
+        const converted = convertToLlm(messages);
+        if (!matchesCurrentLeaf(converted, ctx)) return;
+        this.clear();
+        const anchor = leaf(ctx), sessionId = session(ctx);
+        if (!supported(ctx) || !anchor || !sessionId || messages[0]?.role !== "system") return;
+        if (JSON.stringify(converted).length > MAX_SNAPSHOT_CHARS) return;
+        this.snapshot = { sessionId, anchor, provider: ctx.model!.provider, modelId: ctx.model!.id, messages: structuredClone(converted), systemShape: systemShape(converted[0]) };
+    }
+    payload(value: unknown, ctx: ExtensionContext): void {
+        const snapshot = this.snapshot, payload = payloadValue(value);
+        if (!snapshot || snapshot.sessionId !== session(ctx) || snapshot.provider !== ctx.model?.provider || snapshot.modelId !== ctx.model?.id || !payload || payload.model !== snapshot.modelId) { this.clear(); return; }
+        const candidateChars = inputContentChars(payload.input[0]);
+        if (snapshot.systemShape && candidateChars !== undefined) {
+            const candidateDistance = systemPayloadDistance(snapshot.systemShape, candidateChars);
+            if (candidateDistance > SYSTEM_SHAPE_TOLERANCE) return;
+            if (snapshot.payload && snapshot.capturedInputContentChars !== undefined && candidateDistance >= systemPayloadDistance(snapshot.systemShape, snapshot.capturedInputContentChars)) return;
+        }
+        if (snapshot.payload) return;
+        if (JSON.stringify(payload).length > MAX_SNAPSHOT_CHARS) { this.clear(); return; }
+        this.snapshot = { ...snapshot, capturedInputContentChars: candidateChars, payload: structuredClone(payload) };
+    }
+    get(): AppendSnapshot | undefined { return this.snapshot; }
 }
 
 function messageKey(message: Message): string {
@@ -292,11 +334,11 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 			onPayload: (payload) => {
 				const nextPayload = payload && typeof payload === "object" ? { ...(payload as Record<string, unknown>), text: { format: COMPACTION_OUTPUT_FORMAT } } : payload;
 				const next = payloadValue(nextPayload);
-				if (!preservesPayloadPrefix(snapshot.payload, nextPayload) || (snapshot.payload!.prompt_cache_key !== undefined && snapshot.payload!.prompt_cache_key !== next?.prompt_cache_key)) {
-					payloadRejected = true;
-					payloadMismatch = describePayloadMismatch(snapshot.payload, nextPayload);
-					throw new Error("APPEND_COMPACTION_PAYLOAD_MISMATCH");
-				}
+                if (!preservesPayloadPrefix(snapshot.payload, nextPayload) || (snapshot.payload!.prompt_cache_key !== undefined && snapshot.payload!.prompt_cache_key !== next?.prompt_cache_key)) {
+                    payloadRejected = true;
+                    payloadMismatch = describePayloadMismatch(snapshot.payload, nextPayload, snapshot);
+                    throw new Error("APPEND_COMPACTION_PAYLOAD_MISMATCH");
+                }
 				return nextPayload;
 			},
 		}).result();

@@ -115,21 +115,24 @@ describe("append compaction", () => {
 		expect(result.kind).toBe("success");
 		expect(calls).toBe(2);
 	});
-	test("capture is an isolated bounded copy and does not mutate the original context", () => {
-		const f = fixture(), capture = new AppendCapture();
-		f.ctx.sessionManager.getBranch = () => [{ type: "message", id: "a", message: f.messages[1] }];
-		capture.context(f.messages, f.ctx); capture.payload(f.payload, f.ctx);
-		const firstPayload = structuredClone(capture.get()!.payload);
-		f.ctx.sessionManager.getBranch = () => f.branch;
-		capture.context(f.messages, f.ctx); expect(capture.get()!.payload).toEqual(firstPayload);
-		capture.payload({ ...f.payload, input: [...f.payload.input, { role: "user", content: "later request" }] }, f.ctx);
-		expect(capture.get()!.payload).toEqual(firstPayload);
-		f.messages[0].content = "changed after capture"; f.payload.tools[0].name = "changed after capture";
-		expect(capture.get()!.messages[0].content).toContain("Original system");
-		expect((capture.get()!.payload!.tools as any)[0].name).toBe("bash");
-		capture.clear(); f.ctx.sessionManager.getBranch = () => [{ type: "message", id: "a", message: f.messages[1] }];
-		f.messages[0].content = "x".repeat(16 * 1024 * 1024); capture.context(f.messages, f.ctx); expect(capture.get()).toBeUndefined();
-	});
+	test("ignores a stale provider payload before accepting the matching request", () => {
+        const f = fixture(), capture = new AppendCapture();
+        f.ctx.sessionManager.getBranch = () => [{ type: "message", id: "a", message: f.messages[1] }];
+        capture.context(f.messages, f.ctx);
+        const stale = { ...f.payload, input: [{ ...f.payload.input[0], content: "stale".repeat(512) }, ...f.payload.input.slice(1)] };
+        capture.payload(stale, f.ctx); expect(capture.get()!.payload).toBeUndefined();
+        capture.payload(f.payload, f.ctx); expect(capture.get()!.payload).toEqual(f.payload);
+        const firstPayload = structuredClone(capture.get()!.payload);
+        f.ctx.sessionManager.getBranch = () => f.branch;
+        capture.context(f.messages, f.ctx); expect(capture.get()!.payload).toEqual(firstPayload);
+        capture.payload({ ...f.payload, input: [...f.payload.input, { role: "user", content: "later request" }] }, f.ctx);
+        expect(capture.get()!.payload).toEqual(firstPayload);
+        f.messages[0].content = "changed after capture"; f.payload.tools[0].name = "changed after capture";
+        expect((capture.get()!.messages[0] as any).content).toContain("Original system");
+        expect((capture.get()!.payload!.tools as any)[0].name).toBe("bash");
+        capture.clear(); f.ctx.sessionManager.getBranch = () => [{ type: "message", id: "a", message: f.messages[1] }];
+        f.messages[0].content = "x".repeat(16 * 1024 * 1024); capture.context(f.messages, f.ctx); expect(capture.get()).toBeUndefined();
+    });
 	test("rejects a working tool call and never executes it or retries", async () => {
 		const f = fixture(); let calls = 0;
 		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => { calls++; return { ...answer(), stopReason: "toolUse", content: [{ type: "toolCall", id: "danger", name: "bash", arguments: { command: "rm -rf /" } }] }; } });
