@@ -187,6 +187,12 @@ test("keeps append usage and provider/model in the audit payload", () => {
 	expect(appendAuditPayload({ ...success, repairAttempts: 1 }, 123, { provider: "openai", id: "gpt-5.6-sol" })).toMatchObject({ provider: "openai", model: "gpt-5.6-sol", durationMs: 123, repairAttempts: 1, usage });
 });
 
+test("persists only the bounded mismatch diagnostic on the existing append audit", () => {
+	const payloadMismatch = { fields: ["input" as const], inputLengths: [2, 3] as [number, number], firstInputMismatch: 1, inputItemFields: ["content"] };
+	expect(appendAuditPayload({ kind: "fallback", reason: "payload-mismatch", payloadMismatch }, 29, { provider: "openai", id: "q12-fixture" })).toMatchObject({ reason: "payload-mismatch", payloadMismatch });
+	expect(appendAuditPayload({ kind: "fallback", reason: "snapshot-unavailable" }, 0, undefined)).not.toHaveProperty("payloadMismatch");
+});
+
 test("formats append result warnings without affecting standard compact", () => {
 	const hit = formatAppendNotice({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: { cacheRead: 100, cost: { total: 0.03 } }, details: { read: new Set(), edited: new Set(), created: new Set() } } }, 12_345, "ru");
 	expect(hit).toEqual({ text: "append compact: cache hit · 12.3 s · $0.0300", level: "info" });

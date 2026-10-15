@@ -58,7 +58,7 @@ const COMPACTION_OUTPUT_FORMAT = {
 } as const;
 export type AppendFallback = "unsupported" | "snapshot-unavailable" | "context-changed" | "boundary-unavailable" | "insufficient-window" | "payload-mismatch";
 export type AppendOutcome =
-	| { kind: "fallback"; reason: AppendFallback }
+	| { kind: "fallback"; reason: AppendFallback; payloadMismatch?: PayloadMismatch }
 	| { kind: "cancel"; reason: "aborted" | "request-failed" | "invalid-result" | "context-changed"; usage?: AssistantMessage["usage"]; repairAttempts?: number }
 	| { kind: "success"; compaction: { summary: string; firstKeptEntryId: string; tokensBefore: number; usage: AssistantMessage["usage"]; details: ReturnType<typeof collectFileLists> }; repairAttempts?: number };
 
@@ -89,6 +89,40 @@ export function preservesPayloadPrefix(previous: unknown, next: unknown): boolea
 		&& JSON.stringify(a.tools) === JSON.stringify(b.tools)
 		&& JSON.stringify(a.instructions) === JSON.stringify(b.instructions)
 		&& a.input.every((item, index) => JSON.stringify(item) === JSON.stringify(b.input[index]));
+}
+
+export interface PayloadMismatch {
+	fields: ("invalid-payload" | "model" | "input" | "tools" | "instructions" | "prompt_cache_key")[];
+	inputLengths?: [number, number];
+	firstInputMismatch?: number;
+	inputItemFields?: string[];
+	toolsChars?: [number, number];
+	instructionsChars?: [number, number];
+	cacheKeyTypes?: [string, string];
+}
+
+/** Reports only fixed field names and sizes; never persists text, key values, or hashes. */
+function describePayloadMismatch(previous: unknown, next: unknown): PayloadMismatch {
+	const a = payloadValue(previous), b = payloadValue(next);
+	if (!a || !b) return { fields: ["invalid-payload"] };
+	const result: PayloadMismatch = { fields: [], inputLengths: [a.input.length, b.input.length] };
+	if (a.model !== b.model) result.fields.push("model");
+	const index = a.input.findIndex((item, i) => JSON.stringify(item) !== JSON.stringify(b.input[i]));
+	if (index >= 0 || a.input.length > b.input.length) {
+		result.fields.push("input"); result.firstInputMismatch = index >= 0 ? index : b.input.length;
+		const left = a.input[result.firstInputMismatch] as Record<string, unknown> | undefined;
+		const right = b.input[result.firstInputMismatch] as Record<string, unknown> | undefined;
+		result.inputItemFields = ["type", "role", "content", "tools", "arguments", "name", "call_id", "id", "status", "phase"].filter((key) => JSON.stringify(left?.[key]) !== JSON.stringify(right?.[key]));
+	}
+	for (const key of ["tools", "instructions"] as const) {
+		const left = JSON.stringify(a[key]), right = JSON.stringify(b[key]);
+		if (left !== right) result.fields.push(key);
+		if (key === "tools") result.toolsChars = [left?.length ?? 0, right?.length ?? 0];
+		else result.instructionsChars = [left?.length ?? 0, right?.length ?? 0];
+	}
+	if (a.prompt_cache_key !== undefined && a.prompt_cache_key !== b.prompt_cache_key) result.fields.push("prompt_cache_key");
+	result.cacheKeyTypes = [typeof a.prompt_cache_key, typeof b.prompt_cache_key];
+	return result;
 }
 
 function supported(ctx: ExtensionContext): boolean {
@@ -235,6 +269,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 	let payloadRejected = false;
 	let totalUsage: Usage | undefined;
 	let repairAttempts = 0;
+	let payloadMismatch: PayloadMismatch | undefined;
 	const contextChanged = (): boolean => snapshot.sessionId !== session(ctx) || initialLeaf !== leaf(ctx) || snapshot.provider !== ctx.model?.provider || snapshot.modelId !== ctx.model?.id;
 	const addUsage = (usage: AssistantMessage["usage"]): void => {
 		if (!usage) return;
@@ -259,6 +294,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 				const next = payloadValue(nextPayload);
 				if (!preservesPayloadPrefix(snapshot.payload, nextPayload) || (snapshot.payload!.prompt_cache_key !== undefined && snapshot.payload!.prompt_cache_key !== next?.prompt_cache_key)) {
 					payloadRejected = true;
+					payloadMismatch = describePayloadMismatch(snapshot.payload, nextPayload);
 					throw new Error("APPEND_COMPACTION_PAYLOAD_MISMATCH");
 				}
 				return nextPayload;
@@ -269,7 +305,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 	};
 	try {
 		let response = await request(task);
-		if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch" };
+		if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch };
 		if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage };
 		if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage };
 		let parsed = parseResult(response, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, messages, event);
@@ -277,7 +313,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 			if (event.signal.aborted || contextChanged()) return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "context-changed", usage: totalUsage };
 			repairAttempts += 1;
 			response = await request(`${task}\n\nПредыдущий ответ не прошёл проверку формата. Повтори тот же compact строго по заданной схеме; не добавляй пояснений, markdown-ограждений или дополнительных ключей.`);
-			if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch" };
+			if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch };
 			if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
 			if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
 			parsed = parseResult(response, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, messages, event);
@@ -290,6 +326,6 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 			firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, usage: totalUsage ?? response.usage, details: files,
 		} };
 	} catch {
-		return payloadRejected ? { kind: "fallback", reason: "payload-mismatch" } : { kind: "cancel", reason: event.signal.aborted ? "aborted" : "request-failed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
+		return payloadRejected ? { kind: "fallback", reason: "payload-mismatch", payloadMismatch } : { kind: "cancel", reason: event.signal.aborted ? "aborted" : "request-failed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
 	}
 }

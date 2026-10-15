@@ -39,6 +39,7 @@ export function appendAuditPayload(outcome: Awaited<ReturnType<typeof appendComp
 		model: model?.id,
 		repairAttempts: "repairAttempts" in outcome ? outcome.repairAttempts ?? 0 : 0,
 		usage: appendUsageForAudit(outcome),
+		...(outcome.kind === "fallback" && outcome.reason === "payload-mismatch" && outcome.payloadMismatch ? { payloadMismatch: outcome.payloadMismatch } : {}),
 	};
 }
 

@@ -166,7 +166,22 @@ describe("append compaction", () => {
 	test("payload mismatch is detected in the pre-send hook", async () => {
 		const f = fixture(); let sent = 0;
 		f.ctx.modelRegistry.streamSimple = (_m: any, _c: any, opts: any) => ({ result: async () => { await opts.onPayload({ ...f.payload, tools: [] }); sent++; return answer(); } });
-		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toEqual({ kind: "fallback", reason: "payload-mismatch" }); expect(sent).toBe(0);
+		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "fallback", reason: "payload-mismatch", payloadMismatch: { fields: ["tools"], inputLengths: [2, 2] } }); expect(sent).toBe(0);
+	});
+	test("classifies every payload guard without leaking text or cache key values", async () => {
+		for (const field of ["model", "input", "tools", "instructions", "prompt_cache_key", "invalid-payload"] as const) {
+			const f = fixture(); let sent = 0, calls = 0;
+			const secret = "PRIVATE_PAYLOAD_SENTINEL";
+			const next: any = { ...f.payload, input: [...f.payload.input, { role: "user", content: "task" }] };
+			if (field === "input") next.input[1] = { role: "user", content: secret };
+			else if (field !== "invalid-payload") next[field] = secret;
+			f.ctx.modelRegistry.streamSimple = (_m: any, _c: any, opts: any) => ({ result: async () => { calls++; try { await opts.onPayload(field === "invalid-payload" ? null : next); } catch { return { ...answer(), stopReason: "error" }; } sent++; return answer(); } });
+			const outcome = await appendCompaction(f.event, f.ctx, f.snapshot);
+			expect(outcome).toMatchObject({ kind: "fallback", reason: "payload-mismatch", payloadMismatch: { fields: [field] } });
+			if (field === "input") expect(outcome).toMatchObject({ payloadMismatch: { firstInputMismatch: 1, inputItemFields: ["content"], inputLengths: [2, 3] } });
+			expect(JSON.stringify(outcome)).not.toContain(secret); expect(JSON.stringify(outcome)).not.toContain("fixture-session");
+			expect(sent).toBe(0); expect(calls).toBe(1);
+		}
 	});
 	test("unsupported path, absent snapshot, edited context and unknown boundary fall back before send", async () => {
 		for (const scenario of ["unsupported", "snapshot-unavailable", "context-changed", "boundary-unavailable"]) {
