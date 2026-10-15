@@ -201,9 +201,11 @@ test("formats append result warnings without affecting standard compact", () => 
 	expect(shouldNotifyAppendOutcome({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: {}, details: { read: new Set(), edited: new Set(), created: new Set() } } })).toBe(true);
 	expect(shouldNotifyAppendOutcome({ kind: "fallback", reason: "unsupported" })).toBe(true);
 	expect(shouldNotifyAppendOutcome({ kind: "cancel", reason: "aborted" })).toBe(false);
-	expect(shouldNotifyAppendOutcome({ kind: "fallback", reason: "context-changed" })).toBe(false);
+	expect(shouldNotifyAppendOutcome({ kind: "fallback", reason: "context-changed" })).toBe(true);
 	const fallback = formatAppendNotice({ kind: "fallback", reason: "unsupported" }, 2_000, "ru");
 	expect(fallback).toEqual({ text: "append compact: fallback (unsupported) · cache not attempted · standard compact · 2.0 s · $0.0000", level: "warning" });
+	const contextChanged = formatAppendNotice({ kind: "fallback", reason: "context-changed" }, 300, "ru");
+	expect(contextChanged).toEqual({ text: "append compact: fallback (context-changed) · cache not attempted · standard compact · 0.3 s · $0.0000", level: "warning" });
 	const requestFailed = formatAppendNotice({ kind: "cancel", reason: "request-failed", usage: { cacheRead: 0, cost: { total: 0.08 } } }, 2_500, "ru");
 	expect(requestFailed).toEqual({ text: "append compact: fallback (request-failed) · cache miss · standard compact · 2.5 s · $0.0800", level: "warning" });
 	const requestFailedWithoutUsage = formatAppendNotice({ kind: "cancel", reason: "request-failed" }, 2_500, "ru");

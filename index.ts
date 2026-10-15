@@ -44,7 +44,7 @@ export function appendAuditPayload(outcome: Awaited<ReturnType<typeof appendComp
 }
 
 export function shouldNotifyAppendOutcome(outcome: Awaited<ReturnType<typeof appendCompaction>>): boolean {
-	return outcome.kind === "success" || (shouldUseStandardCompactFallback(outcome) && !(outcome.kind === "fallback" && outcome.reason === "context-changed"));
+	return outcome.kind === "success" || shouldUseStandardCompactFallback(outcome);
 }
 
 export function formatAppendNotice(outcome: Awaited<ReturnType<typeof appendCompaction>>, durationMs: number, language: "ru" | "en"): { text: string; level: "info" | "warning" | "error" } {
