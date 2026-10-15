@@ -118,6 +118,9 @@ describe("append compaction", () => {
 	test("capture is an isolated bounded copy and does not mutate the original context", () => {
 		const f = fixture(), capture = new AppendCapture();
 		capture.context(f.messages, f.ctx); capture.payload(f.payload, f.ctx);
+		const firstPayload = structuredClone(capture.get()!.payload);
+		capture.payload({ ...f.payload, input: [...f.payload.input, { role: "user", content: "later request" }] }, f.ctx);
+		expect(capture.get()!.payload).toEqual(firstPayload);
 		f.messages[0].content = "changed after capture"; f.payload.tools[0].name = "changed after capture";
 		expect(capture.get()!.messages[0].content).toContain("Original system");
 		expect((capture.get()!.payload!.tools as any)[0].name).toBe("bash");

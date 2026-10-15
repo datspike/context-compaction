@@ -114,6 +114,7 @@ export class AppendCapture {
 	payload(value: unknown, ctx: ExtensionContext): void {
 		const snapshot = this.snapshot, payload = payloadValue(value);
 		if (!snapshot || snapshot.sessionId !== session(ctx) || snapshot.provider !== ctx.model?.provider || snapshot.modelId !== ctx.model?.id || !payload || payload.model !== snapshot.modelId) { this.clear(); return; }
+		if (snapshot.payload) return;
 		if (JSON.stringify(payload).length > MAX_SNAPSHOT_CHARS) { this.clear(); return; }
 		this.snapshot = { ...snapshot, payload: structuredClone(payload) };
 	}
