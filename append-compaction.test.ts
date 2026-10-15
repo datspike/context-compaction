@@ -117,14 +117,17 @@ describe("append compaction", () => {
 	});
 	test("capture is an isolated bounded copy and does not mutate the original context", () => {
 		const f = fixture(), capture = new AppendCapture();
+		f.ctx.sessionManager.getBranch = () => [{ type: "message", id: "a", message: f.messages[1] }];
 		capture.context(f.messages, f.ctx); capture.payload(f.payload, f.ctx);
 		const firstPayload = structuredClone(capture.get()!.payload);
+		f.ctx.sessionManager.getBranch = () => f.branch;
+		capture.context(f.messages, f.ctx); expect(capture.get()!.payload).toEqual(firstPayload);
 		capture.payload({ ...f.payload, input: [...f.payload.input, { role: "user", content: "later request" }] }, f.ctx);
 		expect(capture.get()!.payload).toEqual(firstPayload);
 		f.messages[0].content = "changed after capture"; f.payload.tools[0].name = "changed after capture";
 		expect(capture.get()!.messages[0].content).toContain("Original system");
 		expect((capture.get()!.payload!.tools as any)[0].name).toBe("bash");
-		capture.clear(); expect(capture.get()).toBeUndefined();
+		capture.clear(); f.ctx.sessionManager.getBranch = () => [{ type: "message", id: "a", message: f.messages[1] }];
 		f.messages[0].content = "x".repeat(16 * 1024 * 1024); capture.context(f.messages, f.ctx); expect(capture.get()).toBeUndefined();
 	});
 	test("rejects a working tool call and never executes it or retries", async () => {

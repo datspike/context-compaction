@@ -104,10 +104,11 @@ export class AppendCapture {
 	private snapshot: AppendSnapshot | undefined;
 	clear(): void { this.snapshot = undefined; }
 	context(messages: AgentMessage[], ctx: ExtensionContext): void {
+		const converted = convertToLlm(messages);
+		if (!matchesCurrentLeaf(converted, ctx)) return;
 		this.clear();
 		const anchor = leaf(ctx), sessionId = session(ctx);
 		if (!supported(ctx) || !anchor || !sessionId || messages[0]?.role !== "system") return;
-		const converted = convertToLlm(messages);
 		if (JSON.stringify(converted).length > MAX_SNAPSHOT_CHARS) return;
 		this.snapshot = { sessionId, anchor, provider: ctx.model!.provider, modelId: ctx.model!.id, messages: structuredClone(converted) };
 	}
@@ -123,6 +124,14 @@ export class AppendCapture {
 
 function messageKey(message: Message): string {
 	return JSON.stringify(message);
+}
+
+function matchesCurrentLeaf(messages: Message[], ctx: ExtensionContext): boolean {
+	const current = [...ctx.sessionManager.getBranch()].reverse().find((entry) => entry.type === "message");
+	if (!current) return true;
+	const currentMessages = convertToLlm(sessionEntryToContextMessages(current));
+	const offset = messages.length - currentMessages.length;
+	return offset >= 0 && currentMessages.every((message, index) => messageKey(message) === messageKey(messages[offset + index]));
 }
 
 function positions(messages: Message[], selected: Message[], startIndex = 0): number[] | undefined {
