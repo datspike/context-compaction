@@ -31,17 +31,21 @@ export function appendUsageForAudit(outcome: Awaited<ReturnType<typeof appendCom
 }
 
 export function appendAuditPayload(outcome: Awaited<ReturnType<typeof appendCompaction>>, durationMs: number, model: { provider?: string; id?: string } | undefined): Record<string, unknown> {
-	return {
-		version: 1,
-		outcome: outcome.kind,
-		reason: "reason" in outcome ? outcome.reason : undefined,
-		durationMs,
-		provider: model?.provider,
-		model: model?.id,
-		repairAttempts: "repairAttempts" in outcome ? outcome.repairAttempts ?? 0 : 0,
-		usage: appendUsageForAudit(outcome),
-		...(outcome.kind === "fallback" && outcome.reason === "payload-mismatch" && outcome.payloadMismatch ? { payloadMismatch: outcome.payloadMismatch } : {}),
-	};
+    return {
+        version: 2,
+        outcome: outcome.kind,
+        reason: "reason" in outcome ? outcome.reason : undefined,
+        durationMs,
+        provider: model?.provider,
+        model: model?.id,
+        repairAttempts: "repairAttempts" in outcome ? outcome.repairAttempts ?? 0 : 0,
+        usage: appendUsageForAudit(outcome),
+        appendAttempt: outcome.appendAttempt,
+        cacheStatus: outcome.cacheStatus,
+        ...(outcome.validationGuard ? { validationGuard: outcome.validationGuard } : {}),
+        ...(outcome.requestFailure ? { requestFailure: outcome.requestFailure } : {}),
+        ...(outcome.kind === "fallback" && outcome.reason === "payload-mismatch" && outcome.payloadMismatch ? { payloadMismatch: outcome.payloadMismatch } : {}),
+    };
 }
 
 type ContextCompletion = { value: string; label: string; description: string };
@@ -163,25 +167,46 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 	const settings = loadSummarySettings();
 	const language = settings.summaryLanguage;
 	const appendCapture = new AppendCapture();
-	/** Итог append между session_before_compact и session_compact: карточку пишем только после сохранения compaction. */
-	let pendingCard: Pick<CompactCardData, "kind" | "fallbackReason" | "provider" | "model" | "durationMs" | "repairAttempts"> | undefined;
-	const summarize = async (event: any, ctx: ExtensionContext) => {
-		if (!settings.appendCompaction) return russianCompaction(event, ctx);
-		const snapshot = appendCapture.get();
-		appendCapture.clear();
-		const started = Date.now();
-		const model = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
-		const outcome = await appendCompaction(event, ctx, snapshot);
-		const durationMs = Date.now() - started;
-		pi.appendEntry("context-compaction-append", appendAuditPayload(outcome, durationMs, model));
-		if (outcome.kind === "success") {
-			pendingCard = { kind: "append", provider: model?.provider, model: model?.id, durationMs, repairAttempts: outcome.repairAttempts ?? 0 };
-			return { compaction: outcome.compaction };
-		}
-		if (shouldUseStandardCompactFallback(outcome)) {
-			pendingCard = { kind: "standard", fallbackReason: outcome.reason, provider: model?.provider, model: model?.id };
-			return russianCompaction(event, ctx);
-		}
+    /** Итог append между session_before_compact и session_compact: receipt подтверждаем только после сохранения compaction. */
+    type PendingScope = { sessionId?: string; anchor?: string };
+    type PendingCard = Pick<CompactCardData, "kind" | "fallbackReason" | "provider" | "model" | "durationMs" | "appendDurationMs" | "appendUsage" | "appendCacheStatus" | "repairAttempts"> & { scope: PendingScope };
+    let pendingCard: PendingCard | undefined;
+    type AppendOutcome = Awaited<ReturnType<typeof appendCompaction>>;
+    let pendingAppendAudit: { outcome: Extract<AppendOutcome, { kind: "success" }>; durationMs: number; model: { provider?: string; id?: string } | undefined; scope: PendingScope } | undefined;
+    const currentScope = (ctx: ExtensionContext, anchor?: string): PendingScope => { const scope = scopeOf(ctx, anonymousIdentities); return { sessionId: scope.sessionId, anchor: anchor ?? scope.branch }; };
+    const scopeMatches = (pending: PendingScope, ctx: ExtensionContext): boolean => pending.sessionId === ctx.sessionManager.getSessionId() && (!pending.anchor || ctx.sessionManager.getBranch().some((entry) => entry.id === pending.anchor));
+    const closePendingAppendAudit = (reason: string): void => {
+        if (!pendingAppendAudit) return;
+        const payload = appendAuditPayload(pendingAppendAudit.outcome, pendingAppendAudit.durationMs, pendingAppendAudit.model);
+        payload.outcome = "unknown";
+        payload.reason = reason;
+        pi.appendEntry("context-compaction-append", payload);
+        pendingAppendAudit = undefined;
+    };
+    const discardPendingAppendAudit = (): void => { pendingAppendAudit = undefined; };
+    const summarize = async (event: any, ctx: ExtensionContext) => {
+        if (!settings.appendCompaction) return russianCompaction(event, ctx);
+        closePendingAppendAudit("superseded");
+        pendingCard = undefined;
+        const snapshot = appendCapture.get();
+        appendCapture.clear();
+        const started = Date.now();
+        const model = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+        const outcome = await appendCompaction(event, ctx, snapshot);
+        const appendDurationMs = Date.now() - started;
+        const scope = currentScope(ctx, snapshot?.anchor);
+        if (outcome.kind === "success") pendingAppendAudit = { outcome, durationMs: appendDurationMs, model, scope };
+        else pi.appendEntry("context-compaction-append", appendAuditPayload(outcome, appendDurationMs, model));
+        if (outcome.kind === "success") {
+            pendingCard = { kind: "append", provider: model?.provider, model: model?.id, appendDurationMs, durationMs: appendDurationMs, appendUsage: outcome.compaction.usage, appendCacheStatus: outcome.cacheStatus, repairAttempts: outcome.repairAttempts ?? 0, scope };
+            return { compaction: outcome.compaction };
+        }
+        if (shouldUseStandardCompactFallback(outcome)) {
+            const standardStarted = Date.now();
+            const compact = await russianCompaction(event, ctx);
+            pendingCard = { kind: "standard", fallbackReason: outcome.reason, provider: model?.provider, model: model?.id, appendDurationMs, appendUsage: appendUsageForAudit(outcome) as any, appendCacheStatus: outcome.cacheStatus, durationMs: Date.now() - standardStarted, repairAttempts: "repairAttempts" in outcome ? outcome.repairAttempts ?? 0 : 0, scope };
+            return compact;
+        }
 		const op = currentOperation(ctx);
 		if (op) fail(ctx, op);
 		return { cancel: true };
@@ -368,6 +393,8 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		pi.on("before_provider_request", (event, ctx) => { appendCapture.payload(event.payload, ctx); });
 	}
 	pi.on("session_start", async (_event, ctx) => {
+		discardPendingAppendAudit();
+        pendingCard = undefined;
 		appendCapture.clear();
 		operation = undefined;
 		mode = restoreMode(ctx.sessionManager.getEntries());
@@ -407,11 +434,18 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 	}
 	pi.on("session_compact", async (event: any, ctx) => {
 		appendCapture.clear();
-		const card = pendingCard;
-		pendingCard = undefined;
-		const entry = event.compactionEntry;
+        if (pendingAppendAudit) {
+            if (scopeMatches(pendingAppendAudit.scope, ctx)) {
+                pi.appendEntry("context-compaction-append", appendAuditPayload(pendingAppendAudit.outcome, pendingAppendAudit.durationMs, pendingAppendAudit.model));
+                pendingAppendAudit = undefined;
+            } else discardPendingAppendAudit();
+        }
+        const pending = pendingCard && scopeMatches(pendingCard.scope, ctx) ? pendingCard : undefined;
+        pendingCard = undefined;
+        const { scope: _pendingScope, ...card } = pending ?? {};
+        const entry = event.compactionEntry;
 		pi.appendEntry<CompactCardData>(COMPACT_CARD_TYPE, {
-			version: 1,
+			version: 2,
 			kind: "standard",
 			...card,
 			trigger: event.reason,
@@ -427,8 +461,13 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		external(ctx, "success", reason, Boolean(event.willRetry), event.compactionEntry?.tokensBefore);
 	});
 	pi.on("session_compact_failed", (event: any, ctx) => {
-		pendingCard = undefined;
-		const reason = event.reason as AuditReason;
+        const pendingMatches = pendingAppendAudit ? scopeMatches(pendingAppendAudit.scope, ctx) : false;
+        pendingCard = undefined;
+        if (pendingAppendAudit) {
+            if (pendingMatches) closePendingAppendAudit("apply-failed");
+            else discardPendingAppendAudit();
+        }
+        const reason = event.reason as AuditReason;
 		const op = currentOperation(ctx);
 		if (op?.lifecycle === "running" && reason === "manual") { fail(ctx, op, Boolean(event.willRetry)); return; }
 		if (event.willRetry && op) op.continuationSuppressed = true;

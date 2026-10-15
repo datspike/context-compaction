@@ -27,8 +27,8 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 		cwd: "/tmp/context-compaction-test",
 		hasUI: true,
 		ui: { notify(text: string, level: string) { notices.push({ text, level }); }, setStatus() {} },
-		model: { provider: options.modelProvider ?? "openai", id: options.modelId ?? "gpt-5.6-sol", contextWindow: 272_000 },
-		modelRegistry: { getAll: () => [{ provider: options.modelProvider ?? "openai", id: options.modelId ?? "gpt-5.6-sol", contextWindow: options.registryContextWindow ?? 600_000, cost: { tiers: options.registryTiers ?? [{ inputTokensAbove: options.registryContextWindow ?? 600_000 }] } }] },
+        model: { provider: options.modelProvider ?? "openai", id: options.modelId ?? "gpt-5.6-sol", api: "openai-responses", contextWindow: 272_000, maxTokens: 128_000, compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true } },
+        modelRegistry: { getAll: () => [{ provider: options.modelProvider ?? "openai", id: options.modelId ?? "gpt-5.6-sol", contextWindow: options.registryContextWindow ?? 600_000, cost: { tiers: options.registryTiers ?? [{ inputTokensAbove: options.registryContextWindow ?? 600_000 }] } }], find: () => ctx.model },
 		sessionManager,
 		getContextUsage: () => ({ tokens: 1_000, contextWindow: ctx.model.contextWindow, percent: 1 }),
 		isIdle: () => idle,
@@ -202,11 +202,26 @@ test("writes a durable compact card after session_compact and never before it", 
 	await runtime.event("session_compact", { reason: "threshold", willRetry: false, compactionEntry: { tokensBefore: 258_796, summary: "x".repeat(400), usage: { input: 250_000, cacheRead: 0, cost: { total: 0.04 } } } });
 	const cards = runtime.audits.filter((entry) => entry.type === "context-compaction-card");
 	expect(cards).toHaveLength(1);
-	expect(cards[0].data).toMatchObject({ version: 1, kind: "standard", trigger: "threshold", tokensBefore: 258_796, summaryTokens: 100 });
+	expect(cards[0].data).toMatchObject({ version: 2, kind: "standard", trigger: "threshold", tokensBefore: 258_796, summaryTokens: 100 });
 	expect(JSON.stringify(cards[0].data)).not.toContain("xxxx");
 	const rendered = runtime.renderers.get("context-compaction-card")({ data: cards[0].data }, { expanded: false }, { fg: (_c: string, text: string) => text });
 	expect(rendered.render(200)[0]).toContain("standard compact");
 	expect(runtime.notices.filter((notice) => notice.text.includes("append compact"))).toHaveLength(0);
+});
+
+test("does not claim append success before Pi confirms session_compact", async () => {
+    const branch = [{ id: "a", type: "message", message: { role: "user", content: "Начать работу" } }, { id: "b", type: "message", message: { role: "assistant", content: "Проверка выполнена." } }, { id: "c", type: "message", message: { role: "user", content: "Новый хвост." } }];
+    const runtime = setup({ language: "ru", appendCompaction: true, branch });
+    const user = branch[0].message, progress = branch[1].message, tail = branch[2].message;
+    const payload = { model: runtime.ctx.model.id, input: [{ role: "developer", content: "Original system" }, { role: "user", content: user.content }, { role: "assistant", content: progress.content }, { role: "user", content: tail.content }], tools: [], prompt_cache_key: "fixture-session" };
+    runtime.ctx.modelRegistry.streamSimple = (_model: any, _context: any, options: any) => ({ result: async () => { await options.onPayload({ ...payload, input: [...payload.input, { role: "user", content: "candidate" }] }); return { role: "assistant", content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nСохранить замысел.", turnPrefix: "" }) }], stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 100, cacheWrite: 0, totalTokens: 115, cost: { input: 0.01, output: 0.01, cacheRead: 0.01, cacheWrite: 0, total: 0.03 } } }; } });
+    await runtime.event("context_with_system", { messages: [{ role: "system", content: "Original system", timestamp: 0 }, user, progress, tail] });
+    await runtime.event("before_provider_request", { payload });
+    const preparation = { messagesToSummarize: [user, progress], turnPrefixMessages: [], isSplitTurn: false, firstKeptEntryId: "c", tokensBefore: 100, fileOps: { read: new Set(), edited: new Set(), created: new Set() }, settings: { reserveTokens: 4096, keepRecentTokens: 1024 } };
+    await runtime.event("session_before_compact", { reason: "threshold", signal: new AbortController().signal, branchEntries: runtime.getBranch(), preparation, willRetry: false });
+    expect(runtime.audits.filter((entry) => entry.type === "context-compaction-append" && entry.data.outcome === "success")).toHaveLength(0);
+    await runtime.event("session_compact_failed", { reason: "threshold", willRetry: false, preparation });
+    expect(runtime.audits.find((entry) => entry.type === "context-compaction-append")?.data).toMatchObject({ outcome: "unknown", reason: "apply-failed", cacheStatus: "hit" });
 });
 
 describe("session-local context modes", () => {

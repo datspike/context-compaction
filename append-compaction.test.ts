@@ -103,6 +103,7 @@ describe("append compaction", () => {
 		if (result.kind === "success") {
 		expect(result.compaction.usage?.totalTokens).toBe(260);
 		expect(result.repairAttempts).toBe(1);
+        expect(result.appendAttempt).toMatchObject([{ attempt: 1, phase: "parse", validationGuard: "json-parse" }, { attempt: 2, phase: "apply" }]);
 	}
 	});
 	test("rejects structural headings hidden inside code fences", async () => {
@@ -145,7 +146,7 @@ describe("append compaction", () => {
 		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "cancel", reason: "invalid-result" });
 	});
 	test("cancel before send, mid-request abort and stale branch never apply a result", async () => {
-		const f = fixture(); f.controller.abort(); expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toEqual({ kind: "cancel", reason: "aborted" }); expect(f.calls()).toBe(0);
+        const f = fixture(); f.controller.abort(); expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "cancel", reason: "aborted", appendAttempt: [{ attempt: 0, phase: "preflight" }], cacheStatus: "not-attempted" }); expect(f.calls()).toBe(0);
 		for (const change of ["branch", "session", "model", "abort"]) {
 			const g = fixture(); g.ctx.modelRegistry.streamSimple = () => ({ result: async () => {
 				if (change === "branch") g.branch.push({ type: "custom", id: "new" });
@@ -172,21 +173,35 @@ describe("append compaction", () => {
 			expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "success", compaction: { firstKeptEntryId: "c", usage } });
 		});
 	}
+	test("unknown custom entries force strict context fallback", async () => {
+        const f = fixture(); f.branch.push({ type: "custom", customType: "unknown-service", id: "unknown" });
+        expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "fallback", reason: "context-changed", appendAttempt: [{ attempt: 0, phase: "preflight" }] });
+    });
 	test("an unknown request failure does not launch a paid retry", async () => {
 		const f = fixture(); let calls = 0;
 		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => { calls++; throw new Error("stream closed before response.completed"); } });
-		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toEqual({ kind: "cancel", reason: "request-failed" }); expect(calls).toBe(1);
+        expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "cancel", reason: "request-failed", cacheStatus: "unknown", requestFailure: { class: "transport", phase: "provider", hasUsage: false }, appendAttempt: [{ attempt: 1, phase: "provider", toolBlocks: 0, toolBlockTypes: [] }] }); expect(calls).toBe(1);
 	});
 	test("does not treat an error response placeholder as measured usage", async () => {
 		const f = fixture();
-		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), stopReason: "error", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }) });
-		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toEqual({ kind: "cancel", reason: "request-failed" });
+        f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), stopReason: "error", errorMessage: "Request timed out after 120000ms", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }) });
+        const outcome = await appendCompaction(f.event, f.ctx, f.snapshot); expect(outcome).toMatchObject({ kind: "cancel", reason: "request-failed", cacheStatus: "unknown", requestFailure: { class: "timeout", phase: "provider", hasUsage: false }, appendAttempt: [{ attempt: 1, phase: "provider", stopReason: "error" }] }); expect(outcome.appendAttempt[0]).not.toHaveProperty("outputTokenShare");
 	});
+	test("does not treat an aborted response placeholder as measured usage", async () => {
+        const f = fixture(); f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), stopReason: "aborted", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }) });
+        const outcome = await appendCompaction(f.event, f.ctx, f.snapshot); expect(outcome).toMatchObject({ kind: "cancel", reason: "aborted", cacheStatus: "unknown", usage: undefined }); expect(outcome.appendAttempt[0]).not.toHaveProperty("outputTokenShare");
+    });
 	test("payload mismatch is detected in the pre-send hook", async () => {
 		const f = fixture(); let sent = 0;
 		f.ctx.modelRegistry.streamSimple = (_m: any, _c: any, opts: any) => ({ result: async () => { await opts.onPayload({ ...f.payload, tools: [] }); sent++; return answer(); } });
 		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "fallback", reason: "payload-mismatch", payloadMismatch: { fields: ["tools"], inputLengths: [2, 2] } }); expect(sent).toBe(0);
 	});
+	test("rejects a newly introduced provider cache key", async () => {
+        const f = fixture(); delete f.payload.prompt_cache_key;
+        f.ctx.modelRegistry.streamSimple = (_m: any, _c: any, opts: any) => ({ result: async () => { await opts.onPayload({ ...f.payload, prompt_cache_key: "foreign" }); return answer(); } });
+        expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "fallback", reason: "payload-mismatch", payloadMismatch: { fields: ["prompt_cache_key"], cacheKeyTypes: ["undefined", "string"] } });
+    });
+
 	test("classifies every payload guard without leaking text or cache key values", async () => {
 		for (const field of ["model", "input", "tools", "instructions", "prompt_cache_key", "invalid-payload"] as const) {
 			const f = fixture(); let sent = 0, calls = 0;
@@ -196,7 +211,7 @@ describe("append compaction", () => {
 			else if (field !== "invalid-payload") next[field] = secret;
 			f.ctx.modelRegistry.streamSimple = (_m: any, _c: any, opts: any) => ({ result: async () => { calls++; try { await opts.onPayload(field === "invalid-payload" ? null : next); } catch { return { ...answer(), stopReason: "error" }; } sent++; return answer(); } });
 			const outcome = await appendCompaction(f.event, f.ctx, f.snapshot);
-			expect(outcome).toMatchObject({ kind: "fallback", reason: "payload-mismatch", payloadMismatch: { fields: [field] } });
+			expect(outcome).toMatchObject({ kind: "fallback", reason: "payload-mismatch", payloadMismatch: { fields: [field] } }); expect(outcome).not.toHaveProperty("requestFailure");
 			if (field === "input") expect(outcome).toMatchObject({ payloadMismatch: { firstInputMismatch: 1, inputItemFields: ["content"], inputLengths: [2, 3] } });
 			expect(JSON.stringify(outcome)).not.toContain(secret); expect(JSON.stringify(outcome)).not.toContain("fixture-session");
 			expect(sent).toBe(0); expect(calls).toBe(1);
@@ -209,7 +224,7 @@ describe("append compaction", () => {
 			if (scenario === "snapshot-unavailable") f.snapshot.payload = undefined;
 			if (scenario === "context-changed") f.branch.push({ id: "edit", type: "context_edit" });
 			if (scenario === "boundary-unavailable") f.event.preparation.messagesToSummarize = [{ role: "user", content: "missing", timestamp: 1 }];
-			expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toEqual({ kind: "fallback", reason: scenario }); expect(f.calls()).toBe(0);
+            expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "fallback", reason: scenario, appendAttempt: [{ attempt: 0, phase: "preflight" }], cacheStatus: "not-attempted" }); expect(f.calls()).toBe(0);
 		}
 	});
 	test("source catalog identifies eligible state without importing a tail-only completion", () => {
@@ -236,9 +251,9 @@ describe("append compaction", () => {
 
 	test("window accounts for full envelope, output/reasoning and margin; session override cannot invent capability", async () => {
 		const f = fixture(); f.ctx.getContextUsage = () => ({ tokens: 269_000 }); f.ctx.model.contextWindow = 1_000_000;
-		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toEqual({ kind: "fallback", reason: "insufficient-window" }); expect(f.calls()).toBe(0);
+        expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "fallback", reason: "insufficient-window", appendAttempt: [{ attempt: 0, phase: "preflight" }], cacheStatus: "not-attempted" }); expect(f.calls()).toBe(0);
 		const g = fixture(); g.ctx.getContextUsage = () => undefined; g.snapshot.payload.tools = "x".repeat(900_000);
-		expect(await appendCompaction(g.event, g.ctx, g.snapshot)).toEqual({ kind: "fallback", reason: "insufficient-window" }); expect(g.calls()).toBe(0);
+        expect(await appendCompaction(g.event, g.ctx, g.snapshot)).toMatchObject({ kind: "fallback", reason: "insufficient-window", appendAttempt: [{ attempt: 0, phase: "preflight" }], cacheStatus: "not-attempted" }); expect(g.calls()).toBe(0);
 		const h = fixture(); h.ctx.getContextUsage = () => ({ tokens: 197_661 }); h.snapshot.payload.instructions = "x".repeat(900_000);
 		expect(await appendCompaction(h.event, h.ctx, h.snapshot)).toMatchObject({ kind: "success" });
 	});
@@ -265,6 +280,33 @@ describe("append compaction", () => {
 		}
 		const f = fixture(); f.event.preparation.isSplitTurn = true; f.event.preparation.messagesToSummarize = [f.messages[1]]; f.event.preparation.turnPrefixMessages = [f.progress]; expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "cancel", reason: "invalid-result" });
 	});
+    test("records a distinct validation guard without persisting response text", async () => {
+        const cases: Array<[string, any]> = [
+            ["json-parse", { ...answer(), content: [{ type: "text", text: "not JSON" }] }],
+            ["schema-shape", { ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nЕсть", extra: true }) }] }],
+            ["history-heading", { ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "Нет заголовка", turnPrefix: "" }) }] }],
+            ["empty-result", { ...answer(), content: [{ type: "text", text: "" }] }],
+            ["tool-call", { ...answer(), content: [{ type: "toolCall", id: "tool", name: "bash", arguments: { command: "secret-command" } }] }],
+            ["stop-reason", { ...answer(), stopReason: "length" }],
+        ];
+        for (const [guard, response] of cases) {
+            const f = fixture();
+            f.ctx.modelRegistry.streamSimple = () => ({ result: async () => response });
+            const outcome = await appendCompaction(f.event, f.ctx, f.snapshot);
+            expect(outcome).toMatchObject({ kind: "cancel", reason: "invalid-result", validationGuard: guard });
+            expect(JSON.stringify(outcome)).not.toContain("secret-command");
+        }
+        const split = fixture();
+        split.event.preparation.isSplitTurn = true; split.event.preparation.messagesToSummarize = [split.messages[1]]; split.event.preparation.turnPrefixMessages = [split.progress];
+        split.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nЕсть", turnPrefix: "Нет заголовка" }) }] }) });
+        expect(await appendCompaction(split.event, split.ctx, split.snapshot)).toMatchObject({ validationGuard: "turn-prefix-heading" });
+        const provenance = fixture();
+        provenance.progress.content = [{ type: "text", text: "Jobs 0133 отправлены на проверку; завершение не подтверждено." }];
+        provenance.tail.content = "Jobs 0133 validated: 138/138.";
+        provenance.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nJob 0133 validated: 138 segments.", turnPrefix: "" }) }] }) });
+        expect(await appendCompaction(provenance.event, provenance.ctx, provenance.snapshot)).toMatchObject({ validationGuard: "tail-provenance" });
+    });
+
 });
 
 test("real OpenAI Responses converter preserves original envelope and produces an isolated no-tool request offline", async () => {

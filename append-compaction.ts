@@ -57,10 +57,36 @@ const COMPACTION_OUTPUT_FORMAT = {
 	},
 } as const;
 export type AppendFallback = "unsupported" | "snapshot-unavailable" | "context-changed" | "boundary-unavailable" | "insufficient-window" | "payload-mismatch";
+export type ValidationGuard = "json-parse" | "schema-shape" | "history-heading" | "turn-prefix-heading" | "tool-call" | "stop-reason" | "tail-provenance" | "empty-result" | "unknown";
+export type RequestFailureClass = "timeout" | "transport" | "provider-error" | "payload-hook" | "unknown";
+export type RequestFailurePhase = "provider" | "parse";
+export type CacheStatus = "hit" | "miss" | "unavailable" | "not-attempted" | "unknown";
+export interface AppendAttemptReceipt {
+    attempt: number;
+    phase: "preflight" | "provider" | "parse" | "apply";
+    stopReason?: string;
+    validationGuard?: ValidationGuard;
+    toolBlocks: number;
+    toolBlockTypes: string[];
+    responseChars?: number;
+    outputTokenShare?: number;
+    repairAttempts: number;
+}
+export interface RequestFailure {
+    class: RequestFailureClass;
+    phase: RequestFailurePhase;
+    hasUsage: boolean;
+}
+interface AppendDiagnostics {
+    appendAttempt: AppendAttemptReceipt[];
+    validationGuard?: ValidationGuard;
+    requestFailure?: RequestFailure;
+    cacheStatus: CacheStatus;
+}
 export type AppendOutcome =
-	| { kind: "fallback"; reason: AppendFallback; payloadMismatch?: PayloadMismatch }
-	| { kind: "cancel"; reason: "aborted" | "request-failed" | "invalid-result" | "context-changed"; usage?: AssistantMessage["usage"]; repairAttempts?: number }
-	| { kind: "success"; compaction: { summary: string; firstKeptEntryId: string; tokensBefore: number; usage: AssistantMessage["usage"]; details: ReturnType<typeof collectFileLists> }; repairAttempts?: number };
+    | ({ kind: "fallback"; reason: AppendFallback; payloadMismatch?: PayloadMismatch } & AppendDiagnostics)
+    | ({ kind: "cancel"; reason: "aborted" | "request-failed" | "invalid-result" | "context-changed"; usage?: AssistantMessage["usage"]; repairAttempts?: number } & AppendDiagnostics)
+    | ({ kind: "success"; compaction: { summary: string; firstKeptEntryId: string; tokensBefore: number; usage: AssistantMessage["usage"]; details: ReturnType<typeof collectFileLists> }; repairAttempts?: number } & AppendDiagnostics);
 
 export function shouldUseStandardCompactFallback(outcome: AppendOutcome): boolean {
 	return outcome.kind === "fallback" || (outcome.kind === "cancel" && (outcome.reason === "invalid-result" || outcome.reason === "request-failed"));
@@ -156,7 +182,7 @@ function describePayloadMismatch(previous: unknown, next: unknown, source?: Pick
         if (key === "tools") result.toolsChars = [left?.length ?? 0, right?.length ?? 0];
         else result.instructionsChars = [left?.length ?? 0, right?.length ?? 0];
     }
-    if (a.prompt_cache_key !== undefined && a.prompt_cache_key !== b.prompt_cache_key) result.fields.push("prompt_cache_key");
+    if (a.prompt_cache_key !== b.prompt_cache_key) result.fields.push("prompt_cache_key");
     result.cacheKeyTypes = [typeof a.prompt_cache_key, typeof b.prompt_cache_key];
     return result;
 }
@@ -296,105 +322,160 @@ ${previous}
 ${event.customInstructions ? `\nДополнительные инструкции этой контрольной точки:\n${event.customInstructions}` : ""}`;
 }
 
-function parseResult(response: AssistantMessage, splitTurn: boolean, messages: Message[], event: SessionBeforeCompactEvent): { history: string; prefix: string } | undefined {
-	if (response.stopReason !== "stop" || response.content.some((block) => block.type === "toolCall")) return;
-	const text = response.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
-	try {
-		const data = JSON.parse(text);
-		if (!data || typeof data.history !== "string" || typeof data.turnPrefix !== "string") return;
-		const history = localizeSummaryStructure(withoutFileTracking(data.history));
-		const prefix = localizeSummaryStructure(withoutFileTracking(data.turnPrefix));
-		if (!hasStructuralHeading(history, ["## Цель"]) || !history.trim() || (splitTurn ? !hasStructuralHeading(prefix, ["## Исходный запрос"]) : prefix.trim() !== "")) return;
-		const historyIndices = positions(messages, convertToLlm(event.preparation.messagesToSummarize)) ?? [];
-		const prefixIndices = positions(messages, convertToLlm(event.preparation.turnPrefixMessages), (historyIndices.at(-1) ?? -1) + 1) ?? [];
-		if (repeatsTailOnlyFact(`${history}\n${prefix}`, messages, [...historyIndices, ...prefixIndices], event.preparation.previousSummary ? withoutFileTracking(event.preparation.previousSummary) : "")) return;
-		return { history, prefix };
-	} catch { return; }
+type ParseResult = { parsed?: { history: string; prefix: string }; guard?: ValidationGuard; responseChars: number; toolBlockTypes: string[] };
+function parseResult(response: AssistantMessage, splitTurn: boolean, messages: Message[], event: SessionBeforeCompactEvent): ParseResult {
+    const toolBlockTypes = response.content.filter((block) => block.type === "toolCall").map((block) => block.type);
+    const responseChars = response.content.reduce((sum, block) => block.type === "text" ? sum + block.text.length : sum, 0);
+    if (toolBlockTypes.length) return { guard: "tool-call", responseChars, toolBlockTypes };
+    if (response.stopReason !== "stop") return { guard: "stop-reason", responseChars, toolBlockTypes };
+    const text = response.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+    if (!text.trim()) return { guard: "empty-result", responseChars, toolBlockTypes };
+    let data: any;
+    try { data = JSON.parse(text); } catch { return { guard: "json-parse", responseChars, toolBlockTypes }; }
+    if (!data || typeof data.history !== "string" || typeof data.turnPrefix !== "string") return { guard: "schema-shape", responseChars, toolBlockTypes };
+    const history = localizeSummaryStructure(withoutFileTracking(data.history));
+    const prefix = localizeSummaryStructure(withoutFileTracking(data.turnPrefix));
+    if (!hasStructuralHeading(history, ["## Цель"]) || !history.trim()) return { guard: "history-heading", responseChars, toolBlockTypes };
+    if (splitTurn && !hasStructuralHeading(prefix, ["## Исходный запрос"])) return { guard: "turn-prefix-heading", responseChars, toolBlockTypes };
+    if (!splitTurn && prefix.trim() !== "") return { guard: "turn-prefix-heading", responseChars, toolBlockTypes };
+    const historyIndices = positions(messages, convertToLlm(event.preparation.messagesToSummarize)) ?? [];
+    const prefixIndices = positions(messages, convertToLlm(event.preparation.turnPrefixMessages), (historyIndices.at(-1) ?? -1) + 1) ?? [];
+    if (repeatsTailOnlyFact(`${history}\n${prefix}`, messages, [...historyIndices, ...prefixIndices], event.preparation.previousSummary ? withoutFileTracking(event.preparation.previousSummary) : "")) return { guard: "tail-provenance", responseChars, toolBlockTypes };
+    return { parsed: { history, prefix }, responseChars, toolBlockTypes };
 }
 
+function cacheStatus(usage: Usage | undefined, attempted: boolean): CacheStatus {
+    if (!attempted) return "not-attempted";
+    if (!usage) return "unknown";
+    if (typeof usage.cacheRead !== "number") return "unavailable";
+    return usage.cacheRead > 0 ? "hit" : "miss";
+}
+function classifyRequestFailure(error: unknown, phase: RequestFailurePhase): RequestFailure {
+    const text = error instanceof Error ? `${error.name} ${error.message}`.toLowerCase() : typeof error === "string" ? error.toLowerCase() : error && typeof error === "object" && typeof (error as { errorMessage?: unknown }).errorMessage === "string" ? (error as { errorMessage: string }).errorMessage.toLowerCase() : "";
+    const failureClass: RequestFailureClass = /timeout|timed out|deadline/.test(text) ? "timeout" : /payload_mismatch/.test(text) ? "payload-hook" : /401|403|429|provider|rate limit|response\.error/.test(text) ? "provider-error" : /network|fetch|socket|stream|econn|connection/.test(text) ? "transport" : "unknown";
+    return { class: failureClass, phase, hasUsage: false };
+}
+function attemptReceipt(attempt: number, response: AssistantMessage | undefined, phase: AppendAttemptReceipt["phase"], repairAttempts: number, maxTokens: number): AppendAttemptReceipt {
+    const toolBlockTypes = response?.content.filter((block) => block.type === "toolCall").map((block) => block.type) ?? [];
+    const responseChars = response?.content.reduce((sum, block) => block.type === "text" ? sum + block.text.length : sum, 0);
+    const output = response?.stopReason === "error" || response?.stopReason === "aborted" ? undefined : response?.usage?.output;
+    return { attempt, phase, ...(response?.stopReason ? { stopReason: response.stopReason } : {}), toolBlocks: toolBlockTypes.length, toolBlockTypes, ...(response ? { responseChars } : {}), ...(typeof output === "number" && maxTokens > 0 ? { outputTokenShare: Number((output / maxTokens).toFixed(4)) } : {}), repairAttempts };
+}
 /** Returns fallback only before sending; failed/unknown paid requests never silently retry. */
 export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: ExtensionContext, snapshot: AppendSnapshot | undefined): Promise<AppendOutcome> {
-	if (!supported(ctx)) return { kind: "fallback", reason: "unsupported" };
-	if (!snapshot?.payload) return { kind: "fallback", reason: "snapshot-unavailable" };
-	const entries = ctx.sessionManager.getBranch();
-	const anchorIndex = entries.findIndex((entry) => entry.id === snapshot.anchor);
-	if (snapshot.sessionId !== session(ctx) || snapshot.provider !== ctx.model!.provider || snapshot.modelId !== ctx.model!.id || anchorIndex < 0) return { kind: "fallback", reason: "context-changed" };
-	const additions = entries.slice(anchorIndex + 1);
-	if (additions.some((entry) => ["compaction", "branch_summary", "context_edit", "model_change", "thinking_level_change"].includes(entry.type))) return { kind: "fallback", reason: "context-changed" };
-	const messages = [...snapshot.messages, ...convertToLlm(additions.flatMap(sessionEntryToContextMessages))];
-	const task = appendTask(messages, event);
-	if (!task) return { kind: "fallback", reason: "boundary-unavailable" };
-	const declared = ctx.modelRegistry.find(ctx.model!.provider, ctx.model!.id)?.contextWindow ?? ctx.model!.contextWindow;
-	const window = declared;
-	const maxTokens = Math.min(Math.floor(event.preparation.settings.reserveTokens * 0.8), ctx.model!.maxTokens);
-	const contextUsage = ctx.getContextUsage()?.tokens;
-	const serializedPayloadEstimate = Math.ceil(JSON.stringify(snapshot.payload).length / 3);
-	const additionsEstimate = convertToLlm(additions.flatMap(sessionEntryToContextMessages)).reduce((sum, message) => sum + estimateTokens(message), 0);
-	const inputEstimate = contextUsage ?? serializedPayloadEstimate + additionsEstimate;
-	const taskEstimate = Math.ceil(task.length / 3);
-	if (!(window > 0 && maxTokens > 0) || inputEstimate + taskEstimate + maxTokens + WINDOW_MARGIN > window) return { kind: "fallback", reason: "insufficient-window" };
-	if (event.signal.aborted) return { kind: "cancel", reason: "aborted" };
-	const initialLeaf = leaf(ctx);
-	let payloadRejected = false;
-	let totalUsage: Usage | undefined;
-	let repairAttempts = 0;
-	let payloadMismatch: PayloadMismatch | undefined;
-	const contextChanged = (): boolean => snapshot.sessionId !== session(ctx) || initialLeaf !== leaf(ctx) || snapshot.provider !== ctx.model?.provider || snapshot.modelId !== ctx.model?.id;
-	const addUsage = (usage: AssistantMessage["usage"]): void => {
-		if (!usage) return;
-		if (!totalUsage) { totalUsage = usage; return; }
-		totalUsage = {
-			...totalUsage,
-			input: totalUsage.input + usage.input, output: totalUsage.output + usage.output, reasoning: (totalUsage.reasoning ?? 0) + (usage.reasoning ?? 0),
-			cacheRead: totalUsage.cacheRead + usage.cacheRead, cacheWrite: totalUsage.cacheWrite + usage.cacheWrite, totalTokens: totalUsage.totalTokens + usage.totalTokens,
-			cost: {
-				input: totalUsage.cost.input + usage.cost.input, output: totalUsage.cost.output + usage.cost.output,
-				cacheRead: totalUsage.cost.cacheRead + usage.cost.cacheRead, cacheWrite: totalUsage.cost.cacheWrite + usage.cost.cacheWrite, total: totalUsage.cost.total + usage.cost.total,
-			},
-		};
-	};
-	const request = async (content: string): Promise<AssistantMessage> => {
-		payloadRejected = false;
-		const response = await ctx.modelRegistry.streamSimple(ctx.model!, { messages: [...messages, { role: "user", content, timestamp: Date.now() }] }, {
-			maxTokens, reasoning: ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel, signal: event.signal, cacheRetention: "short",
-			sessionId: snapshot.sessionId, transport: "sse", toolChoice: "none", maxRetries: 0, timeoutMs: 120_000,
-			onPayload: (payload) => {
-				const nextPayload = payload && typeof payload === "object" ? { ...(payload as Record<string, unknown>), text: { format: COMPACTION_OUTPUT_FORMAT } } : payload;
-				const next = payloadValue(nextPayload);
-                if (!preservesPayloadPrefix(snapshot.payload, nextPayload) || (snapshot.payload!.prompt_cache_key !== undefined && snapshot.payload!.prompt_cache_key !== next?.prompt_cache_key)) {
-                    payloadRejected = true;
-                    payloadMismatch = describePayloadMismatch(snapshot.payload, nextPayload, snapshot);
-                    throw new Error("APPEND_COMPACTION_PAYLOAD_MISMATCH");
-                }
-				return nextPayload;
-			},
-		}).result();
-		if (response.stopReason !== "error") addUsage(response.usage);
-		return response;
-	};
-	try {
-		let response = await request(task);
-		if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch };
-		if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage };
-		if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage };
-		let parsed = parseResult(response, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, messages, event);
-		if (!parsed && (response.stopReason === "stop" || response.stopReason === "length")) {
-			if (event.signal.aborted || contextChanged()) return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "context-changed", usage: totalUsage };
-			repairAttempts += 1;
-			response = await request(`${task}\n\nПредыдущий ответ не прошёл проверку формата. Повтори тот же compact строго по заданной схеме; не добавляй пояснений, markdown-ограждений или дополнительных ключей.`);
-			if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch };
-			if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
-			if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
-			parsed = parseResult(response, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, messages, event);
-		}
-		if (!parsed) return { kind: "cancel", reason: response.stopReason === "error" ? "request-failed" : "invalid-result", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
-		const body = `${parsed.history}${parsed.prefix ? `\n\n**Контекст разрезанного хода:**\n${parsed.prefix}` : ""}`;
-		const files = collectFileLists(event.preparation.fileOps, event.branchEntries);
-		return { kind: "success", ...(repairAttempts ? { repairAttempts } : {}), compaction: {
-			summary: `${body}${formatFileHints(files, [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages], body)}`,
-			firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, usage: totalUsage ?? response.usage, details: files,
-		} };
-	} catch {
-		return payloadRejected ? { kind: "fallback", reason: "payload-mismatch", payloadMismatch } : { kind: "cancel", reason: event.signal.aborted ? "aborted" : "request-failed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
-	}
+    const preflight = (reason: AppendFallback): AppendOutcome => ({ kind: "fallback", reason, appendAttempt: [attemptReceipt(0, undefined, "preflight", 0, 0)], cacheStatus: "not-attempted" });
+    if (!supported(ctx)) return preflight("unsupported");
+    if (!snapshot?.payload) return preflight("snapshot-unavailable");
+    const entries = ctx.sessionManager.getBranch();
+    const anchorIndex = entries.findIndex((entry) => entry.id === snapshot.anchor);
+    if (snapshot.sessionId !== session(ctx) || snapshot.provider !== ctx.model!.provider || snapshot.modelId !== ctx.model!.id || anchorIndex < 0) return preflight("context-changed");
+    const additions = entries.slice(anchorIndex + 1);
+    const safeCustomTypes = new Set(["pi-autoname-state", "context-compaction-audit", "context-compaction-mode", "context-compaction-card"]);
+    if (additions.some((entry) => entry.type !== "message" && entry.type !== "session_info" && !(entry.type === "custom" && safeCustomTypes.has(entry.customType)))) return preflight("context-changed");
+    const messages = [...snapshot.messages, ...convertToLlm(additions.flatMap(sessionEntryToContextMessages))];
+    const task = appendTask(messages, event);
+    if (!task) return preflight("boundary-unavailable");
+    const declared = ctx.modelRegistry.find(ctx.model!.provider, ctx.model!.id)?.contextWindow ?? ctx.model!.contextWindow;
+    const window = declared;
+    const maxTokens = Math.min(Math.floor(event.preparation.settings.reserveTokens * 0.8), ctx.model!.maxTokens);
+    const contextUsage = ctx.getContextUsage()?.tokens;
+    const serializedPayloadEstimate = Math.ceil(JSON.stringify(snapshot.payload).length / 3);
+    const additionsEstimate = convertToLlm(additions.flatMap(sessionEntryToContextMessages)).reduce((sum, message) => sum + estimateTokens(message), 0);
+    const inputEstimate = contextUsage ?? serializedPayloadEstimate + additionsEstimate;
+    const taskEstimate = Math.ceil(task.length / 3);
+    if (!(window > 0 && maxTokens > 0) || inputEstimate + taskEstimate + maxTokens + WINDOW_MARGIN > window) return preflight("insufficient-window");
+    if (event.signal.aborted) return { kind: "cancel", reason: "aborted", appendAttempt: [attemptReceipt(0, undefined, "preflight", 0, 0)], cacheStatus: "not-attempted" };
+    const initialLeaf = leaf(ctx);
+    let payloadRejected = false;
+    let totalUsage: Usage | undefined;
+    let repairAttempts = 0;
+    let payloadMismatch: PayloadMismatch | undefined;
+    let validationGuard: ValidationGuard | undefined;
+    let requestFailure: RequestFailure | undefined;
+    const appendAttempt: AppendAttemptReceipt[] = [];
+    const contextChanged = (): boolean => snapshot.sessionId !== session(ctx) || initialLeaf !== leaf(ctx) || snapshot.provider !== ctx.model?.provider || snapshot.modelId !== ctx.model?.id;
+    const addUsage = (usage: AssistantMessage["usage"]): void => {
+        if (!usage) return;
+        if (!totalUsage) { totalUsage = usage; return; }
+        totalUsage = {
+            ...totalUsage,
+            input: totalUsage.input + usage.input, output: totalUsage.output + usage.output, reasoning: (totalUsage.reasoning ?? 0) + (usage.reasoning ?? 0),
+            cacheRead: totalUsage.cacheRead + usage.cacheRead, cacheWrite: totalUsage.cacheWrite + usage.cacheWrite, totalTokens: totalUsage.totalTokens + usage.totalTokens,
+            cost: { input: totalUsage.cost.input + usage.cost.input, output: totalUsage.cost.output + usage.cost.output, cacheRead: totalUsage.cost.cacheRead + usage.cost.cacheRead, cacheWrite: totalUsage.cost.cacheWrite + usage.cost.cacheWrite, total: totalUsage.cost.total + usage.cost.total },
+        };
+    };
+    const diagnostics = () => ({ appendAttempt: structuredClone(appendAttempt), ...(validationGuard ? { validationGuard } : {}), ...(requestFailure ? { requestFailure: { ...requestFailure, hasUsage: Boolean(totalUsage) } } : {}), cacheStatus: cacheStatus(totalUsage, appendAttempt.length > 0) });
+    const request = async (content: string): Promise<AssistantMessage> => {
+        payloadRejected = false;
+        const attempt = appendAttempt.length + 1;
+        try {
+            const response = await ctx.modelRegistry.streamSimple(ctx.model!, { messages: [...messages, { role: "user", content, timestamp: Date.now() }] }, {
+                maxTokens, reasoning: ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel, signal: event.signal, cacheRetention: "short",
+                sessionId: snapshot.sessionId, transport: "sse", toolChoice: "none", maxRetries: 0, timeoutMs: 120_000,
+                onPayload: (payload) => {
+                    const nextPayload = payload && typeof payload === "object" ? { ...(payload as Record<string, unknown>), text: { format: COMPACTION_OUTPUT_FORMAT } } : payload;
+                    const next = payloadValue(nextPayload);
+                    if (!preservesPayloadPrefix(snapshot.payload, nextPayload) || snapshot.payload!.prompt_cache_key !== next?.prompt_cache_key) {
+                        payloadRejected = true; payloadMismatch = describePayloadMismatch(snapshot.payload, nextPayload, snapshot);
+                        throw new Error("APPEND_COMPACTION_PAYLOAD_MISMATCH");
+                    }
+                    return nextPayload;
+                },
+            }).result();
+            appendAttempt.push(attemptReceipt(attempt, response, "provider", repairAttempts, maxTokens));
+            if (response.stopReason === "error" && !payloadRejected) requestFailure = classifyRequestFailure((response as AssistantMessage & { errorMessage?: unknown }).errorMessage, "provider");
+            else if (response.stopReason !== "aborted") addUsage(response.usage);
+            return response;
+        } catch (error) {
+            appendAttempt.push(attemptReceipt(attempt, undefined, "provider", repairAttempts, maxTokens));
+            if (!payloadRejected) requestFailure = classifyRequestFailure(error, "provider");
+            throw error;
+        }
+    };
+    const updateAttempt = (result: ParseResult, response: AssistantMessage): void => {
+        const current = appendAttempt.at(-1);
+        if (!current) return;
+        current.phase = result.parsed ? "apply" : "parse";
+        if (result.guard) current.validationGuard = result.guard;
+        current.stopReason = response.stopReason;
+        current.toolBlocks = result.toolBlockTypes.length;
+        current.toolBlockTypes = result.toolBlockTypes;
+        current.responseChars = result.responseChars;
+        current.repairAttempts = repairAttempts;
+        if (typeof response.usage?.output === "number" && maxTokens > 0) current.outputTokenShare = Number((response.usage.output / maxTokens).toFixed(4));
+    };
+    try {
+        let response = await request(task);
+        if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
+        if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, ...diagnostics() };
+        if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, ...diagnostics() };
+        if (response.stopReason === "error") return { kind: "cancel", reason: "request-failed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
+        let result = parseResult(response, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, messages, event);
+        updateAttempt(result, response);
+        if (!result.parsed && (response.stopReason === "stop" || response.stopReason === "length")) {
+            if (event.signal.aborted || contextChanged()) return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "context-changed", usage: totalUsage, ...diagnostics() };
+            repairAttempts += 1;
+            response = await request(`${task}\n\nПредыдущий ответ не прошёл проверку формата. Повтори тот же compact строго по заданной схеме; не добавляй пояснений, markdown-ограждений или дополнительных ключей.`);
+            if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
+            if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, repairAttempts, ...diagnostics() };
+            if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, repairAttempts, ...diagnostics() };
+            if (response.stopReason === "error") return { kind: "cancel", reason: "request-failed", usage: totalUsage, repairAttempts, ...diagnostics() };
+            result = parseResult(response, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, messages, event);
+            updateAttempt(result, response);
+        }
+        if (!result.parsed) {
+            validationGuard = result.guard ?? "unknown";
+            const reason = "invalid-result" as const;
+            return { kind: "cancel", reason, usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
+        }
+        const body = `${result.parsed.history}${result.parsed.prefix ? `\n\n**Контекст разрезанного хода:**\n${result.parsed.prefix}` : ""}`;
+        const files = collectFileLists(event.preparation.fileOps, event.branchEntries);
+        return { kind: "success", ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics(), compaction: {
+            summary: `${body}${formatFileHints(files, [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages], body)}`,
+            firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, usage: totalUsage ?? response.usage, details: files,
+        } };
+    } catch {
+        if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
+        return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "request-failed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
+    }
 }

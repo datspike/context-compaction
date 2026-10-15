@@ -12,19 +12,23 @@ export interface CompactCardUsage {
 }
 
 export interface CompactCardData {
-	version: 1;
-	kind: CompactCardKind;
-	/** Причина отказа append, из-за которой выполнен обычный compact. */
-	fallbackReason?: string;
-	trigger?: string;
-	provider?: string;
-	model?: string;
-	tokensBefore?: number;
-	/** Оценка размера summary в токенах; хвост контекста сюда не входит. */
-	summaryTokens?: number;
-	durationMs?: number;
-	repairAttempts?: number;
-	usage?: CompactCardUsage;
+    version: 2;
+    kind: CompactCardKind;
+    /** Причина отказа append, из-за которой выполнен обычный compact. */
+    fallbackReason?: string;
+    trigger?: string;
+    provider?: string;
+    model?: string;
+    tokensBefore?: number;
+    /** Оценка размера summary в токенах; хвост контекста сюда не входит. */
+    summaryTokens?: number;
+    /** Время standard compact; appendDurationMs остаётся отдельным. */
+    durationMs?: number;
+    appendDurationMs?: number;
+    appendUsage?: CompactCardUsage;
+    appendCacheStatus?: string;
+    repairAttempts?: number;
+    usage?: CompactCardUsage;
 }
 
 export interface CompactCardText {
@@ -46,30 +50,39 @@ export function estimateSummaryTokens(summary: unknown): number | undefined {
 }
 
 export function formatCompactCard(data: CompactCardData, language: "ru" | "en"): CompactCardText {
-	const ru = language === "ru";
-	const usage = data.usage;
-	const input = (usage?.input ?? 0) + (usage?.cacheRead ?? 0);
-	const hasUsage = Boolean(usage) && input > 0;
-	const cacheShare = hasUsage ? Math.round(((usage?.cacheRead ?? 0) / input) * 100) : undefined;
-	const cacheHit = (usage?.cacheRead ?? 0) > 0;
-	const cache = data.kind === "append" && hasUsage ? (cacheHit ? `cache hit ${cacheShare}%` : "cache miss") : undefined;
-	const duration = typeof data.durationMs === "number" ? `${(data.durationMs / 1000).toFixed(1)} s` : undefined;
-	const costValue = usage?.cost?.total;
-	const cost = typeof costValue === "number" ? `$${costValue.toFixed(4)}` : undefined;
-	const fallback = data.fallbackReason !== undefined;
-	const label = data.kind === "append" ? "append compact" : fallback ? `standard compact · append fallback (${data.fallbackReason})` : "standard compact";
-	const size = `${tokens(data.tokensBefore)} → summary ${tokens(data.summaryTokens, true)}`;
-	const line = ["◆ " + label, cache, size, duration, cost].filter(Boolean).join(" · ");
-	const details: string[] = [];
-	details.push(`${ru ? "тип" : "type"}: ${data.kind}${data.trigger ? ` · ${data.trigger}` : ""}`);
-	if (data.provider || data.model) details.push(`${ru ? "модель" : "model"}: ${[data.provider, data.model].filter(Boolean).join("/")}`);
-	if (fallback) details.push(`${ru ? "причина fallback" : "fallback reason"}: ${data.fallbackReason}`);
-	details.push(`${ru ? "контекст" : "context"}: ${tokens(data.tokensBefore)} → summary ${tokens(data.summaryTokens, true)} (${ru ? "хвост не учтён" : "kept tail not counted"})`);
-	if (hasUsage) details.push(`cache: read ${tokens(usage?.cacheRead)} / input ${tokens(input)}${cacheShare !== undefined ? ` (${cacheShare}%)` : ""}`);
-	if (duration) details.push(`${ru ? "время" : "time"}: ${duration}${data.repairAttempts ? ` · repair ${data.repairAttempts}` : ""}`);
-	if (cost) details.push(`${ru ? "стоимость" : "cost"}: ${cost}`);
-	const tone = fallback || (data.kind === "append" && hasUsage && !cacheHit) ? "warning" : "normal";
-	return { line, details, tone };
+    const ru = language === "ru";
+    const usage = data.usage;
+    const appendUsage = data.appendUsage;
+    const cacheRead = usage?.cacheRead;
+    const numericCacheRead = typeof cacheRead === "number";
+    const input = (usage?.input ?? 0) + (numericCacheRead ? cacheRead : 0);
+    const hasUsage = Boolean(usage) && input > 0;
+    const cacheShare = hasUsage && numericCacheRead ? Math.round((cacheRead / input) * 100) : undefined;
+    const derivedAppendCacheStatus = data.kind === "append" && numericCacheRead ? (cacheRead > 0 ? "hit" : "miss") : undefined;
+    const appendCacheStatus = data.appendCacheStatus ?? derivedAppendCacheStatus;
+    const cache = data.kind === "append" && appendCacheStatus && appendCacheStatus !== "not-attempted" ? appendCacheStatus === "hit" && cacheShare !== undefined ? `cache hit ${cacheShare}%` : `cache ${appendCacheStatus}` : undefined;
+    const duration = typeof data.durationMs === "number" ? `${(data.durationMs / 1000).toFixed(1)} s` : undefined;
+    const costValue = usage?.cost?.total;
+    const cost = typeof costValue === "number" ? `$${costValue.toFixed(4)}` : undefined;
+    const appendCost = appendUsage?.cost?.total;
+    const appendCostText = typeof appendCost === "number" ? `append $${appendCost.toFixed(4)}` : appendCacheStatus === "not-attempted" ? "append $0.0000" : appendCacheStatus ? "append unknown" : undefined;
+    const fallback = data.fallbackReason !== undefined;
+    const label = data.kind === "append" ? "append compact" : fallback ? `standard compact · append fallback (${data.fallbackReason})` : "standard compact";
+    const size = `${tokens(data.tokensBefore)} → summary ${tokens(data.summaryTokens, true)}`;
+    const line = ["◆ " + label, cache, size, duration, cost, fallback ? appendCostText : undefined].filter(Boolean).join(" · ");
+    const details: string[] = [];
+    details.push(`${ru ? "тип" : "type"}: ${data.kind}${data.trigger ? ` · ${data.trigger}` : ""}`);
+    if (data.provider || data.model) details.push(`${ru ? "модель" : "model"}: ${[data.provider, data.model].filter(Boolean).join("/")}`);
+    if (fallback) details.push(`${ru ? "причина fallback" : "fallback reason"}: ${data.fallbackReason}`);
+    details.push(`${ru ? "контекст" : "context"}: ${tokens(data.tokensBefore)} → summary ${tokens(data.summaryTokens, true)} (${ru ? "хвост не учтён" : "kept tail not counted"})`);
+    if (hasUsage) details.push(`cache: read ${tokens(cacheRead)} / input ${tokens(input)}${cacheShare !== undefined ? ` (${cacheShare}%)` : ""}`);
+    else if (data.kind === "append" && appendCacheStatus && appendCacheStatus !== "not-attempted") details.push(`cache: ${appendCacheStatus}`);
+    if (duration) details.push(`${ru ? "время" : "time"}: ${duration}${data.repairAttempts ? ` · repair ${data.repairAttempts}` : ""}`);
+    if (typeof data.appendDurationMs === "number") details.push(`${ru ? "append время" : "append time"}: ${(data.appendDurationMs / 1000).toFixed(1)} s${appendCacheStatus ? ` · cache ${appendCacheStatus}` : ""}`);
+    if (appendCostText) details.push(`${ru ? "append стоимость" : "append cost"}: ${appendCostText}`);
+    if (cost) details.push(`${ru ? "стоимость" : "cost"}: ${cost}`);
+    const tone = fallback || (data.kind === "append" && appendCacheStatus === "miss") ? "warning" : "normal";
+    return { line, details, tone };
 }
 
 /** Компонент ленты Pi: свёрнутая строка или строка с подробностями при раскрытии. */
