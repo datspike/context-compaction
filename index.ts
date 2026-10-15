@@ -62,6 +62,12 @@ export function formatAppendNotice(outcome: Awaited<ReturnType<typeof appendComp
 	return { text: language === "ru" ? `append compact: не применён (${outcome.reason}) · ${duration}` : `append compact: not applied (${outcome.reason}) · ${duration}`, level: "error" };
 }
 
+export function publishAppendNotice(ctx: ExtensionContext, outcome: Awaited<ReturnType<typeof appendCompaction>>, durationMs: number, language: "ru" | "en"): void {
+	if (!shouldNotifyAppendOutcome(outcome)) return;
+	const appendNotice = formatAppendNotice(outcome, durationMs, language);
+	notice(ctx, appendNotice.text, appendNotice.level, "context-compaction-append");
+}
+
 type ContextCompletion = { value: string; label: string; description: string };
 type Scope = { sessionId: string; branch: string };
 type UserWatermark = string | null;
@@ -112,8 +118,10 @@ function modelDeclaration(ctx: ExtensionContext): RegistryDeclaration {
 	return { contextWindow, hasLongPricingTier };
 }
 
-function notice(ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "info"): void {
-	if (ctx.hasUI) ctx.ui.notify(text, level);
+function notice(ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "info", statusKey?: string): void {
+	if (!ctx.hasUI) return;
+	ctx.ui.notify(text, level);
+	if (statusKey) ctx.ui.setStatus(statusKey, text);
 }
 
 function scopeOf(ctx: ExtensionContext, anonymousIdentities: WeakMap<object, Map<string, string>>): Scope {
@@ -190,10 +198,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		const outcome = await appendCompaction(event, ctx, snapshot);
 		const durationMs = Date.now() - started;
 		pi.appendEntry("context-compaction-append", appendAuditPayload(outcome, durationMs, model));
-		if (shouldNotifyAppendOutcome(outcome)) {
-			const appendNotice = formatAppendNotice(outcome, durationMs, language);
-			notice(ctx, appendNotice.text, appendNotice.level);
-		}
+		publishAppendNotice(ctx, outcome, durationMs, language);
 		if (outcome.kind === "success") return { compaction: outcome.compaction };
 		if (shouldUseStandardCompactFallback(outcome)) return russianCompaction(event, ctx);
 		const op = currentOperation(ctx);
