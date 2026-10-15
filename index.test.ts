@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import extension, { appendUsageForAudit } from "./index.js";
+import extension, { appendAuditPayload, appendUsageForAudit, formatAppendNotice, shouldNotifyAppendOutcome } from "./index.js";
 
 const params = { mainObjective: "Продолжить цель", completedCheckpoint: "Завершён этап", continuationTarget: "Сделать следующий шаг" };
 let sequence = 0;
@@ -179,10 +179,29 @@ describe("public compaction lifecycle", () => {
 	});
 });
 
-test("keeps append usage in the audit payload for success and cancellation", () => {
+test("keeps append usage and provider/model in the audit payload", () => {
 	const usage = { input: 20, output: 10, cacheRead: 100, cacheWrite: 0, totalTokens: 130, cost: { input: 0.01, output: 0.01, cacheRead: 0.01, cacheWrite: 0, total: 0.03 } };
-	expect(appendUsageForAudit({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage, details: { read: new Set(), edited: new Set(), created: new Set() } } })).toEqual(usage);
+	const success = { kind: "success" as const, compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage, details: { read: new Set(), edited: new Set(), created: new Set() } } };
+	expect(appendUsageForAudit(success)).toEqual(usage);
 	expect(appendUsageForAudit({ kind: "cancel", reason: "request-failed", usage })).toEqual(usage);
+	expect(appendAuditPayload({ ...success, repairAttempts: 1 }, 123, { provider: "openai", id: "gpt-5.6-sol" })).toMatchObject({ provider: "openai", model: "gpt-5.6-sol", durationMs: 123, repairAttempts: 1, usage });
+});
+
+test("formats append result warnings without affecting standard compact", () => {
+	const hit = formatAppendNotice({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: { cacheRead: 100, cost: { total: 0.03 } }, details: { read: new Set(), edited: new Set(), created: new Set() } } }, 12_345, "ru");
+	expect(hit).toEqual({ text: "append compact: cache hit · 12.3 s · $0.0300", level: "info" });
+	const miss = formatAppendNotice({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: { cacheRead: 0, cost: { total: 0.08 } }, details: { read: new Set(), edited: new Set(), created: new Set() } } }, 1_000, "ru");
+	expect(miss).toEqual({ text: "append compact: cache miss · 1.0 s · $0.0800", level: "warning" });
+	expect(shouldNotifyAppendOutcome({ kind: "success", compaction: { summary: "summary", firstKeptEntryId: "tail", tokensBefore: 1, usage: {}, details: { read: new Set(), edited: new Set(), created: new Set() } } })).toBe(true);
+	expect(shouldNotifyAppendOutcome({ kind: "fallback", reason: "unsupported" })).toBe(true);
+	expect(shouldNotifyAppendOutcome({ kind: "cancel", reason: "aborted" })).toBe(false);
+	expect(shouldNotifyAppendOutcome({ kind: "fallback", reason: "context-changed" })).toBe(false);
+	const fallback = formatAppendNotice({ kind: "fallback", reason: "unsupported" }, 2_000, "ru");
+	expect(fallback).toEqual({ text: "append compact: fallback (unsupported) · cache not attempted · standard compact · 2.0 s · $0.0000", level: "warning" });
+	const requestFailed = formatAppendNotice({ kind: "cancel", reason: "request-failed", usage: { cacheRead: 0, cost: { total: 0.08 } } }, 2_500, "ru");
+	expect(requestFailed).toEqual({ text: "append compact: fallback (request-failed) · cache miss · standard compact · 2.5 s · $0.0800", level: "warning" });
+	const requestFailedWithoutUsage = formatAppendNotice({ kind: "cancel", reason: "request-failed" }, 2_500, "ru");
+	expect(requestFailedWithoutUsage).toEqual({ text: "append compact: fallback (request-failed) · cache unavailable · standard compact · 2.5 s · cost unavailable", level: "warning" });
 });
 
 describe("session-local context modes", () => {

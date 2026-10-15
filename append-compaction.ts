@@ -59,8 +59,8 @@ const COMPACTION_OUTPUT_FORMAT = {
 export type AppendFallback = "unsupported" | "snapshot-unavailable" | "context-changed" | "boundary-unavailable" | "insufficient-window" | "payload-mismatch";
 export type AppendOutcome =
 	| { kind: "fallback"; reason: AppendFallback }
-	| { kind: "cancel"; reason: "aborted" | "request-failed" | "invalid-result" | "context-changed"; usage?: AssistantMessage["usage"] }
-	| { kind: "success"; compaction: { summary: string; firstKeptEntryId: string; tokensBefore: number; usage: AssistantMessage["usage"]; details: ReturnType<typeof collectFileLists> } };
+	| { kind: "cancel"; reason: "aborted" | "request-failed" | "invalid-result" | "context-changed"; usage?: AssistantMessage["usage"]; repairAttempts?: number }
+	| { kind: "success"; compaction: { summary: string; firstKeptEntryId: string; tokensBefore: number; usage: AssistantMessage["usage"]; details: ReturnType<typeof collectFileLists> }; repairAttempts?: number };
 
 export function shouldUseStandardCompactFallback(outcome: AppendOutcome): boolean {
 	return outcome.kind === "fallback" || (outcome.kind === "cancel" && (outcome.reason === "invalid-result" || outcome.reason === "request-failed"));
@@ -221,6 +221,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 	const initialLeaf = leaf(ctx);
 	let payloadRejected = false;
 	let totalUsage: Usage | undefined;
+	let repairAttempts = 0;
 	const contextChanged = (): boolean => snapshot.sessionId !== session(ctx) || initialLeaf !== leaf(ctx) || snapshot.provider !== ctx.model?.provider || snapshot.modelId !== ctx.model?.id;
 	const addUsage = (usage: AssistantMessage["usage"]): void => {
 		if (!usage) return;
@@ -250,7 +251,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 				return nextPayload;
 			},
 		}).result();
-		addUsage(response.usage);
+		if (response.stopReason !== "error") addUsage(response.usage);
 		return response;
 	};
 	try {
@@ -261,20 +262,21 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
 		let parsed = parseResult(response, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, messages, event);
 		if (!parsed && (response.stopReason === "stop" || response.stopReason === "length")) {
 			if (event.signal.aborted || contextChanged()) return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "context-changed", usage: totalUsage };
+			repairAttempts += 1;
 			response = await request(`${task}\n\nПредыдущий ответ не прошёл проверку формата. Повтори тот же compact строго по заданной схеме; не добавляй пояснений, markdown-ограждений или дополнительных ключей.`);
 			if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch" };
-			if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage };
-			if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage };
+			if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
+			if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
 			parsed = parseResult(response, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, messages, event);
 		}
-		if (!parsed) return { kind: "cancel", reason: response.stopReason === "error" ? "request-failed" : "invalid-result", usage: totalUsage };
+		if (!parsed) return { kind: "cancel", reason: response.stopReason === "error" ? "request-failed" : "invalid-result", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
 		const body = `${parsed.history}${parsed.prefix ? `\n\n**Контекст разрезанного хода:**\n${parsed.prefix}` : ""}`;
 		const files = collectFileLists(event.preparation.fileOps, event.branchEntries);
-		return { kind: "success", compaction: {
+		return { kind: "success", ...(repairAttempts ? { repairAttempts } : {}), compaction: {
 			summary: `${body}${formatFileHints(files, [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages], body)}`,
 			firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, usage: totalUsage ?? response.usage, details: files,
 		} };
 	} catch {
-		return payloadRejected ? { kind: "fallback", reason: "payload-mismatch" } : { kind: "cancel", reason: event.signal.aborted ? "aborted" : "request-failed", usage: totalUsage };
+		return payloadRejected ? { kind: "fallback", reason: "payload-mismatch" } : { kind: "cancel", reason: event.signal.aborted ? "aborted" : "request-failed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}) };
 	}
 }

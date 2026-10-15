@@ -29,6 +29,38 @@ export function appendUsageForAudit(outcome: Awaited<ReturnType<typeof appendCom
 	return outcome.kind === "success" ? outcome.compaction.usage : outcome.kind === "cancel" ? outcome.usage : undefined;
 }
 
+export function appendAuditPayload(outcome: Awaited<ReturnType<typeof appendCompaction>>, durationMs: number, model: { provider?: string; id?: string } | undefined): Record<string, unknown> {
+	return {
+		version: 1,
+		outcome: outcome.kind,
+		reason: "reason" in outcome ? outcome.reason : undefined,
+		durationMs,
+		provider: model?.provider,
+		model: model?.id,
+		repairAttempts: "repairAttempts" in outcome ? outcome.repairAttempts ?? 0 : 0,
+		usage: appendUsageForAudit(outcome),
+	};
+}
+
+export function shouldNotifyAppendOutcome(outcome: Awaited<ReturnType<typeof appendCompaction>>): boolean {
+	return outcome.kind === "success" || (shouldUseStandardCompactFallback(outcome) && !(outcome.kind === "fallback" && outcome.reason === "context-changed"));
+}
+
+export function formatAppendNotice(outcome: Awaited<ReturnType<typeof appendCompaction>>, durationMs: number, language: "ru" | "en"): { text: string; level: "info" | "warning" | "error" } {
+	const usage = appendUsageForAudit(outcome) as { cacheRead?: number; cost?: { total?: number } } | undefined;
+	const duration = `${(durationMs / 1000).toFixed(1)} s`;
+	const requestFailedWithoutUsage = outcome.kind === "cancel" && outcome.reason === "request-failed" && !usage;
+	const cache = usage ? (usage.cacheRead && usage.cacheRead > 0 ? "cache hit" : "cache miss") : requestFailedWithoutUsage ? "cache unavailable" : "cache not attempted";
+	const cost = usage ? (typeof usage.cost?.total === "number" ? ` · $${usage.cost.total.toFixed(4)}` : " · cost unavailable") : requestFailedWithoutUsage ? " · cost unavailable" : " · $0.0000";
+	if (outcome.kind === "success") {
+		return { text: language === "ru" ? `append compact: ${cache} · ${duration}${cost}` : `append compact: ${cache} · ${duration}${cost}`, level: usage?.cacheRead && usage.cacheRead > 0 ? "info" : "warning" };
+	}
+	if (shouldUseStandardCompactFallback(outcome)) {
+		return { text: language === "ru" ? `append compact: fallback (${outcome.reason}) · ${cache} · standard compact · ${duration}${cost}` : `append compact: fallback (${outcome.reason}) · ${cache} · standard compact · ${duration}${cost}`, level: "warning" };
+	}
+	return { text: language === "ru" ? `append compact: не применён (${outcome.reason}) · ${duration}` : `append compact: not applied (${outcome.reason}) · ${duration}`, level: "error" };
+}
+
 type ContextCompletion = { value: string; label: string; description: string };
 type Scope = { sessionId: string; branch: string };
 type UserWatermark = string | null;
@@ -153,16 +185,18 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		const snapshot = appendCapture.get();
 		appendCapture.clear();
 		const started = Date.now();
+		const model = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 		const outcome = await appendCompaction(event, ctx, snapshot);
-		pi.appendEntry("context-compaction-append", { version: 1, outcome: outcome.kind, reason: "reason" in outcome ? outcome.reason : undefined, durationMs: Date.now() - started, usage: appendUsageForAudit(outcome) });
-		if (outcome.kind === "success") return { compaction: outcome.compaction };
-		if (shouldUseStandardCompactFallback(outcome)) {
-			notice(ctx, text(`Предупреждение: append compact не применён (${outcome.reason}); выполнен стандартный compact.`, `Warning: append compaction was not applied (${outcome.reason}); standard compaction was used.`), "warning");
-			return russianCompaction(event, ctx);
+		const durationMs = Date.now() - started;
+		pi.appendEntry("context-compaction-append", appendAuditPayload(outcome, durationMs, model));
+		if (shouldNotifyAppendOutcome(outcome)) {
+			const appendNotice = formatAppendNotice(outcome, durationMs, language);
+			notice(ctx, appendNotice.text, appendNotice.level);
 		}
+		if (outcome.kind === "success") return { compaction: outcome.compaction };
+		if (shouldUseStandardCompactFallback(outcome)) return russianCompaction(event, ctx);
 		const op = currentOperation(ctx);
 		if (op) fail(ctx, op);
-		notice(ctx, text("Append compact не применён; история сохранена, автоматический повтор не выполняется.", "Append compaction was not applied; history is unchanged and no automatic retry is made."), "error");
 		return { cancel: true };
 	};
 	const text = (ru: string, en: string): string => language === "ru" ? ru : en;

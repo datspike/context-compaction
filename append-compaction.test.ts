@@ -99,7 +99,10 @@ describe("append compaction", () => {
 		const result = await appendCompaction(f.event, f.ctx, f.snapshot);
 		expect(result.kind).toBe("success");
 		expect(calls).toBe(2);
-		if (result.kind === "success") expect(result.compaction.usage?.totalTokens).toBe(260);
+		if (result.kind === "success") {
+		expect(result.compaction.usage?.totalTokens).toBe(260);
+		expect(result.repairAttempts).toBe(1);
+	}
 	});
 	test("rejects structural headings hidden inside code fences", async () => {
 		const f = fixture(); let calls = 0;
@@ -148,6 +151,11 @@ describe("append compaction", () => {
 		const f = fixture(); let calls = 0;
 		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => { calls++; throw new Error("stream closed before response.completed"); } });
 		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toEqual({ kind: "cancel", reason: "request-failed" }); expect(calls).toBe(1);
+	});
+	test("does not treat an error response placeholder as measured usage", async () => {
+		const f = fixture();
+		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), stopReason: "error", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }) });
+		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toEqual({ kind: "cancel", reason: "request-failed" });
 	});
 	test("payload mismatch is detected in the pre-send hook", async () => {
 		const f = fixture(); let sent = 0;
@@ -228,11 +236,11 @@ test("real OpenAI Responses converter preserves original envelope and produces a
 	expect(next.tools).toEqual(original.tools); expect(next.tool_choice).toBe("none"); expect(next.prompt_cache_key).toBe(original.prompt_cache_key); expect(next.store).toBe(false); expect(next.previous_response_id).toBeUndefined(); expect(next.reasoning.effort).toBe("medium");
 });
 
-test("append setting is opt-in and rejects ambiguous values", () => {
+test("append setting is default-on, supports opt-out, and rejects ambiguous values", () => {
 	const dir = mkdtempSync(join(tmpdir(), "q12-settings-"));
 	try {
-		expect(loadSummarySettings(dir)).toEqual({ summaryLanguage: "ru", appendCompaction: false });
-		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { appendCompaction: true } })); expect(loadSummarySettings(dir).appendCompaction).toBe(true);
+		expect(loadSummarySettings(dir)).toEqual({ summaryLanguage: "ru", appendCompaction: true });
+		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { appendCompaction: false } })); expect(loadSummarySettings(dir).appendCompaction).toBe(false);
 		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { appendCompaction: "true" } })); expect(() => loadSummarySettings(dir)).toThrow("contextCompaction.appendCompaction must be a boolean");
 	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
