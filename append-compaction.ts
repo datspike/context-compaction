@@ -35,7 +35,7 @@ function repeatsTailOnlyFact(output: string, messages: Message[], allowed: numbe
 }
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
+import { createInitialSystemMessage, getCurrentSystemPrompt, getCurrentTools, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
 import { convertToLlm, estimateTokens, sessionEntryToContextMessages, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 import { collectFileLists, formatFileHints, withoutFileTracking } from "./file-hints.js";
 import { hasStructuralHeading, localizeSummaryStructure, RUSSIAN_COMPACTION_FOCUS } from "./summary.js";
@@ -166,25 +166,52 @@ function supported(ctx: ExtensionContext): boolean {
 	return ctx.model?.api === "openai-responses" && !!compat && "supportsMidConvoSystemMessages" in compat && compat.supportsMidConvoSystemMessages === true;
 }
 
-function leaf(ctx: ExtensionContext): string | undefined { return ctx.sessionManager.getBranch().at(-1)?.id; }
+/** Naming metadata can arrive while a request is running without changing its context. */
+function leaf(ctx: ExtensionContext): string | undefined {
+	return [...ctx.sessionManager.getBranch()].reverse().find((entry) =>
+		entry.type !== "session_info" && !(entry.type === "custom" && entry.customType === "pi-autoname-state"),
+	)?.id;
+}
 function session(ctx: ExtensionContext): string | undefined { return ctx.sessionManager.getSessionId(); }
 
 /** One in-memory snapshot per extension runtime; never saves prompts or provider payloads. */
 export class AppendCapture {
     private snapshot: AppendSnapshot | undefined;
-    clear(): void { this.snapshot = undefined; }
+    private effectivePrompt: string | undefined;
+    clear(): void { this.snapshot = undefined; this.effectivePrompt = undefined; }
     context(messages: AgentMessage[], ctx: ExtensionContext): void {
         const converted = convertToLlm(messages);
         if (!matchesCurrentLeaf(converted, ctx)) return;
         this.clear();
         const anchor = leaf(ctx), sessionId = session(ctx);
         if (!supported(ctx) || !anchor || !sessionId || messages[0]?.role !== "system") return;
-        if (JSON.stringify(converted).length > MAX_SNAPSHOT_CHARS) return;
+        const effectivePrompt = ctx.getSystemPrompt?.();
+        if (JSON.stringify(converted).length + (effectivePrompt?.length ?? 0) > MAX_SNAPSHOT_CHARS) return;
+        this.effectivePrompt = effectivePrompt;
         this.snapshot = { sessionId, anchor, provider: ctx.model!.provider, modelId: ctx.model!.id, messages: structuredClone(converted), systemShape: systemShape(converted[0]) };
     }
     payload(value: unknown, ctx: ExtensionContext): void {
-        const snapshot = this.snapshot, payload = payloadValue(value);
+        let snapshot = this.snapshot;
+        const payload = payloadValue(value);
         if (!snapshot || snapshot.sessionId !== session(ctx) || snapshot.provider !== ctx.model?.provider || snapshot.modelId !== ctx.model?.id || !payload || payload.model !== snapshot.modelId) { this.clear(); return; }
+        const first = payload.input[0] as { role?: string; content?: unknown } | undefined;
+        const content = first?.content;
+        const text = typeof content === "string" ? content : Array.isArray(content) && content.every((part) => part && typeof part.text === "string") ? content.map((part) => part.text).join("\n") : undefined;
+        // Pi can force a different leading prompt after context_with_system. Only
+        // adopt that projection once the real provider payload proves it was used.
+        const forced = this.effectivePrompt !== undefined && getCurrentSystemPrompt(snapshot.messages) !== this.effectivePrompt;
+        if (!snapshot.payload && this.effectivePrompt !== undefined) {
+            const expected = forced ? this.effectivePrompt : getCurrentSystemPrompt(snapshot.messages.slice(0, 1));
+            if ((first?.role !== "developer" && first?.role !== "system") || text !== expected) return;
+        }
+        if (!snapshot.payload && forced) {
+            const head = createInitialSystemMessage(this.effectivePrompt, getCurrentTools(snapshot.messages));
+            if (head) {
+                const messages = [head, ...snapshot.messages.filter((message) => message.role !== "system")];
+                if (JSON.stringify(messages).length > MAX_SNAPSHOT_CHARS) { this.clear(); return; }
+                snapshot = { ...snapshot, messages, systemShape: systemShape(head) };
+            }
+        }
         const candidateChars = inputContentChars(payload.input[0]);
         if (snapshot.systemShape && candidateChars !== undefined) {
             const candidateDistance = systemPayloadDistance(snapshot.systemShape, candidateChars);

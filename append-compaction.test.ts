@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-responses";
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { APPEND_CANDIDATE_END, APPEND_CANDIDATE_START, AppendCapture, appendCompaction, appendTask, preservesPayloadPrefix, shouldUseStandardCompactFallback } from "./append-compaction.js";
 import { loadSummarySettings } from "./language.js";
@@ -156,6 +157,21 @@ describe("append compaction", () => {
 			expect(await appendCompaction(g.event, g.ctx, g.snapshot)).toMatchObject({ kind: "cancel", reason: change === "abort" ? "aborted" : "context-changed" });
 		}
 	});
+	for (const metadata of [{ type: "custom", customType: "pi-autoname-state", data: { name: "Live append check" } }, { type: "session_info", name: "Live append check" }]) {
+		test(`session naming metadata ${metadata.type} during append does not invalidate unchanged context`, async () => {
+			const f = fixture();
+			const original = f.ctx.modelRegistry.streamSimple;
+			f.ctx.modelRegistry.streamSimple = (...args: any[]) => {
+				const stream = original(...args);
+				return { result: async () => {
+					const response = await stream.result();
+					f.branch.push({ ...metadata, id: "autoname", parentId: "c" });
+					return response;
+				} };
+			};
+			expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "success", compaction: { firstKeptEntryId: "c", usage } });
+		});
+	}
 	test("an unknown request failure does not launch a paid retry", async () => {
 		const f = fixture(); let calls = 0;
 		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => { calls++; throw new Error("stream closed before response.completed"); } });
@@ -260,6 +276,58 @@ test("real OpenAI Responses converter preserves original envelope and produces a
 	await capture([...f.messages, f.progress, f.tail, { role: "user", content: "Only return a compact summary. Never call tools.", timestamp: 4 }], { sessionId: "fixture-session", cacheRetention: "short", reasoning: "medium", maxRetries: 0, transport: "sse", toolChoice: "none" }, (payload) => { next = payload; });
 	expect(requests).toBe(0); expect(original.input.length).toBeGreaterThan(0); expect(preservesPayloadPrefix(original, next)).toBe(true);
 	expect(next.tools).toEqual(original.tools); expect(next.tool_choice).toBe("none"); expect(next.prompt_cache_key).toBe(original.prompt_cache_key); expect(next.store).toBe(false); expect(next.previous_response_id).toBeUndefined(); expect(next.reasoning.effort).toBe("medium");
+});
+
+test.each(["before", "after"] as const)("forced effective prompt: capture %s a later native-tool filter", async (position) => {
+	const f = fixture(), capture = new AppendCapture();
+	const effective = "Effective before_agent_start prompt. ".repeat(400);
+	f.ctx.getSystemPrompt = () => effective;
+	f.ctx.sessionManager.getBranch = () => [{ type: "message", id: "a", message: f.messages[1] }];
+	capture.context(f.messages, f.ctx);
+	let requests = 0, original: any, next: any;
+	const collect = async (messages: any[], receive: (payload: any) => void) => {
+		await streamSimple(model, { messages }, { sessionId: "fixture-session", cacheRetention: "short", reasoning: "medium", maxRetries: 0, transport: "sse", apiKey: "offline-fixture", fetch: async () => { requests++; throw new Error("NETWORK_FORBIDDEN"); }, onPayload: (payload) => { receive(structuredClone(payload)); throw new Error("OFFLINE_CAPTURE_ONLY"); } }).result();
+	};
+	await collect([{ ...f.messages[0], sections: undefined, content: effective }, f.messages[1]], (payload) => { original = payload; });
+	for (const leading of [
+		{ role: "developer", content: "!" + effective.slice(1) },
+		{ role: "developer", content: "!".repeat((f.messages[0] as any).content.length) },
+		{ role: "system", content: "!".repeat((f.messages[0] as any).content.length + 256) },
+		{ role: "user", content: effective },
+		{ role: "developer", content: [{ type: "input_image" }] },
+	]) {
+		capture.payload({ ...original, input: [leading, ...original.input.slice(1)] }, f.ctx);
+		expect(capture.get()?.payload).toBeUndefined();
+	}
+	const beforeFilter = { ...original, tools: [...original.tools, { type: "image_generation", quality: "medium" }] };
+	capture.payload(position === "before" ? beforeFilter : original, f.ctx);
+	expect(preservesPayloadPrefix(original, capture.get()?.payload)).toBe(position === "after");
+	expect((capture.get()!.messages[0] as any).content).toBe(effective);
+	await collect([...capture.get()!.messages, f.progress, f.tail, { role: "user", content: "Compact only", timestamp: 4 }], (payload) => { next = payload; });
+	expect(preservesPayloadPrefix(original, next)).toBe(true);
+	expect(next.prompt_cache_key).toBe(original.prompt_cache_key);
+	expect(next.tools).toEqual(original.tools);
+	f.ctx.sessionManager.getBranch = () => f.branch;
+	f.ctx.modelRegistry.streamSimple = (_model: any, _context: any, opts: any) => ({ result: async () => { await opts.onPayload(next); return answer(); } });
+	const result = await appendCompaction(f.event, f.ctx, capture.get());
+	if (position === "before") expect(result).toMatchObject({ kind: "fallback", reason: "payload-mismatch", payloadMismatch: { fields: ["tools"] } });
+	else expect(result.kind).toBe("success");
+	expect(requests).toBe(0);
+});
+
+test("non-forced capture validates the initial prompt while preserving later system updates", async () => {
+	const f = fixture(), capture = new AppendCapture();
+	const latest: any = { role: "user", content: "Newest request", timestamp: 8 };
+	const messages: any[] = [...f.messages, { role: "system", content: "Later system update", timestamp: 7 }, latest];
+	f.ctx.getSystemPrompt = () => getCurrentSystemPrompt(messages);
+	f.ctx.sessionManager.getBranch = () => [{ type: "message", id: "newest", message: latest }];
+	capture.context(messages, f.ctx);
+	let payload: any, requests = 0;
+	await streamSimple(model, { messages }, { apiKey: "offline-fixture", sessionId: "fixture-session", maxRetries: 0, transport: "sse", fetch: async () => { requests++; throw new Error("NETWORK_FORBIDDEN"); }, onPayload: (value) => { payload = structuredClone(value); throw new Error("OFFLINE_CAPTURE_ONLY"); } }).result();
+	const foreign = structuredClone(payload); foreign.input[0].content = "!".repeat(getCurrentSystemPrompt(messages.slice(0, 1)).length);
+	capture.payload(foreign, f.ctx); expect(capture.get()?.payload).toBeUndefined();
+	capture.payload(payload, f.ctx); expect(preservesPayloadPrefix(payload, capture.get()?.payload)).toBe(true);
+	expect(capture.get()?.messages).toEqual(messages); expect(requests).toBe(0);
 });
 
 test("append setting is default-on, supports opt-out, and rejects ambiguous values", () => {
