@@ -575,6 +575,8 @@ export class NativeAppend {
 		run.held = undefined;
 		held?.(result);
 	}
+	/** True while a held manual compact waits for Pi to save the compaction returned from its hook. */
+	awaitsSave(): boolean { return !!this.run?.holding && this.run.phase === "drafted" && !this.run.saved; }
 	/** Pi saved the compaction returned from the manual hook; confirm the boundary and publish receipts. */
 	async compacted(ctx: ExtensionContext): Promise<void> {
 		const run = this.run;

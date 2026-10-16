@@ -337,6 +337,33 @@ test("Escape during a held manual compact cancels it without a compaction or a s
 	} finally { await fixture.close(); }
 });
 
+test("a manual compact still completes when an older standard compaction has the same summary", async () => {
+	// The summary of a compact that follows an earlier compaction differs from the first one, so learn it from a seeded run.
+	const seed = async (summary: string, verify: boolean): Promise<string> => {
+		const fixture = await setup();
+		try {
+			const first = fixture.manager.getBranch().find((e: any) => e.type === "message")!;
+			fixture.manager.appendCompaction(summary, first.id, 1000);
+			const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+			for (let i = 0; i < 4; i++) {
+				fixture.manager.appendMessage({ role: "user", content: `Продолжение ${i}: ` + "локальный импорт Linux. ".repeat(400), timestamp: Date.now() } as any);
+				fixture.manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "Принято. ".repeat(400) }], api: "openai-responses", provider: "native-fixture", model: "native-model", stopReason: "stop", usage, timestamp: Date.now() } as any);
+			}
+			const result = await fixture.session.compact();
+			if (verify) {
+				expect(result.summary).toBe(summary);
+				await until(() => fixture.audits().some((a: any) => a.native && a.outcome === "success") && fixture.session.isIdle, "compact with equal older summary");
+				await fixture.compact();
+				await until(() => fixture.session.isIdle, "controller released");
+				expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(2);
+			}
+			return result.summary;
+		} finally { await fixture.close(); }
+	};
+	const learned = await seed("Прежняя сводка.", false);
+	await seed(learned, true);
+});
+
 test("a changed session identity before the service turn sends no stale request", async () => {
 	const fixture = await setup();
 	try {

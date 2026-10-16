@@ -469,8 +469,8 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		pi.registerEntryRenderer<CompactCardData>(COMPACT_CARD_TYPE, (entry, options, theme) => entry.data ? renderCompactCard(entry.data, options.expanded, theme, language) : undefined);
 	}
 	pi.on("session_compact", async (event: any, ctx) => {
-		// A manual native compact is saved by Pi from the hook result; its receipts come from the native flow.
-		if (event.compactionEntry?.details?.nativeAppend) { pendingCard = undefined; await native.compacted(ctx); updateFooter(ctx); return; }
+		// A manual native compact is saved by Pi from the hook result; Pi may report an older entry with an equal summary, so ownership comes from the held run, not the event entry.
+		if (native.awaitsSave()) { pendingCard = undefined; await native.compacted(ctx); updateFooter(ctx); return; }
 
         const pending = pendingCard && scopeMatches(pendingCard.scope, ctx) ? pendingCard : undefined;
         pendingCard = undefined;
