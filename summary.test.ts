@@ -1,3 +1,4 @@
+import { MAX_COMPACT_PAYLOAD_CHARS } from "./compact-budget.js";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -91,10 +92,10 @@ describe("Russian summary formatting", () => {
 		expect(RUSSIAN_TREE_SUMMARY_INSTRUCTIONS).toContain("Сохраняй точные пути");
 	});
 
-	test("falls back when no model is selected", async () => {
+	test("returns an explicit cancellation when no model is selected", async () => {
 		const event = { preparation: {}, reason: "threshold", willRetry: false, signal: new AbortController().signal } as any;
 		const ctx = { model: undefined } as any;
-		expect(await russianCompaction(event, ctx)).toBeUndefined();
+		expect(await russianCompaction(event, ctx)).toEqual({ cancel: true });
 	});
 });
 
@@ -123,4 +124,111 @@ test("Russian /tree keeps localized headings and usage", async () => {
 	const result = await russianTreeSummary(event, ctx);
 	expect(result?.summary.summary).toContain("## Цель\nRead src/a.ts");
 	expect(result?.summary.usage).toEqual({ input: 3 });
+});
+
+
+function guardedFixture() {
+const controller = new AbortController();
+const activeModel: any = { provider: "fixture", id: "active", api: "openai-responses", baseUrl: "https://active.invalid", maxTokens: 8192, contextWindow: 128000 };
+const branch: any[] = [{ id: "root", parentId: null, type: "message" }];
+let sessionId = "session-a";
+let route: object = {};
+const fixture: any = { controller, branch, activeModel, sessionId, route, calls: [], response: { stopReason: "stop", content: [{ type: "text", text: "## Goal\nСводка" }], usage: { input: 2, output: 3 } } };
+fixture.setSession = (value: string) => { sessionId = value; };
+fixture.setRoute = (value: object) => { route = value; };
+const manager = { getSessionId: () => sessionId, getSessionFile: () => `/tmp/${sessionId}.jsonl`, getLeafId: () => branch.at(-1)?.id ?? null, getBranch: () => branch };
+fixture.ctx = { model: activeModel, sessionManager: manager, modelRegistry: { getProvider: () => route, complete: async (...args: any[]) => { fixture.calls.push(args); return fixture.response; } } };
+const preparation = { settings: { reserveTokens: 8192 }, isSplitTurn: false, messagesToSummarize: [], previousSummary: undefined, turnPrefixMessages: [], fileOps: { read: new Set<string>(), edited: new Set<string>(), written: new Set<string>() }, firstKeptEntryId: "kept", tokensBefore: 100 };
+fixture.event = { preparation, branchEntries: [], signal: controller.signal, reason: "threshold", willRetry: false };
+return fixture;
+}
+
+test("standard compact uses the service model without changing the active identity and requests SSE once", async () => {
+const fixture = guardedFixture();
+const serviceModel: any = { ...fixture.activeModel, id: "service", baseUrl: "https://service.invalid" };
+const result = await russianCompaction(fixture.event, fixture.ctx, { model: serviceModel });
+expect(result).toHaveProperty("compaction");
+expect(fixture.calls).toHaveLength(1);
+expect(fixture.calls[0][0]).toBe(serviceModel);
+expect(fixture.calls[0][2]).toMatchObject({ transport: "sse", maxRetries: 0, signal: fixture.event.signal });
+expect(fixture.ctx.model).toBe(fixture.activeModel);
+});
+
+test("standard compact classifies invalid responses and request failures separately", async () => {
+const invalid = guardedFixture();
+invalid.response = { stopReason: "stop", content: [{ type: "text", text: "не структурировано" }] };
+const invalidReasons: string[] = [];
+expect(await russianCompaction(invalid.event, invalid.ctx, { onFailure: (reason) => invalidReasons.push(reason) })).toEqual({ cancel: true });
+expect(invalidReasons).toEqual(["invalid-response"]);
+const failed = guardedFixture();
+failed.ctx.modelRegistry.complete = async (...args: any[]) => { failed.calls.push(args); throw new Error("network unavailable"); };
+const failedReasons: string[] = [];
+expect(await russianCompaction(failed.event, failed.ctx, { onFailure: (reason) => failedReasons.push(reason) })).toEqual({ cancel: true });
+expect(failedReasons).toEqual(["request-failed"]);
+});
+
+test("standard compact rejects session, tree, model and route changes after await", async () => {
+for (const change of ["session", "tree", "model", "route"] as const) {
+const fixture = guardedFixture();
+fixture.ctx.modelRegistry.complete = async (...args: any[]) => {
+fixture.calls.push(args);
+if (change === "session") fixture.setSession("session-b");
+if (change === "tree") fixture.branch.push({ id: "child", parentId: "root", type: "message" });
+if (change === "model") fixture.ctx.model = { ...fixture.activeModel, id: "changed" };
+if (change === "route") fixture.setRoute({});
+return fixture.response;
+};
+const reasons: string[] = [];
+expect(await russianCompaction(fixture.event, fixture.ctx, { onFailure: (reason) => reasons.push(reason) })).toEqual({ cancel: true });
+expect(reasons).toEqual(["context-changed"]);
+expect(fixture.calls).toHaveLength(1);
+}
+});
+
+test("standard compact treats abort and owner loss as explicit cancellation", async () => {
+const aborted = guardedFixture();
+aborted.ctx.modelRegistry.complete = async (...args: any[]) => { aborted.calls.push(args); aborted.controller.abort(); return aborted.response; };
+const abortedReasons: string[] = [];
+expect(await russianCompaction(aborted.event, aborted.ctx, { onFailure: (reason) => abortedReasons.push(reason) })).toEqual({ cancel: true });
+expect(abortedReasons).toEqual(["aborted"]);
+const stale = guardedFixture();
+const staleReasons: string[] = [];
+expect(await russianCompaction(stale.event, stale.ctx, { isCurrent: () => false, onFailure: (reason) => staleReasons.push(reason) })).toEqual({ cancel: true });
+expect(staleReasons).toEqual(["context-changed"]);
+expect(stale.calls).toHaveLength(0);
+});
+
+test("split-turn stops before the prefix request when history loses its context", async () => {
+const fixture = guardedFixture();
+const message = { role: "user", content: [{ type: "text", text: "Новый ход" }], timestamp: 1 };
+fixture.event.preparation = { ...fixture.event.preparation, isSplitTurn: true, messagesToSummarize: [message], turnPrefixMessages: [message] };
+fixture.ctx.modelRegistry.complete = async (...args: any[]) => {
+fixture.calls.push(args);
+fixture.ctx.model = { ...fixture.activeModel, id: "changed" };
+return fixture.response;
+};
+const reasons: string[] = [];
+expect(await russianCompaction(fixture.event, fixture.ctx, { onFailure: (reason) => reasons.push(reason) })).toEqual({ cancel: true });
+expect(reasons).toEqual(["context-changed"]);
+expect(fixture.calls).toHaveLength(1);
+});
+
+for (const kind of ["small", "oversized", "swallowed-error", "late-route"] as const) test(`standard final provider boundary: ${kind}`, async () => {
+const fixture = guardedFixture();
+const huge = kind === "oversized" || kind === "swallowed-error";
+const text = huge ? "\0".repeat(Math.ceil(MAX_COMPACT_PAYLOAD_CHARS / 6) + 2048) : "Сохранить локальный JSON";
+fixture.event.preparation.messagesToSummarize = [{ role: "user", content: [{ type: "text", text }], timestamp: 1 }];
+const reasons: string[] = [];
+let sent = 0;
+fixture.ctx.modelRegistry.complete = async (model: any, context: any, options: any) => {
+ const payload = { model: model.id, input: context.messages, encrypted_content: "opaque-kept" };
+ if (kind === "late-route") fixture.activeModel.baseUrl = "https://changed.invalid";
+ try { expect((await options.onPayload?.(payload, model)) ?? payload).toBe(payload); }
+ catch (error) { if (kind === "swallowed-error") return { stopReason: "error", errorMessage: String(error), content: [] }; throw error; }
+ sent++;
+ return fixture.response;
+};
+const result = await russianCompaction(fixture.event, fixture.ctx, { model: { ...fixture.activeModel, contextWindow: 1048576 }, capability: { window: 1048576, source: "offline exact-route declaration", outputLimitEnforced: false }, onFailure: (reason) => reasons.push(reason) });
+if (kind === "small") { expect(result).toHaveProperty("compaction"); expect(sent).toBe(1); }
+else { expect(result).toEqual({ cancel: true }); expect(sent).toBe(0); expect(reasons).toEqual([kind === "late-route" ? "context-changed" : "request-too-large"]); }
 });

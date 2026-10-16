@@ -56,7 +56,7 @@ export const COMPACTION_OUTPUT_FORMAT = {
 		additionalProperties: false,
 	},
 } as const;
-export type AppendFallback = "unsupported" | "snapshot-unavailable" | "context-changed" | "boundary-unavailable" | "insufficient-window" | "payload-mismatch";
+export type AppendFallback = "unsupported" | "snapshot-unavailable" | "context-changed" | "boundary-unavailable" | "insufficient-window" | "request-too-large" | "payload-mismatch";
 export type ValidationGuard = "json-parse" | "schema-shape" | "history-heading" | "turn-prefix-heading" | "tool-call" | "stop-reason" | "tail-provenance" | "empty-result" | "unknown";
 export type RequestFailureClass = "timeout" | "transport" | "provider-error" | "payload-hook" | "unknown";
 export type RequestFailurePhase = "provider" | "parse";

@@ -41,7 +41,7 @@ for (const [name, target] of dependencies) {
 }
 try {
   const command = mode === "test"
-    ? ["bun", "test", "index.test.ts", "policy.test.ts", "session-state.test.ts", "summary.test.ts", "append-compaction.test.ts", "native-append.test.ts", "file-hints.test.ts", "scripts/discover-pi-runtime.test.mjs", "audit.test.ts", "card.test.ts"]
+    ? ["bun", "test", "compact-budget.test.ts", "index.test.ts", "policy.test.ts", "session-state.test.ts", "summary.test.ts", "append-compaction.test.ts", "native-append.test.ts", "file-hints.test.ts", "scripts/discover-pi-runtime.test.mjs", "audit.test.ts", "card.test.ts"]
     : [typeScriptBin, "-p", "tsconfig.json"];
   const result = spawnSync(command[0], command.slice(1), { cwd: extensionDir, stdio: "inherit", env: process.env });
   if (result.error) throw result.error;

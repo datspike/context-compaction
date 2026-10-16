@@ -136,11 +136,11 @@ describe("summary integration", () => {
 		expect(prompts[1]).toContain("ONLY CUSTOM"); expect(prompts[1]).not.toContain("Чего пользователь пытался добиться");
 	});
 
-	test("failed or invalid generation leaves native fallback available and inputs unchanged", async () => {
+	test("failed compact cancels explicitly while tree retains its fallback and inputs stay unchanged", async () => {
 		for (const response of [new Error("offline"), { stopReason: "length", content: [] }, { stopReason: "stop", content: [{ type: "text", text: "invalid" }] }]) {
 			const { ctx, event } = fixture();
 			ctx.modelRegistry.complete = async () => { if (response instanceof Error) throw response; return response; };
-			expect(await russianCompaction(event, ctx)).toBeUndefined();
+			expect(await russianCompaction(event, ctx)).toEqual({ cancel: true });
 			expect(event.preparation.previousSummary).toBe(OLD);
 			const tree: any = { signal: event.signal, preparation: { userWantsSummary: true, entriesToSummarize: [{ type: "branch_summary", id: "b", summary: OLD, fromId: "a", timestamp: new Date(0).toISOString() }] } };
 			expect(await russianTreeSummary(tree, ctx)).toBeUndefined();
@@ -150,7 +150,7 @@ describe("summary integration", () => {
 
 describe("tracking boundary regressions", () => {
 	const trackingOnly = (heading: string) => `<file-hints>\n${heading}\nNOT-SEMANTIC-BODY\n</file-hints>`;
-	test("tracking-only generated history and prefix use fallback independently", async () => {
+	test("tracking-only generated history or prefix cancels without another summarizer", async () => {
 		for (const mode of ["normal", "history", "prefix", "prefix-no-history"]) {
 			const responses = mode === "history" ? [trackingOnly("## Цель"), "## Исходный запрос\nKeep prefix"]
 				: mode === "prefix" ? [BODY, trackingOnly("## Исходный запрос")]
@@ -161,7 +161,7 @@ describe("tracking boundary regressions", () => {
 				event.preparation.turnPrefixMessages = [tool("src/current.ts")];
 				if (mode === "prefix-no-history") event.preparation.messagesToSummarize = [];
 			}
-			expect(await russianCompaction(event, ctx)).toBeUndefined();
+			expect(await russianCompaction(event, ctx)).toEqual({ cancel: true });
 			expect(event.preparation.previousSummary).toBe(OLD);
 		}
 	});

@@ -60,6 +60,7 @@ type ManualOperation = {
 	reason: "manual";
 	params: CheckpointParams;
 	scope: Scope;
+	modelRoute: string;
 	userWatermark: UserWatermark;
 	goal: GoalSnapshot;
 	lifecycle: "pending" | "running" | "success" | "error" | "cancel";
@@ -174,8 +175,20 @@ export default function contextCompaction(pi: ExtensionAPI): void {
     type AppendOutcome = Awaited<ReturnType<typeof appendCompaction>>;
     const currentScope = (ctx: ExtensionContext, anchor?: string): PendingScope => { const scope = scopeOf(ctx, anonymousIdentities); return { sessionId: scope.sessionId, anchor: anchor ?? scope.branch }; };
     const scopeMatches = (pending: PendingScope, ctx: ExtensionContext): boolean => pending.sessionId === ctx.sessionManager.getSessionId() && (!pending.anchor || ctx.sessionManager.getBranch().some((entry) => entry.id === pending.anchor));
+    let summarySequence = 0;
+    const standard = async (event: any, ctx: ExtensionContext) => {
+        const generation = ++summarySequence;
+        return russianCompaction(event, ctx, {
+            model: native.serviceModel(ctx), capability: native.capability(ctx),
+            isCurrent: () => generation === summarySequence,
+            onFailure: (reason) => {
+                pi.appendEntry("context-compaction-standard", { version: 1, reason });
+                if (reason !== "aborted") notice(ctx, `Compact: ${reason}`, "warning");
+            },
+        });
+    };
     const summarize = async (event: any, ctx: ExtensionContext) => {
-        if (!settings.appendCompaction || native.fallbackReason()) return russianCompaction(event, ctx);
+        if (!settings.appendCompaction || native.fallbackReason()) return standard(event, ctx);
         pendingCard = undefined;
         const handoff = native.before(event, ctx);
         if (handoff) return handoff;
@@ -183,7 +196,8 @@ export default function contextCompaction(pi: ExtensionAPI): void {
         const outcome: AppendOutcome = { kind: "fallback", reason: native.preflightReason(), cacheStatus: "not-attempted", appendAttempt: [{ attempt: 0, phase: "preflight", toolBlocks: 0, toolBlockTypes: [], repairAttempts: 0 }] };
         pi.appendEntry("context-compaction-append", appendAuditPayload(outcome, 0, model));
         const started = Date.now();
-        const compact = await russianCompaction(event, ctx);
+        const compact = await standard(event, ctx);
+        if (!("compaction" in compact)) return compact;
         pendingCard = { kind: "standard", fallbackReason: outcome.reason, provider: model?.provider, model: model?.id, appendDurationMs: 0, appendCacheStatus: "not-attempted", durationMs: Date.now() - started, repairAttempts: 0, scope: currentScope(ctx) };
         return compact;
     };
@@ -226,11 +240,12 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		appendAudit(pi, { version: 2, correlation: op.correlation, origin: op.origin, reason, phase, tokens: tokensOverride ?? ctx.getContextUsage()?.tokens ?? null, window: policy.window, threshold: policy.threshold ?? null, mode, source: policy.source, willRetry, sessionId: op.scope.sessionId, tree: op.scope.branch });
 	};
 	const external = (ctx: ExtensionContext, phase: AuditEntry["phase"], reason: AuditReason, willRetry: boolean, tokens?: number): void => audit(ctx, { correlation: nextCorrelation(), origin: "external-unattributed", scope: scopeOf(ctx, anonymousIdentities) }, phase, reason, willRetry, tokens);
-	const updateFooter = (ctx: ExtensionContext): void => { if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, formatFooter(ctx.getContextUsage()?.tokens, currentPolicy(ctx))); };
+	const updateFooter = (ctx: ExtensionContext): void => { if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, formatFooter(native.contextTokens(ctx), currentPolicy(ctx))); };
 	const setMode = (next: ContextMode, persist: boolean): void => { if (mode !== next) { mode = next; if (persist) appendMode(pi, next); } };
+	const manualIdentity = (ctx: ExtensionContext): string => JSON.stringify(ctx.model ? [ctx.model.provider, ctx.model.id, ctx.model.api, ctx.model.baseUrl ?? ""] : null);
 	const isCurrent = (ctx: ExtensionContext, op: ManualOperation, lifecycle?: ManualOperation["lifecycle"]): boolean => {
 		const actual = scopeOf(ctx, anonymousIdentities);
-		return operation === op && (!lifecycle || op.lifecycle === lifecycle) && op.scope.sessionId === actual.sessionId && branchContains(ctx, op.scope.branch);
+		return operation === op && (!lifecycle || op.lifecycle === lifecycle) && op.scope.sessionId === actual.sessionId && op.modelRoute === manualIdentity(ctx) && branchContains(ctx, op.scope.branch);
 	};
 	const currentOperation = (ctx: ExtensionContext): ManualOperation | undefined => {
 		if (operation && !isCurrent(ctx, operation)) operation = undefined;
@@ -310,13 +325,13 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		if (!isCurrent(ctx, op, "success")) return;
 		await restoreAfterSuccessfulCompact(ctx);
 		const entries = ctx.sessionManager.getBranch() as SessionEntry[];
-		if (!isCurrent(ctx, op, "success") || op.continuationClaimed || op.continuationSuppressed || userWatermark(entries) !== op.userWatermark || !continuationGoalIsValid(op.goal, entries)) { operation = undefined; return; }
+		if (!isCurrent(ctx, op, "success") || op.continuationClaimed || op.continuationSuppressed || ctx.hasPendingMessages() || userWatermark(entries) !== op.userWatermark || !continuationGoalIsValid(op.goal, entries)) { operation = undefined; return; }
 		// In-memory guard covers duplicate callbacks. Pi's public ExtensionAPI does not
 		// expose queue acknowledgement, so this records one invocation after the core lock.
 		op.continuationClaimed = true;
 		try {
 			const revalidated = ctx.sessionManager.getBranch() as SessionEntry[];
-			if (!isCurrent(ctx, op, "success") || op.continuationSuppressed || userWatermark(revalidated) !== op.userWatermark || !continuationGoalIsValid(op.goal, revalidated)) return;
+			if (!isCurrent(ctx, op, "success") || op.continuationSuppressed || ctx.hasPendingMessages() || userWatermark(revalidated) !== op.userWatermark || !continuationGoalIsValid(op.goal, revalidated)) return;
 			pi.sendUserMessage(contextCompactionFollowUp(continuationPrompt(op.params, language), op.correlation), { deliverAs: "followUp" });
 			audit(ctx, op, "continuation-claimed", "manual");
 			audit(ctx, op, "send-attempted", "manual");
@@ -354,7 +369,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 			else if (op?.lifecycle === "success") await continueManualAfterCompaction(ctx, op);
 			updateFooter(ctx);
 		},
-	});
+	}, settings.compactCapabilities);
 
 	pi.registerTool({
 		name: "checkpoint_compact_continue",
@@ -368,7 +383,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 			if (currentOperation(ctx)) return { content: [{ type: "text" as const, text: text("Compact уже ожидает или выполняется.", "Compaction is already pending or running.") }], details: { reason: "manual", params: raw, result: "in_progress" }, terminate: true };
 			if (compactedSinceLastUserMessage(ctx)) return { content: [{ type: "text" as const, text: text("Compact уже был выполнен после последнего сообщения пользователя.", "Compaction already ran after the last user message.") }], details: { reason: "manual", params: raw, result: "already_compacted" }, terminate: false };
 			const entries = ctx.sessionManager.getBranch() as SessionEntry[];
-			const op: ManualOperation = { correlation: nextCorrelation(), origin: "manual-tool", reason: "manual", params: raw as CheckpointParams, scope: scopeOf(ctx, anonymousIdentities), userWatermark: userWatermark(entries), goal: goalSnapshot(entries), lifecycle: "pending", continuationClaimed: false, continuationSuppressed: false };
+			const op: ManualOperation = { correlation: nextCorrelation(), origin: "manual-tool", reason: "manual", params: raw as CheckpointParams, scope: scopeOf(ctx, anonymousIdentities), modelRoute: manualIdentity(ctx), userWatermark: userWatermark(entries), goal: goalSnapshot(entries), lifecycle: "pending", continuationClaimed: false, continuationSuppressed: false };
 			operation = op;
 			audit(ctx, { ...op, origin: "manual-tool" }, "pending", "manual");
 			return { content: [{ type: "text" as const, text: text("Checkpoint compact запланирован после завершения текущего хода.", "Checkpoint compaction is scheduled after the current turn.") }], details: { reason: "manual", params: raw, result: "scheduled" }, terminate: true };
@@ -403,9 +418,10 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		return result;
 	});
 	pi.on("tool_call", (_event, ctx) => native.tool(ctx));
-	pi.on("session_before_switch", (_event, ctx) => native.cancel(ctx));
-	pi.on("session_before_fork", (_event, ctx) => native.cancel(ctx));
+	pi.on("session_before_switch", (_event, ctx) => { ++summarySequence; operation = undefined; native.cancel(ctx); });
+	pi.on("session_before_fork", (_event, ctx) => { ++summarySequence; operation = undefined; native.cancel(ctx); });
 	pi.on("session_start", async (_event, ctx) => {
+		++summarySequence;
 		native.shutdown(ctx);
         pendingCard = undefined;
 		operation = undefined;
@@ -418,7 +434,12 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		await ensureWindow(ctx);
 		updateFooter(ctx);
 	});
-	pi.on("model_select", async (_event, ctx) => { if (internalModelTransition) { updateFooter(ctx); return; } native.shutdown(ctx); await ensureWindow(ctx); updateFooter(ctx); });
+	pi.on("model_select", async (_event, ctx) => {
+		++summarySequence;
+		if (operation && (!internalModelTransition || operation.modelRoute !== manualIdentity(ctx))) operation = undefined;
+		if (internalModelTransition) { updateFooter(ctx); return; }
+		native.shutdown(ctx); await ensureWindow(ctx); updateFooter(ctx);
+	});
 	pi.on("turn_end", (event, ctx) => { updateFooter(ctx); return native.turn(event, ctx); });
 	pi.on("agent_before_settle", (_event, ctx) => native.beforeSettle(ctx));
 	pi.on("agent_settled", async (_event, ctx) => {
@@ -442,7 +463,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		external(ctx, "contained", reason, Boolean(event.willRetry), event.preparation?.tokensBefore);
 		if (language === "ru") return summarize(event, ctx);
 	});
-	if (language === "ru") pi.on("session_before_tree", async (event: any, ctx) => { native.cancel(ctx); return russianTreeSummary(event, ctx); });
+	pi.on("session_before_tree", async (event: any, ctx) => { ++summarySequence; operation = undefined; native.cancel(ctx); if (language === "ru") return russianTreeSummary(event, ctx); });
 	if (typeof pi.registerEntryRenderer === "function") {
 		pi.registerEntryRenderer<CompactCardData>(COMPACT_CARD_TYPE, (entry, options, theme) => entry.data ? renderCompactCard(entry.data, options.expanded, theme, language) : undefined);
 	}
@@ -478,7 +499,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		external(ctx, "error", reason, Boolean(event.willRetry), event.preparation?.tokensBefore);
 		updateFooter(ctx);
 	});
-	pi.on("session_shutdown", (_event, ctx) => { native.shutdown(ctx); const op = currentOperation(ctx); if (op) cancel(ctx, op); });
+	pi.on("session_shutdown", (_event, ctx) => { ++summarySequence; native.shutdown(ctx); const op = currentOperation(ctx); if (op) cancel(ctx, op); });
 }
 
 export { compactedSinceLastUserMessage, prepareArguments } from "./checkpoint.js";

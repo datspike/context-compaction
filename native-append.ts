@@ -1,15 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Message, Provider } from "@earendil-works/pi-ai";
-import { convertToLlm, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionBoundaryDraft, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, estimateTokens, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionBoundaryDraft, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { appendTask, buildAppendCompaction, cacheStatus, classifyRequestFailure, COMPACTION_OUTPUT_FORMAT, parseResult, preservesPayloadPrefix, supported, type AppendFallback, type AppendOutcome } from "./append-compaction.js";
 
 import { isNativeCompactionMessage } from "./checkpoint.js";
 import { russianCompaction } from "./summary.js";
+import { calculateCompactBudget, resolveCompactCapability, type CompactCapability, type CompactCapabilityOverride } from "./compact-budget.js";
 
 const SERVICE_PREFIX = "[context-compaction-native:";
-const MAX_PAYLOAD_CHARS = 16 * 1024 * 1024;
-const WINDOW_MARGIN = 4096;
 const STATUS_KEY = "context-compaction-native";
 type Success = Extract<AppendOutcome, { kind: "success" }>;
 type Failure = Exclude<AppendOutcome, Success>;
@@ -35,7 +34,10 @@ interface Run {
 	event: SessionBeforeCompactEvent;
 	ctx: ExtensionContext;
 	sessionId: string;
-	model: { provider: string; id: string };
+	model: { provider: string; id: string; baseUrl: string };
+	capability: CompactCapability;
+	inputTokens: number;
+	modelMaxTokens: number;
 	fingerprint: string;
 	phase: Phase;
 	started: number;
@@ -86,11 +88,48 @@ function isService(message: { role?: string; content?: unknown }, ctx: Extension
 /** Coordinates native service turns while leaving Pi's compact and provider implementations intact. */
 export class NativeAppend {
 	private run?: Run;
+	private uncertainUsage?: string;
+
+	/** A cleanup edit invalidates SDK usage; do not display a fictitious reduction. */
+	contextTokens(ctx: ExtensionContext): number | null | undefined {
+		if (this.uncertainUsage) {
+			if (this.usageStamp(ctx) === this.uncertainUsage) return undefined;
+			this.uncertainUsage = undefined;
+		}
+		return ctx.getContextUsage()?.tokens;
+	}
+	private usageStamp(ctx: ExtensionContext, excluded = new Set<string>()): string {
+		const branch = ctx.sessionManager.getBranch();
+		const omitted = new Set([...excluded, ...branch.flatMap(e => e.type === "context_edit" && e.replacement === null ? [e.targetId] : [])]);
+		let assistant: string | undefined, boundary: string | undefined, service = false;
+		for (const entry of branch) {
+			if (entry.type === "compaction") boundary = entry.id;
+			if (entry.type !== "message" || omitted.has(entry.id)) continue;
+			if (entry.message.role === "user") service = isService(entry.message, ctx);
+			if (!service && entry.message.role === "assistant" && entry.message.stopReason !== "aborted" && entry.message.stopReason !== "error" && entry.message.usage?.totalTokens > 0) assistant = entry.id;
+		}
+		return JSON.stringify([ctx.sessionManager.getSessionId(), assistant, boundary]);
+	}
 	private decline: AppendFallback = "unsupported";
 	private registration?: { registry: ExtensionContext["modelRegistry"]; id: string; proxy: Provider; restore: () => void };
 	private fallbackScope?: { sessionId: string; reason: SessionBeforeCompactEvent["reason"] };
 
-	constructor(private readonly pi: ExtensionAPI, private readonly callbacks: Callbacks) {}
+	constructor(private readonly pi: ExtensionAPI, private readonly callbacks: Callbacks, private readonly capabilities: readonly CompactCapabilityOverride[] = []) {}
+
+	/** Service metadata does not change ordinary session policy or registry. */
+	capability(ctx: ExtensionContext): CompactCapability {
+		return ctx.model ? resolveCompactCapability(ctx.model, ctx.modelRegistry.find(ctx.model.provider, ctx.model.id)?.contextWindow, this.capabilities) : { window: 0, source: "unsupported", outputLimitEnforced: false };
+	}
+	serviceModel(ctx: ExtensionContext) {
+		return ctx.model ? { ...ctx.model, contextWindow: this.capability(ctx).window } : undefined;
+	}
+	private budget(run: Run, payload?: unknown) {
+		const serialized = payload === undefined ? undefined : JSON.stringify(payload);
+		// Pi estimates visible text; opaque reasoning and image bytes are not text tokens.
+		const visible = payload === undefined ? 0 : estimateTokens({ role: "user", content: JSON.stringify(payload, (key, value) => key === "encrypted_content" || key === "image_url" || key === "data" ? undefined : value), timestamp: 0 });
+		const taskTokens = run.task ? estimateTokens({ role: "user", content: run.task, timestamp: 0 }) : 0;
+		return calculateCompactBudget({ capability: run.capability, inputTokens: Math.max(run.inputTokens, visible - taskTokens), taskTokens, requestedOutputTokens: run.maxTokens, modelMaxTokens: run.modelMaxTokens, serializedChars: serialized?.length });
+	}
 
 	get active(): boolean { return this.run !== undefined; }
 	/** Why no guarded native operation was started; permits only a standalone fallback. */
@@ -102,7 +141,7 @@ export class NativeAppend {
 		return ctx.sessionManager.getSessionId() === run.sessionId;
 	}
 	private sameModel(run: Run, ctx: ExtensionContext): boolean {
-		return ctx.model?.provider === run.model.provider && ctx.model.id === run.model.id;
+		return ctx.model?.provider === run.model.provider && ctx.model.id === run.model.id && ctx.model.baseUrl === run.model.baseUrl;
 	}
 	private completion(run: Run): NativeCompletion {
 		return { id: run.id, event: run.event, outcome: run.outcome!, standard: run.standard, durationMs: Date.now() - run.started, model: run.model };
@@ -128,8 +167,8 @@ export class NativeAppend {
 				this.reject(run, "payload-mismatch", run.ctx, true);
 				throw new Error("APPEND_COMPACTION_FINAL_CONTEXT_MISMATCH");
 			}
-			return base.streamSimple(model, context, {
-				...options, maxRetries: 0, timeoutMs: 120_000,
+			return base.streamSimple({ ...model, contextWindow: run.capability.window }, context, {
+				...options, transport: "sse", maxRetries: 0, timeoutMs: 120_000,
 				onPayload: async (payload) => {
 					const final = (await options?.onPayload?.(payload, model)) ?? payload;
 					if (this.run !== run || run.phase !== "response" || !this.sameModel(run, run.ctx) || !this.registrationOwned(run.ctx) || payloadDigest(final) !== run.payloadHash) {
@@ -137,6 +176,12 @@ export class NativeAppend {
 						throw new Error("APPEND_COMPACTION_FINAL_PAYLOAD_MISMATCH");
 					}
 					if (options?.signal?.aborted) throw new Error("APPEND_COMPACTION_ABORTED");
+					const budget = this.budget(run, final);
+					this.pi.appendEntry("context-compaction-budget", { version: 1, id: run.id, phase: "final", source: run.capability.source, inputSource: "sdk-preparation-and-visible-payload-estimate", ...budget });
+					if (!this.sameSession(run, run.ctx) || !budget.allowed) {
+						this.reject(run, !this.sameSession(run, run.ctx) ? "context-changed" : budget.reason ?? "insufficient-window", run.ctx, true);
+						throw new Error(budget.reason === "request-too-large" ? "APPEND_COMPACTION_REQUEST_TOO_LARGE" : "APPEND_COMPACTION_INSUFFICIENT_WINDOW");
+					}
 					run.verified = true;
 					run.sent = true;
 					return final;
@@ -170,10 +215,11 @@ export class NativeAppend {
 		}
 		if (!supported(ctx) || event.signal.aborted || !this.install(ctx)) return;
 		const maxTokens = Math.min(Math.floor(event.preparation.settings.reserveTokens * 0.8), ctx.model!.maxTokens);
-		const window = ctx.modelRegistry.find(ctx.model!.provider, ctx.model!.id)?.contextWindow ?? ctx.model!.contextWindow;
-		if (!(maxTokens > 0) || event.preparation.tokensBefore + maxTokens + WINDOW_MARGIN >= window) { this.decline = "insufficient-window"; return; }
+		const capability = this.capability(ctx);
+		const budget = calculateCompactBudget({ capability, inputTokens: event.preparation.tokensBefore, taskTokens: 0, requestedOutputTokens: maxTokens, modelMaxTokens: ctx.model!.maxTokens });
+		if (!budget.allowed) { this.decline = budget.reason ?? "insufficient-window"; return; }
 		const id = randomUUID();
-		const run: Run = { id, service: `${SERVICE_PREFIX}${id}] Служебный запрос сводки; не выполняй рабочие действия.`, event, ctx, sessionId: ctx.sessionManager.getSessionId(), model: { provider: ctx.model!.provider, id: ctx.model!.id }, fingerprint: digest(semanticBranch(ctx)), phase: "handoff", started: Date.now(), maxTokens, toolBlocks: 0, fallbackAllowed: false };
+		const run: Run = { id, service: `${SERVICE_PREFIX}${id}] Служебный запрос сводки; не выполняй рабочие действия.`, event, ctx, sessionId: ctx.sessionManager.getSessionId(), model: { provider: ctx.model!.provider, id: ctx.model!.id, baseUrl: ctx.model!.baseUrl }, capability, inputTokens: event.preparation.tokensBefore, modelMaxTokens: ctx.model!.maxTokens, fingerprint: digest(semanticBranch(ctx)), phase: "handoff", started: Date.now(), maxTokens, toolBlocks: 0, fallbackAllowed: false };
 		this.run = run;
 		run.abort = () => this.reject(run, "aborted", ctx);
 		event.signal.addEventListener("abort", run.abort, { once: true });
@@ -205,7 +251,7 @@ export class NativeAppend {
 	/** Transform only our own service input; stale service records are never model instructions. */
 	context(messages: AgentMessage[], ctx: ExtensionContext): { messages: AgentMessage[] } | undefined {
 		const run = this.run;
-		if (run?.standard && run.phase === "drafted") run.continuationStarted = true;
+		if (run?.phase === "drafted") run.continuationStarted = true;
 		const last = messages.at(-1);
 		let orphan = false;
 		const filtered = messages.filter((message) => {
@@ -251,13 +297,13 @@ export class NativeAppend {
 		if (!value || !input || task?.role !== "user" || text(task) !== run.task || value.model !== run.model.id || value.prompt_cache_key !== run.sessionId) {
 			this.reject(run, "payload-mismatch", ctx, true); throw new Error("APPEND_COMPACTION_NATIVE_PAYLOAD_MISMATCH");
 		}
-		const serialized = JSON.stringify(value);
-		const window = ctx.modelRegistry.find(run.model.provider, run.model.id)?.contextWindow ?? ctx.model!.contextWindow;
-		if (serialized.length > MAX_PAYLOAD_CHARS || Math.ceil(serialized.length / 3) + run.maxTokens + WINDOW_MARGIN > window) {
-			this.reject(run, "insufficient-window", ctx, true); throw new Error("APPEND_COMPACTION_INSUFFICIENT_WINDOW");
+		const next = { ...value, tool_choice: "none", text: { format: COMPACTION_OUTPUT_FORMAT }, max_output_tokens: run.maxTokens };
+		const budget = this.budget(run, next);
+		this.pi.appendEntry("context-compaction-budget", { version: 1, id: run.id, phase: "prepared", source: run.capability.source, inputSource: "sdk-preparation-and-visible-payload-estimate", ...budget });
+		if (!budget.allowed) {
+			this.reject(run, budget.reason ?? "insufficient-window", ctx, true); throw new Error(budget.reason === "request-too-large" ? "APPEND_COMPACTION_REQUEST_TOO_LARGE" : "APPEND_COMPACTION_INSUFFICIENT_WINDOW");
 		}
 		const baseline = { ...value, input: input.slice(0, taskIndex) };
-		const next = { ...value, tool_choice: "none", text: { format: COMPACTION_OUTPUT_FORMAT }, max_output_tokens: run.maxTokens };
 		if (!preservesPayloadPrefix(baseline, next)) {
 			this.reject(run, "payload-mismatch", ctx, true); throw new Error("APPEND_COMPACTION_PREFIX_MISMATCH");
 		}
@@ -281,9 +327,9 @@ export class NativeAppend {
 	}
 
 	private reject(run: Run, reason: Failure["reason"], ctx: ExtensionContext, fallback = false, abortCurrent = true): void {
-		if (this.run !== run || run.phase === "drafted" || run.phase === "fallback") return;
+		if (this.run !== run || run.phase === "drafted") return;
 		if (!run.failure) {
-			const fallbackReason = ["unsupported", "snapshot-unavailable", "boundary-unavailable", "insufficient-window", "payload-mismatch"].includes(reason);
+			const fallbackReason = ["unsupported", "snapshot-unavailable", "boundary-unavailable", "insufficient-window", "request-too-large", "payload-mismatch"].includes(reason);
 			run.failure = fallbackReason ? { kind: "fallback", appendAttempt: [], reason: reason as Extract<Failure, { kind: "fallback" }>["reason"], cacheStatus: run.sent ? "unknown" : "not-attempted" } : { kind: "cancel", appendAttempt: [], reason: reason as Extract<Failure, { kind: "cancel" }>["reason"], cacheStatus: run.sent ? "unknown" : "not-attempted" };
 			run.failure.appendAttempt = [{ attempt: run.sent ? 1 : 0, phase: run.sent ? "provider" : "preflight", toolBlocks: run.toolBlocks, toolBlockTypes: run.toolBlocks ? ["toolCall"] : [], repairAttempts: 0 }];
 			run.fallbackAllowed = fallback;
@@ -304,7 +350,9 @@ export class NativeAppend {
 			if (entry.message.role === "user") service = isService(entry.message, ctx) && !omitted.has(entry.id);
 			if (service && entry.message.role !== "system") ids.add(entry.id);
 		}
-		return [...ids].filter((id) => id && !omitted.has(id)).map((targetId) => ({ type: "context_edit", targetId, replacement: null }));
+		const removed = [...ids].filter((id) => id && !omitted.has(id));
+		if (removed.length) this.uncertainUsage = this.usageStamp(ctx, new Set(removed));
+		return removed.map((targetId) => ({ type: "context_edit", targetId, replacement: null }));
 	}
 
 	/** Return drafts only; success callbacks wait until Pi has committed the actual compaction. */
@@ -320,7 +368,8 @@ export class NativeAppend {
 		if (!run.failure && (!this.sameModel(run, ctx) || digest(current) !== run.fingerprint || !run.verified || !run.messages || !run.serviceId)) this.reject(run, "context-changed", ctx);
 		if (!run.failure && response.stopReason === "aborted") this.reject(run, "aborted", ctx);
 		if (!run.failure && response.stopReason === "error") {
-			this.reject(run, "request-failed", ctx, true);
+			// An SDK error may be a lost stream, not a confirmed rejection by the provider.
+			this.reject(run, "request-failed", ctx);
 			run.failure!.requestFailure = { ...classifyRequestFailure(response.errorMessage, "provider"), hasUsage: response.usage?.totalTokens > 0 };
 			for (const attempt of run.failure!.appendAttempt) attempt.stopReason = response.stopReason;
 		}
@@ -337,7 +386,7 @@ export class NativeAppend {
 				return { entries: [
 					{ type: "compaction", summary: run.outcome.compaction.summary, firstKeptEntryId: run.outcome.compaction.firstKeptEntryId, usage: response.usage, details: { ...run.outcome.compaction.details, nativeAppend: { version: 1, id: run.id, reason: run.event.reason } } },
 					...this.cleanup(ctx, [run.serviceId!, event.messageEntryId, ...event.toolResultEntryIds]),
-				], continue: run.event.willRetry };
+				] };
 			}
 		}
 		if (run.failure?.kind === "cancel") {
@@ -350,7 +399,7 @@ export class NativeAppend {
 	}
 
 	/** Preserve overflow recovery at a public boundary instead of creating a manual compact. */
-	private async prepareStandard(ctx: ExtensionContext): Promise<{ entries: SessionBoundaryDraft[]; continue: true } | undefined> {
+	private async prepareStandard(ctx: ExtensionContext): Promise<{ entries: SessionBoundaryDraft[] } | undefined> {
 		const run = this.run;
 		if (!run?.failure || !run.fallbackAllowed || !run.event.willRetry || run.phase !== "failed" || ctx.hasPendingMessages()) return;
 		if (!this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || run.signal?.aborted || run.event.signal.aborted) return;
@@ -358,9 +407,9 @@ export class NativeAppend {
 		if (!run.failureReported) { run.failureReported = true; this.callbacks.failed(run.failure, Date.now() - run.started, run.model, ctx); }
 		run.phase = "standard";
 		run.fallbackAllowed = false;
-		const result = await russianCompaction({ ...run.event, signal: run.signal ?? run.event.signal }, ctx);
+		const result = await russianCompaction({ ...run.event, signal: run.signal ?? run.event.signal }, ctx, { model: this.serviceModel(ctx), capability: run.capability, isCurrent: () => this.run === run && run.phase === "standard" && this.registrationOwned(ctx) && digest(semanticBranch(ctx)) === fingerprint });
 		if (this.run !== run || run.phase !== "standard") return;
-		if (!result || !this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || digest(semanticBranch(ctx)) !== fingerprint || run.signal?.aborted || run.event.signal.aborted || ctx.hasPendingMessages()) {
+		if (!("compaction" in result) || !this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || digest(semanticBranch(ctx)) !== fingerprint || run.signal?.aborted || run.event.signal.aborted || ctx.hasPendingMessages()) {
 			run.phase = "failed";
 			return;
 		}
@@ -368,13 +417,13 @@ export class NativeAppend {
 		run.outcome = { kind: "success", compaction: result.compaction, cacheStatus: cacheStatus(result.compaction.usage, true), appendAttempt: [{ attempt: 1, phase: "apply", toolBlocks: 0, toolBlockTypes: [], repairAttempts: 0 }] };
 		run.completion = this.completion(run);
 		run.phase = "drafted";
-		return { entries: [{ type: "compaction", summary: result.compaction.summary, firstKeptEntryId: result.compaction.firstKeptEntryId, usage: result.compaction.usage, details: { ...result.compaction.details, nativeAppend: { version: 1, id: run.id, reason: run.event.reason, standard: true } } }], continue: true };
+		return { entries: [{ type: "compaction", summary: result.compaction.summary, firstKeptEntryId: result.compaction.firstKeptEntryId, usage: result.compaction.usage, details: { ...result.compaction.details, nativeAppend: { version: 1, id: run.id, reason: run.event.reason, standard: true } } }] };
 	}
 
-	/** Error responses end the low-level loop even after a turn-boundary continuation decision. */
+	/** Resume only after the committed compaction survived every turn_end handler. */
 	async beforeSettle(ctx: ExtensionContext): Promise<{ continue: true } | undefined> {
 		const run = this.run;
-		if (!run?.standard || run.phase !== "drafted" || run.continuationStarted) return;
+		if (!run?.event.willRetry || run.phase !== "drafted" || run.continuationStarted) return;
 		await this.settled(ctx);
 		if (run.applied && !run.signal?.aborted && !run.event.signal.aborted && this.sameSession(run, ctx) && this.sameModel(run, ctx) && !ctx.hasPendingMessages()) return { continue: true };
 	}
@@ -388,7 +437,10 @@ export class NativeAppend {
 		if (!this.sameSession(run, ctx)) { this.release(run, ctx); return; }
 		if (run.phase === "drafted") {
 			const entry = ctx.sessionManager.getBranch().find((e) => e.type === "compaction" && (e.details as any)?.nativeAppend?.id === run.id);
-			if (entry && run.completion) {
+			const expected = run.outcome?.compaction;
+			const marker = (entry as any)?.details?.nativeAppend;
+			// A matching operation id cannot authenticate a boundary changed by a later handler.
+			if (entry?.type === "compaction" && expected && entry.firstKeptEntryId === expected.firstKeptEntryId && entry.summary === expected.summary && marker.version === 1 && marker.reason === run.event.reason && (marker.standard ?? false) === Boolean(run.standard) && Object.entries(expected.details ?? {}).every(([key, value]) => JSON.stringify(value) === JSON.stringify((entry.details as any)?.[key])) && run.completion) {
 				run.applied = true;
 				for (const draft of this.callbacks.entries(run.completion)) {
 					if (draft.type !== "custom") throw new Error("Native append receipts must be custom metadata");
@@ -406,6 +458,7 @@ export class NativeAppend {
 		if (!run.failureReported) { run.failureReported = true; this.callbacks.failed(run.failure!, Date.now() - run.started, run.model, ctx); }
 		if (run.fallbackAllowed && this.sameModel(run, ctx) && ctx.isIdle() && !ctx.hasPendingMessages()) {
 			run.phase = "fallback";
+			run.fallbackAllowed = false;
 			this.fallbackScope = { sessionId: run.sessionId, reason: run.event.reason };
 			ctx.compact({ customInstructions: run.event.customInstructions, onComplete: () => { this.release(run, ctx); void this.callbacks.finished(ctx, true); }, onError: () => { this.release(run, ctx); void this.callbacks.finished(ctx, false); } });
 			return;

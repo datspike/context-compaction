@@ -15,6 +15,7 @@
     "checkpoint.ts",
     "language.ts",
     "policy.ts",
+    "compact-budget.ts",
     "session-state.ts",
     "summary.ts",
     "append-compaction.ts",

@@ -17,6 +17,7 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 	let sessionId = options.sessionId ?? `session-${++sequence}`;
 	let thinkingLevel = options.thinkingLevel ?? "low";
 	let compactionInProgress = false;
+	let modelBarrier: (() => Promise<void>) | undefined;
 	const audits: any[] = [];
 	const compactOptions: any[] = [];
 	const sent: string[] = [];
@@ -32,6 +33,7 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 		sessionManager,
 		getContextUsage: () => ({ tokens: 1_000, contextWindow: ctx.model.contextWindow, percent: 1 }),
 		isIdle: () => idle,
+		hasPendingMessages: () => false,
 		compact(value: any) { compactOptions.push(value); },
 	};
 	const pi: any = {
@@ -48,6 +50,7 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 			const result = options.setModelResults?.shift() ?? options.setModelResult ?? true;
 			if (result === false) return false;
 			ctx.model = next;
+			await modelBarrier?.();
 			if (options.emitModelSelect) await handlers.get("model_select")?.({}, ctx);
 			if (result === "reject") throw new Error("session transcript write failed");
 			if (options.modelSwitchThinkingLevel) thinkingLevel = options.modelSwitchThinkingLevel;
@@ -70,6 +73,7 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 	}
 	return {
 		ctx, tool, command, audits, renderers, compactOptions, sent, notices, setModelCalls,
+		setModelBarrier(value: () => Promise<void>) { modelBarrier = value; },
 		hasEvent(name: string) { return handlers.has(name); },
 		get thinkingLevel() { return thinkingLevel; },
 		setBranch(value: any[]) { branch = value; },
@@ -134,7 +138,7 @@ describe("public compaction lifecycle", () => {
 		let customCalls = 0;
 		runtime.ctx.modelRegistry.complete = () => { customCalls++; throw new Error("Custom summarizer must not run in English mode"); };
 		runtime.ctx.modelRegistry.streamSimple = () => { customCalls++; throw new Error("Append summarizer must not run in English mode"); };
-		expect(runtime.hasEvent("session_before_tree")).toBe(false);
+		expect(await runtime.event("session_before_tree", {})).toBeUndefined();
 		const ordinaryMessages = [{ role: "user", content: "Continue the work", timestamp: 1 }];
 		expect(await runtime.event("context_with_system", { messages: ordinaryMessages })).toBeUndefined();
 		expect(ordinaryMessages[0].content).toBe("Continue the work");
@@ -162,9 +166,9 @@ describe("public compaction lifecycle", () => {
 		expect(runtime.audits.filter((entry) => entry.data.phase === "error" && entry.data.origin === "manual-tool")).toHaveLength(1);
 	});
 
-	test("failed native threshold is audited without cancelling Pi or scheduling a retry", async () => {
+	test("failed threshold cancels compaction explicitly without scheduling a hidden retry", async () => {
 		const runtime = setup();
-		expect(await runtime.event("session_before_compact", { reason: "threshold", willRetry: false, preparation: { tokensBefore: 256_000 } })).toBeUndefined();
+		expect(await runtime.event("session_before_compact", { reason: "threshold", willRetry: false, preparation: { tokensBefore: 256_000 } })).toEqual({ cancel: true });
 		await runtime.event("session_compact_failed", { reason: "threshold", willRetry: false, preparation: { tokensBefore: 256_000 } });
 		expect(runtime.compactOptions).toHaveLength(0);
 		expect(runtime.sent).toHaveLength(0);
@@ -278,7 +282,7 @@ describe("session-local context modes", () => {
 		await runtime.event("session_compact", { reason: "overflow", willRetry: true, compactionEntry: { tokensBefore: 590_000 } });
 		expect(runtime.ctx.model.contextWindow).toBe(600_000);
 		await runtime.command("off", runtime.ctx);
-		expect(await runtime.event("session_before_compact", { reason: "threshold", willRetry: false })).toBeUndefined();
+		expect(await runtime.event("session_before_compact", { reason: "threshold", willRetry: false })).toEqual({ cancel: true });
 		expect(runtime.compactOptions).toHaveLength(0);
 	});
 
@@ -314,4 +318,30 @@ describe("session-local context modes", () => {
 		expect(runtime.ctx.model.contextWindow).toBe(600_000);
 		expect(runtime.notices.some((entry) => entry.text.includes("context: economy") && entry.text.includes("600000") && entry.text.includes("source=fallback"))).toBe(true);
 	});
+});
+
+for (const change of ["none", "model", "route", "api", "fork", "tree", "pending"] as const) test(`manual continuation revalidates identity after window restore: ${change}`, async () => {
+	const runtime = setup({ language: "en", emitModelSelect: true });
+	await runtime.command("long-once", runtime.ctx);
+	const callback = await startManual(runtime);
+	await runtime.event("session_before_compact", { reason: "manual", willRetry: false });
+	await runtime.event("session_compact", { reason: "manual", willRetry: false, compactionEntry: { tokensBefore: 12000 } });
+	let entered!: () => void, release!: () => void;
+	const reached = new Promise<void>((resolve) => { entered = resolve; });
+	const blocked = new Promise<void>((resolve) => { release = resolve; });
+	let waits = 0;
+	runtime.setModelBarrier(async () => { if (waits++ === 0) { entered(); await blocked; } });
+	callback.onComplete({});
+	await reached;
+	if (change === "model") runtime.ctx.model = { ...runtime.ctx.model, id: "different-model" };
+	if (change === "route") runtime.ctx.model = { ...runtime.ctx.model, baseUrl: "https://changed.invalid/v1" };
+	if (change === "api") runtime.ctx.model = { ...runtime.ctx.model, api: "different-api" };
+	if (["model", "route", "api"].includes(change)) await runtime.event("model_select", {});
+	if (change === "fork") await runtime.event("session_before_fork", {});
+	if (change === "tree") await runtime.event("session_before_tree", {});
+	if (change === "pending") runtime.ctx.hasPendingMessages = () => true;
+	release();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(runtime.sent).toHaveLength(change === "none" ? 1 : 0);
+	expect(runtime.audits.filter((e) => e.data.phase === "send-attempted")).toHaveLength(change === "none" ? 1 : 0);
 });
