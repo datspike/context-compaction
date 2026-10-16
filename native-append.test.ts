@@ -8,7 +8,7 @@ import extension from "./index.js";
 
 const usage = { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 30, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const history = "## Цель\nСохранить локальный JSON ради автономной работы без сети.\n## Следующие шаги\nРешение пользователя: проверить импорт и экспорт Linux.";
-type Scenario = "success" | "split-turn" | "invalid-json" | "tail-leak" | "tool-calls" | "aborted" | "late-mutator" | "checkpoint" | "threshold" | "overflow" | "apply-rejected" | "late-context" | "late-envelope" | "model-switch" | "orphan" | "late-include" | "late-tools" | "queue-rejected";
+type Scenario = "success" | "split-turn" | "invalid-json" | "tail-leak" | "tool-calls" | "aborted" | "late-mutator" | "checkpoint" | "threshold" | "overflow" | "apply-rejected" | "late-context" | "late-envelope" | "model-switch" | "orphan" | "late-include" | "late-tools" | "queue-rejected" | "mid-convo-effort" | "late-effort" | "unexpected-tail" | "duplicate-effort";
 
 async function until(predicate: () => boolean, description: string) {
 	const deadline = Date.now() + 4000;
@@ -32,7 +32,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 	const runtime = await ModelRuntime.create({ authPath: join(profile, "auth.json"), modelsPath: join(profile, "models.json") });
 	runtime.registerProvider("native-fixture", {
 		api: "openai-responses", apiKey: "offline-fixture", baseUrl: "https://fixture.invalid/v1",
-		models: [{ id: "native-model", name: "Synthetic native fixture", api: "openai-responses", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 8192, compat: { supportsMidConvoSystemMessages: true } }],
+		models: [{ id: "native-model", name: "Synthetic native fixture", api: "openai-responses", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 8192, compat: { supportsMidConvoSystemMessages: true, supportsMidConvoEffort: ["mid-convo-effort", "late-effort", "unexpected-tail", "duplicate-effort"].includes(scenario) } }],
 		streamSimple(model, context, options) {
 			const events = new AssistantMessageEventStream();
 			void (async () => {
@@ -43,7 +43,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 				}).result();
 				if (final && !options?.signal?.aborted) payloads.push(final);
 				const native = final?.text?.format?.name === "compact_result";
-				const task = (final?.input?.at(-1)?.content ?? []).map((part: any) => part.text ?? "").join("\n");
+				const task = (final?.input?.findLast((item: any) => item.role === "user")?.content ?? []).map((part: any) => part.text ?? "").join("\n");
 				const split = native && !task.includes("РАННЯЯ ЧАСТЬ ХОДА: (нет сообщений)");
 				const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, stopReason: "stop", usage, timestamp: Date.now(), content: [{ type: "text", text: native ? JSON.stringify({ history, turnPrefix: split ? "## Исходный запрос\nПроверить импорт.\n## Прогресс на текущий момент\nПроверка запланирована.\n## Контекст для продолжения\nНе считать импорт завершённым." : "" }) : history }] };
 				if (!native && final) {
@@ -91,13 +91,19 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 		(pi) => {
 			pi.on("before_agent_start", (event) => { beforeStarts++; event.systemPromptOptions.appendSystemPrompt = ["CURRENT_PROMPT_TRANSFORM"]; });
 			pi.on("context_with_system", () => { contextTransforms++; });
-			pi.on("before_provider_request", (event) => { payloadTransforms++; return { ...(event.payload as object), metadata: { fixtureTransform: "CURRENT_PAYLOAD_TRANSFORM" } }; });
+			pi.on("before_provider_request", (event) => {
+				payloadTransforms++;
+				const payload = event.payload as any;
+				const extra = scenario === "unexpected-tail" ? { role: "user", content: [{ type: "input_text", text: "UNEXPECTED_TASK" }] } : scenario === "duplicate-effort" ? { type: "configuration_update", reasoning: { effort: "medium" } } : undefined;
+				return { ...payload, ...(extra ? { input: [...payload.input, extra] } : {}), metadata: { fixtureTransform: "CURRENT_PAYLOAD_TRANSFORM" } };
+			});
 		},
 		(pi) => { const old = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = profile; try { extension(scenario === "queue-rejected" ? new Proxy(pi, { get(target, key) { if (key === "sendUserMessage") return (...args: any[]) => { if (!droppedService) { droppedService = true; return; } return Reflect.apply(target.sendUserMessage, target, args); }; return Reflect.get(target, key); } }) : pi); } finally { if (old === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = old; } },
 		...(scenario === "model-switch" ? [(pi: any) => pi.on("context_with_system", async (event: any, ctx: any) => { if (JSON.stringify(event.messages.at(-1)).includes("СЛУЖЕБНАЯ ЗАДАЧА COMPACT")) await pi.setModel({ ...ctx.model, contextWindow: 90_000 }); })] : []),
 		...(scenario === "late-context" ? [(pi: any) => pi.on("context_with_system", (event: any) => ({ messages: event.messages.map((message: any) => message.role === "user" && JSON.stringify(message.content).includes("Решение пользователя:") ? { ...message, content: "Подменённая история" } : message) }))] : []),
 		...(scenario === "late-envelope" ? [(pi: any) => pi.on("context_with_system", (event: any) => ({ messages: event.messages.map((message: any) => message.role === "system" ? { ...message, content: message.content + "\\nCURRENT_LATE_ENVELOPE" } : message) }))] : []),
 		...((scenario === "apply-rejected" || nativeFailure === "apply-rejected") ? [(pi: any) => pi.on("turn_end", (event: any) => ({ entries: event.entries.filter((draft: any) => draft.type !== "compaction") }))] : []),
+		...(scenario === "late-effort" ? [(pi: any) => pi.on("before_provider_request", (event: any) => event.payload.text?.format?.name === "compact_result" ? { ...event.payload, input: [...event.payload.input.slice(0, -1), { type: "configuration_update", reasoning: { effort: "high" } }] } : undefined)] : []),
 		...(scenario === "late-tools" ? [(pi: any) => pi.on("before_provider_request", (event: any) => ({ ...event.payload, tools: [...(event.payload.tools ?? []), { type: "web_search", external_web_access: true }] }))] : []),
 		...(scenario === "late-include" ? [(pi: any) => pi.on("before_provider_request", (event: any) => ({ ...event.payload, include: [...(event.payload.include ?? []), "web_search_call.action.sources"] }))] : []),
 		...(scenario === "late-mutator" ? [(pi: any) => { pi.on("before_provider_request", (event: any) => ({ ...event.payload, tool_choice: "auto" })); }] : []),
@@ -332,6 +338,42 @@ test("rejected overflow standard boundary never resumes or claims success", asyn
 		expect(fixture.payloads).toHaveLength(3);
 		expect(fixture.audits().some((a: any) => a.outcome === "success")).toBe(false);
 		expect(fixture.audits().some((a: any) => a.outcome === "unknown" && a.reason === "apply-failed")).toBe(true);
+		expect(fixture.stats.networkCalls).toBe(0);
+	} finally { await fixture.close(); }
+});
+
+test("native compact preserves the SDK trailing effort update", async () => {
+	const fixture = await setup("mid-convo-effort");
+	try {
+		await fixture.compact();
+		expect(fixture.audits().some((a: any) => a.native && a.outcome === "success")).toBe(true);
+		const payload = fixture.payloads.find((p) => p.text?.format?.name === "compact_result");
+		expect(payload.input.at(-1)).toEqual({ type: "configuration_update", reasoning: { effort: "medium" } });
+		expect(payload.input.at(-2).role).toBe("user");
+		expect(payload.tool_choice).toBe("none");
+		expect(payload.prompt_cache_key).toBe(fixture.manager.getSessionId());
+		expect(fixture.stats.toolExecutions).toBe(0);
+		expect(fixture.stats.networkCalls).toBe(0);
+		expect(JSON.stringify(fixture.manager.getEntry(fixture.tailId))).toBe(fixture.oldTail);
+	} finally { await fixture.close(); }
+});
+
+for (const scenario of ["unexpected-tail", "duplicate-effort"] as const) test(`native payload rejects non-SDK suffix: ${scenario}`, async () => {
+	const fixture = await setup(scenario);
+	try {
+		await fixture.compact();
+		expect(fixture.audits().some((a: any) => a.reason === "payload-mismatch")).toBe(true);
+		expect(fixture.payloads.filter((p) => p.text?.format?.name === "compact_result")).toHaveLength(0);
+		expect(fixture.stats.networkCalls).toBe(0);
+	} finally { await fixture.close(); }
+});
+
+test("late changes to the SDK effort control are rejected before sending", async () => {
+	const fixture = await setup("late-effort");
+	try {
+		await fixture.compact();
+		expect(fixture.audits().some((a: any) => a.reason === "payload-mismatch")).toBe(true);
+		expect(fixture.payloads.filter((p) => p.text?.format?.name === "compact_result")).toHaveLength(0);
 		expect(fixture.stats.networkCalls).toBe(0);
 	} finally { await fixture.close(); }
 });

@@ -239,7 +239,16 @@ export class NativeAppend {
 		const run = this.run;
 		if (!run || run.phase !== "payload") return;
 		const value = payload as Record<string, any> | undefined;
-		if (!value || !Array.isArray(value.input) || text(value.input.at(-1) ?? {}) !== run.task || value.model !== run.model.id || value.prompt_cache_key !== run.sessionId) {
+		const input = Array.isArray(value?.input) ? value.input : undefined;
+		const suffix = input?.at(-1);
+		// Responses may append a model-supported effort control after the final user message.
+		const compat = ctx.model?.compat;
+		const effortControl = compat && "supportsMidConvoEffort" in compat && compat.supportsMidConvoEffort === true && suffix?.type === "configuration_update"
+			&& Object.keys(suffix).length === 2 && suffix.reasoning && typeof suffix.reasoning === "object" && !Array.isArray(suffix.reasoning)
+			&& Object.keys(suffix.reasoning).length === 1 && typeof suffix.reasoning.effort === "string" && suffix.reasoning.effort.length > 0;
+		const taskIndex = (input?.length ?? 0) - (effortControl ? 2 : 1);
+		const task = input?.[taskIndex];
+		if (!value || !input || task?.role !== "user" || text(task) !== run.task || value.model !== run.model.id || value.prompt_cache_key !== run.sessionId) {
 			this.reject(run, "payload-mismatch", ctx, true); throw new Error("APPEND_COMPACTION_NATIVE_PAYLOAD_MISMATCH");
 		}
 		const serialized = JSON.stringify(value);
@@ -247,7 +256,7 @@ export class NativeAppend {
 		if (serialized.length > MAX_PAYLOAD_CHARS || Math.ceil(serialized.length / 3) + run.maxTokens + WINDOW_MARGIN > window) {
 			this.reject(run, "insufficient-window", ctx, true); throw new Error("APPEND_COMPACTION_INSUFFICIENT_WINDOW");
 		}
-		const baseline = { ...value, input: value.input.slice(0, -1) };
+		const baseline = { ...value, input: input.slice(0, taskIndex) };
 		const next = { ...value, tool_choice: "none", text: { format: COMPACTION_OUTPUT_FORMAT }, max_output_tokens: run.maxTokens };
 		if (!preservesPayloadPrefix(baseline, next)) {
 			this.reject(run, "payload-mismatch", ctx, true); throw new Error("APPEND_COMPACTION_PREFIX_MISMATCH");
