@@ -79,10 +79,12 @@ function payloadDigest(value: unknown): string {
 	return digest(request);
 }
 function semanticBranch(ctx: ExtensionContext) {
-	return ctx.sessionManager.getBranch().filter((e) => e.type !== "custom" && e.type !== "session_info" && e.type !== "usage");
+	return ctx.sessionManager.getBranch().filter((e) => e.type !== "custom" && e.type !== "session_info" && e.type !== "usage" && !(e.type === "custom_message" && e.customType === STATUS_KEY));
 }
-function isService(message: { role?: string; content?: unknown }, ctx: ExtensionContext): boolean {
-	return message.role === "user" && text(message).startsWith(SERVICE_PREFIX) && isNativeCompactionMessage({ type: "message", message }, ctx.sessionManager.getBranch());
+function isService(message: { role?: string; customType?: string; content?: unknown }, ctx: ExtensionContext): boolean {
+	const supportedRole = message.role === "user" || message.role === "custom" || (message.role === undefined && message.customType === STATUS_KEY);
+	const entry = message.role === "custom" || (message.role === undefined && message.customType === STATUS_KEY) ? { type: "custom_message", customType: message.customType, content: message.content } : { type: "message", message };
+	return supportedRole && text(message).startsWith(SERVICE_PREFIX) && isNativeCompactionMessage(entry, ctx.sessionManager.getBranch());
 }
 
 /** Coordinates native service turns while leaving Pi's compact and provider implementations intact. */
@@ -104,8 +106,11 @@ export class NativeAppend {
 		let assistant: string | undefined, boundary: string | undefined, service = false;
 		for (const entry of branch) {
 			if (entry.type === "compaction") boundary = entry.id;
+			if (entry.type === "message" || entry.type === "custom_message") {
+				const message = entry.type === "message" ? entry.message : entry;
+				if (isService(message, ctx)) service = !omitted.has(entry.id);
+			}
 			if (entry.type !== "message" || omitted.has(entry.id)) continue;
-			if (entry.message.role === "user") service = isService(entry.message, ctx);
 			if (!service && entry.message.role === "assistant" && entry.message.stopReason !== "aborted" && entry.message.stopReason !== "error" && entry.message.usage?.totalTokens > 0) assistant = entry.id;
 		}
 		return JSON.stringify([ctx.sessionManager.getSessionId(), assistant, boundary]);
@@ -245,7 +250,7 @@ export class NativeAppend {
 		if (run.event.reason === "manual" && !ctx.isIdle()) return;
 		run.phase = "queued";
 		this.pi.appendEntry("context-compaction-native", { version: 1, id: run.id, phase: "queued", sessionId: run.sessionId });
-		this.pi.sendUserMessage(run.service, { deliverAs: run.event.reason === "manual" ? "followUp" : "steer" });
+		this.pi.sendMessage({ customType: STATUS_KEY, content: run.service, display: false }, { triggerTurn: true, deliverAs: run.event.reason === "manual" ? "followUp" : "steer" });
 	}
 
 	/** Transform only our own service input; stale service records are never model instructions. */
@@ -255,22 +260,25 @@ export class NativeAppend {
 		const last = messages.at(-1);
 		let orphan = false;
 		const filtered = messages.filter((message) => {
-			if (message.role === "user") orphan = isService(message, ctx) && (!run || text(message) !== run.service);
+			if (message.role === "user" || message.role === "custom") orphan = isService(message, ctx) && (!run || text(message) !== run.service);
 			return !orphan || message.role === "system";
 		});
-		if (run && last?.role === "user" && !isService(last, ctx) && run.phase !== "drafted" && run.phase !== "fallback") {
+		if (run && (last?.role === "user" || last?.role === "custom") && !isService(last, ctx) && run.phase !== "drafted" && run.phase !== "fallback") {
 			this.reject(run, "context-changed", ctx, false, false);
 			void this.settled(ctx);
 			return filtered.length !== messages.length ? { messages: filtered } : undefined;
 		}
 		if (!run || run.phase === "drafted" || run.phase === "fallback" || run.phase === "failed") {
-			if (last && isService(last, ctx)) ctx.abort();
+			if (last && isService(last, ctx) && run?.phase !== "failed") ctx.abort();
 			return filtered.length !== messages.length ? { messages: filtered } : undefined;
 		}
-		if (!last || last.role !== "user" || text(last) !== run.service || !isService(last, ctx) || !this.sameSession(run, ctx) || !this.sameModel(run, ctx)) {
+		if (!last || (last.role !== "user" && last.role !== "custom") || text(last) !== run.service || !isService(last, ctx) || !this.sameSession(run, ctx) || !this.sameModel(run, ctx)) {
 			this.reject(run, "context-changed", ctx); return;
 		}
-		run.serviceId = [...ctx.sessionManager.getBranch()].reverse().find((e) => e.type === "message" && isService(e.message, ctx) && text(e.message) === run.service)?.id;
+		run.serviceId = [...ctx.sessionManager.getBranch()].reverse().find((e) => {
+			const message = e.type === "message" ? e.message : e.type === "custom_message" ? e : undefined;
+			return !!message && isService(message, ctx) && text(message) === run.service;
+		})?.id;
 		run.messages = convertToLlm(filtered.slice(0, -1));
 		run.task = appendTask(run.messages, run.event);
 		if (!run.serviceId || !run.task) { this.reject(run, "boundary-unavailable", ctx, true); return; }
@@ -346,9 +354,14 @@ export class NativeAppend {
 		const ids = new Set(extra);
 		let service = false;
 		for (const entry of branch) {
-			if (entry.type !== "message") continue;
-			if (entry.message.role === "user") service = isService(entry.message, ctx) && !omitted.has(entry.id);
-			if (service && entry.message.role !== "system") ids.add(entry.id);
+			if (entry.type !== "message" && entry.type !== "custom_message") continue;
+			const message = entry.type === "message" ? entry.message : entry;
+			if (isService(message, ctx)) {
+				service = !omitted.has(entry.id);
+			} else if (entry.type === "custom_message" || entry.message?.role === "user" || entry.message?.role === "custom") {
+				service = false;
+			}
+			if (service && (entry.type === "custom_message" || entry.message?.role === "user" || entry.message?.role === "assistant" || entry.message?.role === "toolResult")) ids.add(entry.id);
 		}
 		const removed = [...ids].filter((id) => id && !omitted.has(id));
 		if (removed.length) this.uncertainUsage = this.usageStamp(ctx, new Set(removed));
@@ -359,7 +372,8 @@ export class NativeAppend {
 	async turn(event: TurnEndEvent, ctx: ExtensionContext): Promise<{ entries: SessionBoundaryDraft[]; continue?: boolean } | undefined> {
 		const run = this.run;
 		if (!run || run.phase === "drafted" || run.phase === "fallback") {
-			const entries = this.cleanup(ctx); return entries.length ? { entries } : undefined;
+			const entries = this.cleanup(ctx);
+			return entries.length ? { entries } : undefined;
 		}
 		if (!this.sameSession(run, ctx)) return;
 		const response = event.message as AssistantMessage;
@@ -404,11 +418,11 @@ export class NativeAppend {
 		if (!run?.failure || !run.fallbackAllowed || !run.event.willRetry || run.phase !== "failed" || ctx.hasPendingMessages()) return;
 		if (!this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || run.signal?.aborted || run.event.signal.aborted) return;
 		const fingerprint = digest(semanticBranch(ctx));
-		if (!run.failureReported) { run.failureReported = true; this.callbacks.failed(run.failure, Date.now() - run.started, run.model, ctx); }
 		run.phase = "standard";
 		run.fallbackAllowed = false;
 		const result = await russianCompaction({ ...run.event, signal: run.signal ?? run.event.signal }, ctx, { model: this.serviceModel(ctx), capability: run.capability, isCurrent: () => this.run === run && run.phase === "standard" && this.registrationOwned(ctx) && digest(semanticBranch(ctx)) === fingerprint });
 		if (this.run !== run || run.phase !== "standard") return;
+		if (!run.failureReported) { run.failureReported = true; this.callbacks.failed(run.failure, Date.now() - run.started, run.model, ctx); }
 		if (!("compaction" in result) || !this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || digest(semanticBranch(ctx)) !== fingerprint || run.signal?.aborted || run.event.signal.aborted || ctx.hasPendingMessages()) {
 			run.phase = "failed";
 			return;

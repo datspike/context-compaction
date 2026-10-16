@@ -10,7 +10,7 @@ import extension from "./index.js";
 
 const usage = { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 30, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const history = "## Цель\nСохранить локальный JSON ради автономной работы без сети.\n## Следующие шаги\nРешение пользователя: проверить импорт и экспорт Linux.";
-type Scenario = "success" | "split-turn" | "invalid-json" | "tail-leak" | "tool-calls" | "aborted" | "late-mutator" | "checkpoint" | "threshold" | "overflow" | "apply-rejected" | "late-context" | "late-envelope" | "model-switch" | "orphan" | "late-include" | "late-tools" | "queue-rejected" | "mid-convo-effort" | "late-effort" | "unexpected-tail" | "duplicate-effort";
+type Scenario = "success" | "split-turn" | "invalid-json" | "tail-leak" | "tool-calls" | "aborted" | "late-mutator" | "checkpoint" | "threshold" | "overflow" | "apply-rejected" | "late-context" | "late-envelope" | "model-switch" | "orphan" | "late-include" | "late-tools" | "queue-rejected" | "mid-convo-effort" | "late-effort" | "unexpected-tail" | "duplicate-effort" | "provider-hook-throw";
 
 async function until(predicate: () => boolean, description: string) {
 	const deadline = Date.now() + 4000;
@@ -102,7 +102,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 			pi.on("session_compact_failed", () => { standardFailures++; });
 			// SDK cut selection may split a turn; answer its distinct history and prefix requests.
 			pi.on("session_before_compact", (event) => { if (event.willRetry) standardExpectedRequests = event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0 ? Number(event.preparation.messagesToSummarize.length > 0) + 1 : 1; });
-			pi.on("before_agent_start", (event) => { if (!event.prompt.startsWith("[context-compaction-native:")) lastUserPrompt = event.prompt; beforeStarts++; event.systemPromptOptions.appendSystemPrompt = ["CURRENT_PROMPT_TRANSFORM"]; });
+			pi.on("before_agent_start", (event: any) => { if (event.messageType === "user" && !event.prompt.startsWith("[context-compaction-native:")) lastUserPrompt = event.prompt; beforeStarts++; event.systemPromptOptions.appendSystemPrompt = ["CURRENT_PROMPT_TRANSFORM"]; });
 			pi.on("context_with_system", () => { contextTransforms++; });
 			pi.on("before_provider_request", (event) => {
 				payloadTransforms++;
@@ -111,7 +111,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 				return { ...payload, ...(extra ? { input: [...payload.input, extra] } : budgetCase === "opaque" ? { input: [{ type: "reasoning", id: "opaque-fixture", encrypted_content: "x".repeat(703_320) }, ...payload.input] } : {}), metadata: { fixtureTransform: "CURRENT_PAYLOAD_TRANSFORM" } };
 			});
 		},
-		(pi) => { const old = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = profile; try { extension(scenario === "queue-rejected" ? new Proxy(pi, { get(target, key) { if (key === "sendUserMessage") return (...args: any[]) => { if (!droppedService) { droppedService = true; return; } return Reflect.apply(target.sendUserMessage, target, args); }; return Reflect.get(target, key); } }) : pi); } finally { if (old === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = old; } },
+		(pi) => { const old = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = profile; try { extension(scenario === "queue-rejected" ? new Proxy(pi, { get(target, key) { if (key === "sendMessage") return (...args: any[]) => { if (!droppedService) { droppedService = true; return; } return Reflect.apply(target.sendMessage, target, args); }; return Reflect.get(target, key); } }) : pi); } finally { if (old === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = old; } },
 		...(scenario === "model-switch" ? [(pi: any) => pi.on("context_with_system", async (event: any, ctx: any) => { if (JSON.stringify(event.messages.at(-1)).includes("СЛУЖЕБНАЯ ЗАДАЧА COMPACT")) await pi.setModel({ ...ctx.model, contextWindow: 90_000 }); })] : []),
 		...(scenario === "late-context" ? [(pi: any) => pi.on("context_with_system", (event: any) => ({ messages: event.messages.map((message: any) => message.role === "user" && JSON.stringify(message.content).includes("Решение пользователя:") ? { ...message, content: "Подменённая история" } : message) }))] : []),
 		...(scenario === "late-envelope" ? [(pi: any) => pi.on("context_with_system", (event: any) => ({ messages: event.messages.map((message: any) => message.role === "system" ? { ...message, content: message.content + "\\nCURRENT_LATE_ENVELOPE" } : message) }))] : []),
@@ -121,6 +121,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 		...(scenario === "late-include" ? [(pi: any) => pi.on("before_provider_request", (event: any) => ({ ...event.payload, include: [...(event.payload.include ?? []), "web_search_call.action.sources"] }))] : []),
 		...(scenario === "late-mutator" ? [(pi: any) => { pi.on("before_provider_request", (event: any) => ({ ...event.payload, tool_choice: "auto" })); }] : []),
 		...(budgetCase === "late-serialized" ? [(pi: any) => pi.on("before_provider_request", (event: any) => { const payload = { ...event.payload, tools: [...(event.payload.tools ?? []), { type: "function", name: "large_declaration", description: "x".repeat(MAX_COMPACT_PAYLOAD_CHARS), parameters: { type: "object", properties: {} } }] }; latePayloadChars = JSON.stringify(payload).length; return payload; })] : []),
+		...(scenario === "provider-hook-throw" ? [(pi: any) => pi.on("before_provider_request", (event: any) => { if (event.payload.text?.format?.name === "compact_result") throw new Error("SYNTHETIC_BEFORE_PROVIDER_FAILURE"); })] : []),
 	] });
 	await loader.reload(); expect(loader.getExtensions().errors).toEqual([]);
 	const { session } = await createAgentSession({ cwd: root, agentDir: profile, modelRuntime: runtime, model, thinkingLevel: "medium", settingsManager: settings, sessionManager: manager, resourceLoader: loader, tools: scenario === "checkpoint" ? ["read", "checkpoint_compact_continue"] : ["read"], customTools: [{ name: "read", label: "read", description: "Read synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } as any, execute: async () => { toolExecutions++; return { content: [{ type: "text", text: "fixture" }], details: {} }; } }] });
@@ -223,9 +224,45 @@ test("an interrupted service turn is excluded before the next normal request and
 		expect(JSON.stringify(fixture.payloads[0])).not.toContain("[context-compaction-native:");
 		expect(JSON.stringify(fixture.manager.getEntry(serviceId))).toBe(original);
 		const omitted = fixture.manager.getBranch().filter((e) => e.type === "context_edit" && e.replacement === null).map((e: any) => e.targetId);
+		const branch = fixture.manager.getBranch();
+		const normalUserIndex = branch.findIndex((entry: any) => entry.type === "message" && entry.message?.role === "user" && JSON.stringify(entry.message.content).includes("Новый настоящий запрос пользователя."));
+		const normalUser = normalUserIndex >= 0 ? branch[normalUserIndex] : undefined;
+		const normalResponse = normalUserIndex >= 0 ? branch.slice(normalUserIndex + 1).find((entry: any) => entry.type === "message" && entry.message?.role === "assistant") : undefined;
+		expect(normalUser).toBeDefined();
+		expect(normalResponse).toBeDefined();
+		expect(omitted).not.toContain(normalUser!.id);
+		expect(omitted).not.toContain(normalResponse!.id);
+		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).toContain(JSON.stringify(normalResponse!.message.content));
 		expect(omitted.every((id) => (fixture.manager.getEntry(id) as any)?.message?.role !== "system")).toBe(true);
 		expect(omitted).toContain(serviceId);
 		expect(omitted).toContain(responseId);
+	} finally { await fixture.close(); }
+});
+
+test("an early provider hook failure hides the native service message immediately", async () => {
+	const fixture = await setup("provider-hook-throw");
+	try {
+		await fixture.compact();
+		const branch = fixture.manager.getBranch();
+		expect(branch.some((entry: any) => entry.type === "message" && entry.message?.role === "user" && JSON.stringify(entry.message.content).includes("[context-compaction-native:"))).toBe(false);
+		expect(branch.some((entry: any) => entry.type === "custom_message" && entry.customType === "context-compaction-native" && entry.display === false)).toBe(true);
+		expect(branch.some((entry: any) => entry.type === "context_edit" && entry.replacement === null)).toBe(true);
+		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).not.toContain("[context-compaction-native:");
+		expect(readFileSync(fixture.manager.getSessionFile()!).subarray(0, fixture.originalFile.length).equals(fixture.originalFile)).toBe(true);
+		const reloaded = SessionManager.open(fixture.manager.getSessionFile()!);
+		expect(JSON.stringify(reloaded.buildSessionProjection().messages)).not.toContain("[context-compaction-native:");
+		await fixture.session.prompt("Новый настоящий запрос после reload.");
+		await until(() => fixture.session.isIdle && fixture.manager.getBranch().some((entry: any) => entry.type === "message" && entry.message?.role === "user" && JSON.stringify(entry.message.content).includes("Новый настоящий запрос после reload.")), "ordinary request after hidden orphan");
+		const afterBranch = fixture.manager.getBranch();
+		const afterUserIndex = afterBranch.findIndex((entry: any) => entry.type === "message" && entry.message?.role === "user" && JSON.stringify(entry.message.content).includes("Новый настоящий запрос после reload."));
+		const afterUser = afterUserIndex >= 0 ? afterBranch[afterUserIndex] : undefined;
+		const afterAssistant = afterUserIndex >= 0 ? afterBranch.slice(afterUserIndex + 1).find((entry: any) => entry.type === "message" && entry.message?.role === "assistant") : undefined;
+		const afterOmitted = afterBranch.filter((entry: any) => entry.type === "context_edit" && entry.replacement === null).map((entry: any) => entry.targetId);
+		expect(afterUser).toBeDefined();
+		expect(afterAssistant).toBeDefined();
+		expect(afterOmitted).not.toContain(afterUser!.id);
+		expect(afterOmitted).not.toContain(afterAssistant!.id);
+		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).toContain(JSON.stringify(afterAssistant!.message.content));
 	} finally { await fixture.close(); }
 });
 

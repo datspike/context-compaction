@@ -10,6 +10,8 @@ const FOLLOW_UP_MARKER_SUFFIX = " -->";
 type BranchEntry = {
 	type?: string;
 	customType?: string;
+	content?: unknown;
+	display?: boolean;
 	data?: unknown;
 	message?: { role?: string; content?: unknown };
 };
@@ -32,8 +34,11 @@ function continuationCorrelation(entry: BranchEntry): string | null {
 
 /** Match only service records backed by this extension's durable operation metadata. */
 export function isNativeCompactionMessage(entry: BranchEntry, entries: readonly BranchEntry[]): boolean {
-	if (entry.type !== "message" || entry.message?.role !== "user") return false;
-	const id = messageText(entry.message.content).match(/^\[context-compaction-native:([0-9a-f-]{36})\] /)?.[1];
+	const isUserMessage = entry.type === "message" && entry.message?.role === "user";
+	const isHiddenCustomMessage = entry.type === "custom_message" && entry.customType === "context-compaction-native";
+	if (!isUserMessage && !isHiddenCustomMessage) return false;
+	const content = isUserMessage ? entry.message?.content : entry.content;
+	const id = messageText(content).match(/^\[context-compaction-native:([0-9a-f-]{36})\] /)?.[1];
 	return !!id && entries.some((candidate) => candidate.type === "custom" && candidate.customType === "context-compaction-native" && (candidate.data as { id?: unknown; phase?: unknown } | undefined)?.id === id && (candidate.data as { phase?: unknown }).phase === "queued");
 }
 
