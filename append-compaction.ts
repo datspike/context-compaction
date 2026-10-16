@@ -45,7 +45,7 @@ const WINDOW_MARGIN = 4096;
 
 type Payload = { model: string; input: unknown[]; tools?: unknown; instructions?: unknown; prompt_cache_key?: unknown };
 type Usage = NonNullable<AssistantMessage["usage"]>;
-const COMPACTION_OUTPUT_FORMAT = {
+export const COMPACTION_OUTPUT_FORMAT = {
 	type: "json_schema",
 	name: "compact_result",
 	strict: true,
@@ -187,7 +187,8 @@ function describePayloadMismatch(previous: unknown, next: unknown, source?: Pick
     return result;
 }
 
-function supported(ctx: ExtensionContext): boolean {
+/** Whether the selected model supports the append envelope and strict response format. */
+export function supported(ctx: ExtensionContext): boolean {
 	const compat = ctx.model?.compat;
 	return ctx.model?.api === "openai-responses" && !!compat && "supportsMidConvoSystemMessages" in compat && compat.supportsMidConvoSystemMessages === true;
 }
@@ -323,7 +324,8 @@ ${event.customInstructions ? `\nДополнительные инструкци�
 }
 
 type ParseResult = { parsed?: { history: string; prefix: string }; guard?: ValidationGuard; responseChars: number; toolBlockTypes: string[] };
-function parseResult(response: AssistantMessage, splitTurn: boolean, messages: Message[], event: SessionBeforeCompactEvent): ParseResult {
+/** Validate a compact response against its assigned source ranges and split-turn boundary. */
+export function parseResult(response: AssistantMessage, splitTurn: boolean, messages: Message[], event: SessionBeforeCompactEvent): ParseResult {
     const toolBlockTypes = response.content.filter((block) => block.type === "toolCall").map((block) => block.type);
     const responseChars = response.content.reduce((sum, block) => block.type === "text" ? sum + block.text.length : sum, 0);
     if (toolBlockTypes.length) return { guard: "tool-call", responseChars, toolBlockTypes };
@@ -344,13 +346,15 @@ function parseResult(response: AssistantMessage, splitTurn: boolean, messages: M
     return { parsed: { history, prefix }, responseChars, toolBlockTypes };
 }
 
-function cacheStatus(usage: Usage | undefined, attempted: boolean): CacheStatus {
+/** Derive cache status from observed usage, without inferring a hit from request identity. */
+export function cacheStatus(usage: Usage | undefined, attempted: boolean): CacheStatus {
     if (!attempted) return "not-attempted";
     if (!usage) return "unknown";
     if (typeof usage.cacheRead !== "number") return "unavailable";
     return usage.cacheRead > 0 ? "hit" : "miss";
 }
-function classifyRequestFailure(error: unknown, phase: RequestFailurePhase): RequestFailure {
+/** Classify a provider failure without retaining raw errors, prompts or payloads. */
+export function classifyRequestFailure(error: unknown, phase: RequestFailurePhase): RequestFailure {
     const text = error instanceof Error ? `${error.name} ${error.message}`.toLowerCase() : typeof error === "string" ? error.toLowerCase() : error && typeof error === "object" && typeof (error as { errorMessage?: unknown }).errorMessage === "string" ? (error as { errorMessage: string }).errorMessage.toLowerCase() : "";
     const failureClass: RequestFailureClass = /timeout|timed out|deadline/.test(text) ? "timeout" : /payload_mismatch/.test(text) ? "payload-hook" : /401|403|429|provider|rate limit|response\.error/.test(text) ? "provider-error" : /network|fetch|socket|stream|econn|connection/.test(text) ? "transport" : "unknown";
     return { class: failureClass, phase, hasUsage: false };
@@ -468,14 +472,19 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
             const reason = "invalid-result" as const;
             return { kind: "cancel", reason, usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
         }
-        const body = `${result.parsed.history}${result.parsed.prefix ? `\n\n${SPLIT_TURN_HEADER}\n${result.parsed.prefix}` : ""}`;
-        const files = collectFileLists(event.preparation.fileOps, event.branchEntries);
-        return { kind: "success", ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics(), compaction: {
-            summary: `${body}${formatFileHints(files, [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages], body)}`,
-            firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, usage: totalUsage ?? response.usage, details: files,
-        } };
+        return { kind: "success", ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics(), compaction: buildAppendCompaction(result.parsed, event, totalUsage ?? response.usage) };
     } catch {
         if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
         return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "request-failed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
     }
+}
+
+/** Build the shared compact result after response validation; the raw retained tail stays untouched. */
+export function buildAppendCompaction(parsed: { history: string; prefix: string }, event: SessionBeforeCompactEvent, usage: Usage): Extract<AppendOutcome, { kind: "success" }>["compaction"] {
+	const body = `${parsed.history}${parsed.prefix ? `\n\n${SPLIT_TURN_HEADER}\n${parsed.prefix}` : ""}`;
+	const files = collectFileLists(event.preparation.fileOps, event.branchEntries);
+	return {
+		summary: body + formatFileHints(files, [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages], body),
+		firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, usage, details: files,
+	};
 }

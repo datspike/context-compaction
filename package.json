@@ -18,6 +18,7 @@
     "session-state.ts",
     "summary.ts",
     "append-compaction.ts",
+    "native-append.ts",
     "file-hints.ts",
     "README.md",
     "docs/workflows.md",

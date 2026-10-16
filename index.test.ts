@@ -135,7 +135,9 @@ describe("public compaction lifecycle", () => {
 		runtime.ctx.modelRegistry.complete = () => { customCalls++; throw new Error("Custom summarizer must not run in English mode"); };
 		runtime.ctx.modelRegistry.streamSimple = () => { customCalls++; throw new Error("Append summarizer must not run in English mode"); };
 		expect(runtime.hasEvent("session_before_tree")).toBe(false);
-		expect(runtime.hasEvent("context_with_system")).toBe(false);
+		const ordinaryMessages = [{ role: "user", content: "Continue the work", timestamp: 1 }];
+		expect(await runtime.event("context_with_system", { messages: ordinaryMessages })).toBeUndefined();
+		expect(ordinaryMessages[0].content).toBe("Continue the work");
 		expect(runtime.hasEvent("before_provider_request")).toBe(false);
 		const callback = await startManual(runtime);
 		expect(callback.customInstructions).toContain("## Main objective");
@@ -209,7 +211,7 @@ test("writes a durable compact card after session_compact and never before it", 
 	expect(runtime.notices.filter((notice) => notice.text.includes("append compact"))).toHaveLength(0);
 });
 
-test("does not claim append success before Pi confirms session_compact", async () => {
+test("does not reuse a legacy snapshot when the guarded native provider is unavailable", async () => {
     const branch = [{ id: "a", type: "message", message: { role: "user", content: "Начать работу" } }, { id: "b", type: "message", message: { role: "assistant", content: "Проверка выполнена." } }, { id: "c", type: "message", message: { role: "user", content: "Новый хвост." } }];
     const runtime = setup({ language: "ru", appendCompaction: true, branch });
     const user = branch[0].message, progress = branch[1].message, tail = branch[2].message;
@@ -221,7 +223,7 @@ test("does not claim append success before Pi confirms session_compact", async (
     await runtime.event("session_before_compact", { reason: "threshold", signal: new AbortController().signal, branchEntries: runtime.getBranch(), preparation, willRetry: false });
     expect(runtime.audits.filter((entry) => entry.type === "context-compaction-append" && entry.data.outcome === "success")).toHaveLength(0);
     await runtime.event("session_compact_failed", { reason: "threshold", willRetry: false, preparation });
-    expect(runtime.audits.find((entry) => entry.type === "context-compaction-append")?.data).toMatchObject({ outcome: "unknown", reason: "apply-failed", cacheStatus: "hit" });
+    expect(runtime.audits.find((entry) => entry.type === "context-compaction-append")?.data).toMatchObject({ outcome: "fallback", reason: "unsupported", cacheStatus: "not-attempted" });
 });
 
 describe("session-local context modes", () => {

@@ -30,9 +30,17 @@ function continuationCorrelation(entry: BranchEntry): string | null {
 	return match?.[1] ?? null;
 }
 
+/** Match only service records backed by this extension's durable operation metadata. */
+export function isNativeCompactionMessage(entry: BranchEntry, entries: readonly BranchEntry[]): boolean {
+	if (entry.type !== "message" || entry.message?.role !== "user") return false;
+	const id = messageText(entry.message.content).match(/^\[context-compaction-native:([0-9a-f-]{36})\] /)?.[1];
+	return !!id && entries.some((candidate) => candidate.type === "custom" && candidate.customType === "context-compaction-native" && (candidate.data as { id?: unknown; phase?: unknown } | undefined)?.id === id && (candidate.data as { phase?: unknown }).phase === "queued");
+}
+
 /** Отличает followUp этого расширения от настоящего user input по durable send audit. */
 export function isHumanUserMessage(entry: BranchEntry, entries: readonly BranchEntry[]): boolean {
 	if (entry.type !== "message" || entry.message?.role !== "user") return false;
+	if (isNativeCompactionMessage(entry, entries)) return false;
 	const correlation = continuationCorrelation(entry);
 	if (!correlation) return true;
 	return !entries.some((candidate) => {
