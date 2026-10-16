@@ -1,4 +1,5 @@
 import { MAX_COMPACT_PAYLOAD_CHARS } from "./compact-budget.js";
+import { APPEND_CANDIDATE_START, APPEND_TURN_SEPARATOR } from "./append-compaction.js";
 import { NativeAppend } from "./native-append.js";
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -47,15 +48,15 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 			void (async () => {
 				let final: any;
 				await convertResponses(model, context, { ...options, apiKey: "offline-fixture", transport: "sse", maxRetries: 0,
-					onPayload: async (payload) => { final = (await options?.onPayload?.(payload, model)) ?? payload; if (nativeFailure === "cancel-standard" && ordinaryResponses === 1 && final?.text?.format?.name !== "compact_result") void session.abort(); throw new Error("SYNTHETIC_PROVIDER_CAPTURE"); },
+					onPayload: async (payload) => { final = (await options?.onPayload?.(payload, model)) ?? payload; if (nativeFailure === "cancel-standard" && ordinaryResponses === 1 && !isNative(final)) void session.abort(); throw new Error("SYNTHETIC_PROVIDER_CAPTURE"); },
 					fetch: async () => { networkCalls++; throw new Error("NETWORK_FORBIDDEN"); },
 				}).result();
 				if (final && !options?.signal?.aborted) payloads.push(final);
-				const native = final?.text?.format?.name === "compact_result";
+				const native = isNative(final);
 				const task = (final?.input?.findLast((item: any) => item.role === "user")?.content ?? []).map((part: any) => part.text ?? "").join("\n");
 				const split = native && !task.includes("РАННЯЯ ЧАСТЬ ХОДА: (нет сообщений)");
 				const prefixSummary = "## Исходный запрос\n" + lastUserPrompt + "\n## Прогресс на текущий момент\nПроверка запланирована.\n## Контекст для продолжения\nНе считать импорт завершённым.";
-				const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, stopReason: "stop", usage, timestamp: Date.now(), content: [{ type: "text", text: native ? JSON.stringify({ history, turnPrefix: split ? prefixSummary : "" }) : task.includes("Это ранняя часть пользовательского хода, а его недавняя часть сохранена отдельно.") ? prefixSummary : history }] };
+				const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, stopReason: "stop", usage, timestamp: Date.now(), content: [{ type: "text", text: native ? reply(history, split ? prefixSummary : "") : task.includes("Это ранняя часть пользовательского хода, а его недавняя часть сохранена отдельно.") ? prefixSummary : history }] };
 				if (!native && final) {
 					ordinaryResponses++;
 					if (ordinaryResponses === 1 && scenario === "threshold") message.usage = { ...usage, input: 70_050, totalTokens: 70_060 };
@@ -64,7 +65,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 				}
 				if (native && providerError) { message.content = []; message.stopReason = "error"; message.errorMessage = nativeFailure === "transport-error" ? "OpenAI Responses stream ended before a terminal response event" : "SYNTHETIC_PROVIDER_ERROR"; if (nativeFailure === "transport-error") message.usage = { ...usage, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 }; }
 				if (native && (scenario === "invalid-json" || nativeFailure === "invalid-json" || nativeFailure === "cancel-standard" || nativeFailure === "apply-rejected")) message.content[0].text = "{broken";
-				if (native && (scenario === "tail-leak" || nativeFailure === "tail-leak")) message.content[0].text = JSON.stringify({ history: "## Цель\nСвежий код TAIL_73918.", turnPrefix: "" });
+				if (native && (scenario === "tail-leak" || nativeFailure === "tail-leak")) message.content[0].text = reply("## Цель\nСвежий код TAIL_73918.", "");
 				if (native && (scenario === "tool-calls" || nativeFailure === "tool-calls")) { message.content = [{ type: "toolCall", id: "first", name: "read", arguments: { path: "/dev/null" } }, { type: "toolCall", id: "second", name: "read", arguments: { path: "/dev/null" } }]; message.stopReason = "toolUse"; }
 				if ((native && scenario === "aborted") || options?.signal?.aborted || !final) { message.content = []; message.stopReason = "aborted"; }
 				if (message.stopReason === "aborted") events.push({ type: "error", reason: "aborted", error: message });
@@ -126,12 +127,12 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 		...(scenario === "late-context" ? [(pi: any) => pi.on("context_with_system", (event: any) => ({ messages: event.messages.map((message: any) => message.role === "user" && JSON.stringify(message.content).includes("Решение пользователя:") ? { ...message, content: "Подменённая история" } : message) }))] : []),
 		...(scenario === "late-envelope" ? [(pi: any) => pi.on("context_with_system", (event: any) => ({ messages: event.messages.map((message: any) => message.role === "system" ? { ...message, content: message.content + "\\nCURRENT_LATE_ENVELOPE" } : message) }))] : []),
 		...((scenario === "apply-rejected" || nativeFailure === "apply-rejected" || nativeFailure === "drop-native" || nativeFailure === "mutate-native" || nativeFailure === "mutate-tail") ? [(pi: any) => pi.on("turn_end", (event: any) => ({ entries: (nativeFailure === "mutate-native" || nativeFailure === "mutate-tail") ? event.entries.map((draft: any) => draft.type === "compaction" ? { ...draft, ...(nativeFailure === "mutate-tail" ? { firstKeptEntryId: manager.getBranch().find((e: any) => e.type === "message" && e.message.role === "user")!.id } : { summary: draft.summary + "\nUNEXPECTED_BOUNDARY_CHANGE" }) } : draft) : event.entries.filter((draft: any) => draft.type !== "compaction") }))] : []),
-		...(scenario === "late-effort" ? [(pi: any) => pi.on("before_provider_request", (event: any) => event.payload.text?.format?.name === "compact_result" ? { ...event.payload, input: [...event.payload.input.slice(0, -1), { type: "configuration_update", reasoning: { effort: "high" } }] } : undefined)] : []),
+		...(scenario === "late-effort" ? [(pi: any) => pi.on("before_provider_request", (event: any) => isNative(event.payload) ? { ...event.payload, input: [...event.payload.input.slice(0, -1), { type: "configuration_update", reasoning: { effort: "high" } }] } : undefined)] : []),
 		...(scenario === "late-tools" ? [(pi: any) => pi.on("before_provider_request", (event: any) => ({ ...event.payload, tools: [...(event.payload.tools ?? []), { type: "web_search", external_web_access: true }] }))] : []),
 		...(scenario === "late-include" ? [(pi: any) => pi.on("before_provider_request", (event: any) => ({ ...event.payload, include: [...(event.payload.include ?? []), "web_search_call.action.sources"] }))] : []),
 		...(scenario === "late-mutator" ? [(pi: any) => { pi.on("before_provider_request", (event: any) => ({ ...event.payload, tool_choice: "auto" })); }] : []),
 		...(budgetCase === "late-serialized" ? [(pi: any) => pi.on("before_provider_request", (event: any) => { const payload = { ...event.payload, tools: [...(event.payload.tools ?? []), { type: "function", name: "large_declaration", description: "x".repeat(MAX_COMPACT_PAYLOAD_CHARS), parameters: { type: "object", properties: {} } }] }; latePayloadChars = JSON.stringify(payload).length; return payload; })] : []),
-		...(scenario === "provider-hook-throw" ? [(pi: any) => pi.on("before_provider_request", (event: any) => { if (event.payload.text?.format?.name === "compact_result") throw new Error("SYNTHETIC_BEFORE_PROVIDER_FAILURE"); })] : []),
+		...(scenario === "provider-hook-throw" ? [(pi: any) => pi.on("before_provider_request", (event: any) => { if (isNative(event.payload)) throw new Error("SYNTHETIC_BEFORE_PROVIDER_FAILURE"); })] : []),
 	] });
 	await loader.reload(); expect(loader.getExtensions().errors).toEqual([]);
 	const { session } = await createAgentSession({ cwd: root, agentDir: profile, modelRuntime: runtime, model, thinkingLevel: "medium", settingsManager: settings, sessionManager: manager, resourceLoader: loader, tools: scenario === "checkpoint" ? ["read", "checkpoint_compact_continue"] : ["read"], customTools: [{ name: "read", label: "read", description: "Read synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } as any, execute: async () => { toolExecutions++; return { content: [{ type: "text", text: "fixture" }], details: {} }; } }] });
@@ -201,7 +202,7 @@ for (const scenario of ["invalid-json", "tail-leak", "tool-calls", "aborted", "l
 		expect(JSON.stringify(fixture.manager.getEntry(fixture.tailId))).toBe(fixture.oldTail);
 		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).not.toContain("[context-compaction-native:");
 		if (scenario === "aborted" || scenario === "model-switch") expect(fixture.manager.getBranch().some((e) => e.type === "compaction")).toBe(false);
-		if (scenario === "late-mutator" || scenario === "late-context") expect(fixture.payloads.some((payload) => payload.text?.format?.name === "compact_result")).toBe(false);
+		if (scenario === "late-mutator" || scenario === "late-context") expect(fixture.payloads.some((payload) => isNative(payload))).toBe(false);
 	} finally { await fixture.close(); }
 });
 
@@ -211,7 +212,7 @@ for (const scenario of ["checkpoint", "threshold", "overflow"] as const) test(`n
 		await fixture.session.prompt(scenario === "checkpoint" ? "Сохрани checkpoint и продолжи проверку импорта." : "Продолжи исходную работу; контрольный запрос.");
 		await until(() => fixture.audits().some((audit: any) => audit.outcome === "success" && audit.native) && fixture.session.isIdle, `native ${scenario} success`);
 		if (scenario === "checkpoint") await until(() => fixture.payloads.length >= 3 && fixture.session.isIdle, "checkpoint continuation");
-		expect(fixture.payloads.filter((p) => p.text?.format?.name === "compact_result")).toHaveLength(1);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
 		expect(fixture.payloads).toHaveLength(scenario === "threshold" ? 2 : 3);
 		expect(fixture.stats.toolExecutions).toBe(0);
 		expect(fixture.stats.networkCalls).toBe(0);
@@ -225,7 +226,7 @@ for (const scenario of ["checkpoint", "threshold", "overflow"] as const) test(`n
 			expect(phases).not.toContain("error");
 		}
 	} catch (error) {
-		console.error("ENTRY_DIAGNOSTIC", JSON.stringify({ scenario, tools: fixture.session.getActiveToolNames(), audits: fixture.audits(), stats: fixture.stats, payloads: fixture.payloads.map((p) => ({ native: p.text?.format?.name, tools: p.tools?.map((t: any) => t.name), last: JSON.stringify(p.input.at(-1)).slice(0, 160) })), entries: fixture.manager.getBranch().map((e: any) => ({ type: e.type, role: e.message?.role, data: e.type === "custom" ? e.data : undefined, text: e.message ? JSON.stringify(e.message.content).slice(0, 100) : undefined })) }));
+		console.error("ENTRY_DIAGNOSTIC", JSON.stringify({ scenario, tools: fixture.session.getActiveToolNames(), audits: fixture.audits(), stats: fixture.stats, payloads: fixture.payloads.map((p) => ({ native: isNative(p), tools: p.tools?.map((t: any) => t.name), last: JSON.stringify(p.input.at(-1)).slice(0, 160) })), entries: fixture.manager.getBranch().map((e: any) => ({ type: e.type, role: e.message?.role, data: e.type === "custom" ? e.data : undefined, text: e.message ? JSON.stringify(e.message.content).slice(0, 100) : undefined })) }));
 		throw error;
 	} finally { await fixture.close(); }
 }, 10_000);
@@ -244,6 +245,8 @@ for (const entry of ["manual", "checkpoint", "threshold", "overflow"] as const) 
 	} finally { await fixture.close(); }
 });
 
+const isNative = (payload: any): boolean => JSON.stringify(payload?.input ?? []).includes(APPEND_CANDIDATE_START);
+const reply = (history: string, prefix = ""): string => prefix ? `${history}\n${APPEND_TURN_SEPARATOR}\n${prefix}` : history;
 test("an interrupted service turn is excluded before the next normal request and cleaned append-only", async () => {
 	const fixture = await setup("orphan");
 	try {
@@ -324,7 +327,7 @@ test("new ordinary input supersedes pending compact without losing its normal re
 		try { await fixture.session.compact(); } catch (e) { expect(String(e)).toContain("cancelled"); }
 		await fixture.session.prompt("Новый обычный запрос вместо ожидающего compact.");
 		expect(fixture.payloads).toHaveLength(1);
-		expect(fixture.payloads[0].text?.format?.name).not.toBe("compact_result");
+		expect(isNative(fixture.payloads[0])).toBe(false);
 		expect(fixture.manager.getBranch().some((e) => e.type === "compaction")).toBe(false);
 		expect(fixture.session.getLastAssistantText()).toContain("локальный JSON");
 		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).toContain("локальный JSON");
@@ -339,7 +342,7 @@ for (const kind of ["provider", "transport"] as const) for (const entry of ["man
 		await until(() => fixture.audits().some((a: any) => a.native && a.reason === "request-failed") && fixture.session.isIdle, `failed native settles ${kind} ${entry}`);
 		expect(fixture.manager.getBranch().some((e) => e.type === "compaction")).toBe(false);
 		expect(fixture.payloads).toHaveLength(entry === "manual" ? 1 : 2);
-		expect(fixture.payloads.filter((p) => p.text?.format?.name === "compact_result")).toHaveLength(1);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
 		const failure = fixture.audits().find((a: any) => a.native && a.reason === "request-failed");
 		expect(failure.outcome).toBe("cancel");
 		expect(failure.requestFailure).toEqual({ class: kind === "transport" ? "transport" : "provider-error", phase: "provider", hasUsage: kind === "provider" });
@@ -361,7 +364,7 @@ test("idle tree cancellation releases the scheduled native operation", async () 
 		await fixture.session.prompt("Продолжи проверку импорта после перехода ветки.");
 		await fixture.compact();
 		await until(() => fixture.audits().some((a: any) => a.native && a.outcome === "success") && fixture.session.isIdle, "append after tree cancellation");
-		expect(fixture.payloads.filter((p) => p.text?.format?.name === "compact_result")).toHaveLength(1);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
 		expect(fixture.stats.networkCalls).toBe(0);
 	} finally { await fixture.close(); }
 });
@@ -376,7 +379,7 @@ test("an unstarted service submission can be cancelled and retried without reloa
 		expect(fixture.audits().some((a: any) => a.native && a.reason === "context-changed")).toBe(true);
 		await fixture.compact();
 		await until(() => fixture.audits().some((a: any) => a.native && a.outcome === "success") && fixture.session.isIdle, "append after rejected submission");
-		expect(fixture.payloads.filter((p) => p.text?.format?.name === "compact_result")).toHaveLength(1);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
 		expect(fixture.stats.networkCalls).toBe(0);
 	} finally { await fixture.close(); }
 });
@@ -387,7 +390,7 @@ for (const failure of ["invalid-json", "tail-leak", "tool-calls"] as const) test
 		const request = "Продолжи исходный импорт ORIGINAL_OVERFLOW_491.";
 		await fixture.session.prompt(request);
 		await until(() => fixture.session.isIdle && fixture.payloads.length === 3 + fixture.stats.standardExpectedRequests, `overflow fallback continuation ${failure}`);
-		expect(fixture.payloads.filter((p) => p.text?.format?.name === "compact_result")).toHaveLength(1);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
 		expect(JSON.stringify(fixture.payloads.at(-1).input)).toContain(request);
 		// A split request lives in the typed prefix summary, not a retained raw user message.
 		expect(fixture.manager.buildSessionProjection().messages.filter((m: any) => (m.role === "user" || m.role === "compactionSummary") && JSON.stringify(m).includes(request))).toHaveLength(1);
@@ -431,7 +434,7 @@ test("native compact preserves the SDK trailing effort update", async () => {
 	try {
 		await fixture.compact();
 		expect(fixture.audits().some((a: any) => a.native && a.outcome === "success")).toBe(true);
-		const payload = fixture.payloads.find((p) => p.text?.format?.name === "compact_result");
+		const payload = fixture.payloads.find((p) => isNative(p));
 		expect(payload.input.at(-1)).toEqual({ type: "configuration_update", reasoning: { effort: "medium" } });
 		expect(payload.input.at(-2).role).toBe("user");
 		expect(payload.tool_choice).toBe("none");
@@ -447,7 +450,7 @@ for (const scenario of ["unexpected-tail", "duplicate-effort"] as const) test(`n
 	try {
 		await fixture.compact();
 		expect(fixture.audits().some((a: any) => a.reason === "payload-mismatch")).toBe(true);
-		expect(fixture.payloads.filter((p) => p.text?.format?.name === "compact_result")).toHaveLength(0);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(0);
 		expect(fixture.stats.networkCalls).toBe(0);
 	} finally { await fixture.close(); }
 });
@@ -457,7 +460,7 @@ test("late changes to the SDK effort control are rejected before sending", async
 	try {
 		await fixture.compact();
 		expect(fixture.audits().some((a: any) => a.reason === "payload-mismatch")).toBe(true);
-		expect(fixture.payloads.filter((p) => p.text?.format?.name === "compact_result")).toHaveLength(0);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(0);
 		expect(fixture.stats.networkCalls).toBe(0);
 	} finally { await fixture.close(); }
 });
@@ -466,7 +469,7 @@ for (const budgetCase of ["large", "wrong-route", "small", "opaque"] as const) t
 	const fixture = await setup("success", undefined, budgetCase);
 	try {
 		await fixture.compact();
-		const native = fixture.payloads.filter(p => p.text?.format?.name === "compact_result");
+		const native = fixture.payloads.filter(p => isNative(p));
 		if (budgetCase === "large" || budgetCase === "opaque") {
 			expect(native).toHaveLength(1);
 			expect(fixture.audits().some((a: any) => a.native && a.outcome === "success")).toBe(true);
@@ -552,7 +555,7 @@ test("native final budget records exact late serialization refusal", async () =>
 		expect(final.serializedChars).toBe(fixture.stats.latePayloadChars);
 		expect(final.serializedChars).toBeGreaterThan(MAX_COMPACT_PAYLOAD_CHARS);
 		expect(fixture.audits()[0].reason).toBe("request-too-large");
-		expect(fixture.payloads.filter((p) => p.text?.format?.name === "compact_result")).toHaveLength(0);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(0);
 		expect(fixture.stats.networkCalls).toBe(0);
 	} finally { await fixture.close(); }
 });

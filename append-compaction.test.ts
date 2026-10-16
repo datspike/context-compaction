@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-responses";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { APPEND_CANDIDATE_END, APPEND_CANDIDATE_START, AppendCapture, appendCompaction, appendTask, preservesPayloadPrefix, shouldUseStandardCompactFallback } from "./append-compaction.js";
+import { APPEND_CANDIDATE_END, APPEND_TURN_SEPARATOR, APPEND_CANDIDATE_START, AppendCapture, appendCompaction, appendTask, preservesPayloadPrefix, shouldUseStandardCompactFallback } from "./append-compaction.js";
 import { loadSummarySettings } from "./language.js";
 import { SPLIT_TURN_HEADER } from "./summary.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -16,7 +16,8 @@ const model: any = {
 	compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true, supportsMaxOutputTokens: true },
 };
 const usage = { input: 20, output: 10, cacheRead: 100, cacheWrite: 0, totalTokens: 130, cost: { input: 0.01, output: 0.01, cacheRead: 0.01, cacheWrite: 0, total: 0.03 } };
-const answer = () => ({ role: "assistant", content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nСохранить замысел.\n## Следующие шаги\nПроверить без публикации.", turnPrefix: "" }) }], api: model.api, provider: model.provider, model: model.id, usage, stopReason: "stop", timestamp: 4 });
+const reply = (history: string, prefix = ""): string => prefix ? `${history}\n${APPEND_TURN_SEPARATOR}\n${prefix}` : history;
+const answer = () => ({ role: "assistant", content: [{ type: "text", text: reply("## Цель\nСохранить замысел.\n## Следующие шаги\nПроверить без публикации.", "") }], api: model.api, provider: model.provider, model: model.id, usage, stopReason: "stop", timestamp: 4 });
 
 function fixture() {
 	const request: any = { role: "user", content: "Сделай локально, не публикуй. Сохрани содержание.", timestamp: 1 };
@@ -81,7 +82,7 @@ describe("append compaction", () => {
 		expect(f.options()).toMatchObject({ transport: "sse", toolChoice: "none", cacheRetention: "short", sessionId: "fixture-session", reasoning: "medium", maxRetries: 0 });
 		expect(f.options().maxTokens).toBe(3276);
 	});
-	test("adds strict OpenAI output schema without changing the cached input prefix", async () => {
+	test("sends no output schema and keeps the cached input prefix", async () => {
 		const f = fixture(); let payload: any;
 		f.ctx.modelRegistry.streamSimple = (_model: any, context: any, opts: any) => ({ result: async () => {
 			payload = await opts.onPayload({ ...f.payload, input: [...f.payload.input, { role: "user", content: context.messages.at(-1).content }] });
@@ -89,14 +90,15 @@ describe("append compaction", () => {
 		} });
 		const result = await appendCompaction(f.event, f.ctx, f.snapshot);
 		expect(result.kind).toBe("success");
-		expect(payload.text).toEqual({ format: { type: "json_schema", name: "compact_result", strict: true, schema: { type: "object", properties: { history: { type: "string" }, turnPrefix: { type: "string" } }, required: ["history", "turnPrefix"], additionalProperties: false } } });
+		expect(payload.text).toBeUndefined();
+		expect(JSON.stringify(payload)).not.toContain("json_schema");
 		expect(preservesPayloadPrefix(f.payload, payload)).toBe(true);
 	});
-	test("repairs one malformed structured response before returning append success", async () => {
+	test("repairs one malformed response before returning append success", async () => {
 		const f = fixture(); let calls = 0;
 		f.ctx.modelRegistry.streamSimple = (_model: any, context: any, opts: any) => ({ result: async () => {
 			calls++; await opts.onPayload({ ...f.payload, input: [...f.payload.input, { role: "user", content: context.messages.at(-1).content }] });
-			return calls === 1 ? { ...answer(), content: [{ type: "text", text: "{broken" }] } : answer();
+			return calls === 1 ? { ...answer(), content: [{ type: "text", text: "сломанный ответ без заголовка" }] } : answer();
 		} });
 		const result = await appendCompaction(f.event, f.ctx, f.snapshot);
 		expect(result.kind).toBe("success");
@@ -104,14 +106,14 @@ describe("append compaction", () => {
 		if (result.kind === "success") {
 		expect(result.compaction.usage?.totalTokens).toBe(260);
 		expect(result.repairAttempts).toBe(1);
-        expect(result.appendAttempt).toMatchObject([{ attempt: 1, phase: "parse", validationGuard: "json-parse" }, { attempt: 2, phase: "apply" }]);
+        expect(result.appendAttempt).toMatchObject([{ attempt: 1, phase: "parse", validationGuard: "history-heading" }, { attempt: 2, phase: "apply" }]);
 	}
 	});
 	test("rejects structural headings hidden inside code fences", async () => {
 		const f = fixture(); let calls = 0;
 		f.ctx.modelRegistry.streamSimple = (_model: any, context: any, opts: any) => ({ result: async () => {
 			calls++; await opts.onPayload({ ...f.payload, input: [...f.payload.input, { role: "user", content: context.messages.at(-1).content }] });
-			if (calls === 1) return { ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "```markdown\\n## Цель\\nэто не заголовок\\n```", turnPrefix: "" }) }] };
+			if (calls === 1) return { ...answer(), content: [{ type: "text", text: reply("```markdown\\n## Цель\\nэто не заголовок\\n```", "") }] };
 			return answer();
 		} });
 		const result = await appendCompaction(f.event, f.ctx, f.snapshot);
@@ -246,7 +248,7 @@ describe("append compaction", () => {
 		const f = fixture();
 		f.progress.content = [{ type: "text", text: "Jobs 0133 и 0134 отправлены на проверку; завершение ещё не подтверждено." }];
 		f.tail.content = "Jobs 0133 validated: 138/138; 0134 validated: 90/90.";
-		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nJob 0133 validated: 138 segments; job 0134 validated: 90 segments.", turnPrefix: "" }) }] }) });
+		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nJob 0133 validated: 138 segments; job 0134 validated: 90 segments.", "") }] }) });
 		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "cancel", reason: "invalid-result" });
 	});
 
@@ -262,7 +264,7 @@ describe("append compaction", () => {
 		const f = fixture(); f.event.preparation.messagesToSummarize = [f.messages[1]]; f.event.preparation.turnPrefixMessages = [f.progress]; f.event.preparation.isSplitTurn = true;
 		const task = appendTask([...f.messages, f.progress, f.tail], f.event)!;
 		expect(task).toContain("Номера сообщений (с 1, включая system и toolResult): 2."); expect(task).toContain("Номера сообщений (с 1, включая system и toolResult): 3."); expect(task).not.toContain("НОВЫЙ ХВОСТ");
-		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nИстория", turnPrefix: "## Исходный запрос\nЛокальная проверка\n## Контекст для продолжения\nРабота ещё не завершена." }) }] }) });
+		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nИстория", "## Исходный запрос\nЛокальная проверка\n## Контекст для продолжения\nРабота ещё не завершена.") }] }) });
 		const result = await appendCompaction(f.event, f.ctx, f.snapshot); expect(result.kind).toBe("success");
 		if (result.kind === "success") { expect(result.compaction.summary).toContain(SPLIT_TURN_HEADER); expect(result.compaction.firstKeptEntryId).toBe("c"); }
 	});
@@ -275,17 +277,16 @@ describe("append compaction", () => {
 		expect(task).toContain("Номера сообщений (с 1, включая system и toolResult): 2.");
 		expect(task).toContain("Номера сообщений (с 1, включая system и toolResult): 3.");
 	});
-	test("invalid JSON, missing goal, length cutoff and missing split-turn prefix are rejected", async () => {
-		for (const response of [{ ...answer(), content: [{ type: "text", text: "not JSON" }] }, { ...answer(), stopReason: "length" }, { ...answer(), content: [{ type: "text", text: '{"history":"No goal", "turnPrefix":""}' }] }]) {
+	test("missing goal, length cutoff and missing split-turn prefix are rejected", async () => {
+		for (const response of [{ ...answer(), content: [{ type: "text", text: "ответ без заголовка" }] }, { ...answer(), stopReason: "length" }, { ...answer(), content: [{ type: "text", text: '{"history":"No goal", "turnPrefix":""}' }] }]) {
 			const f = fixture(); f.ctx.modelRegistry.streamSimple = () => ({ result: async () => response }); expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "cancel", reason: "invalid-result" });
 		}
 		const f = fixture(); f.event.preparation.isSplitTurn = true; f.event.preparation.messagesToSummarize = [f.messages[1]]; f.event.preparation.turnPrefixMessages = [f.progress]; expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "cancel", reason: "invalid-result" });
 	});
     test("records a distinct validation guard without persisting response text", async () => {
         const cases: Array<[string, any]> = [
-            ["json-parse", { ...answer(), content: [{ type: "text", text: "not JSON" }] }],
-            ["schema-shape", { ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nЕсть", extra: true }) }] }],
-            ["history-heading", { ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "Нет заголовка", turnPrefix: "" }) }] }],
+            ["format", { ...answer(), content: [{ type: "text", text: `## Цель\nА\n${APPEND_TURN_SEPARATOR}\nx\n${APPEND_TURN_SEPARATOR}\ny` }] }],
+            ["history-heading", { ...answer(), content: [{ type: "text", text: reply("Нет заголовка", "") }] }],
             ["empty-result", { ...answer(), content: [{ type: "text", text: "" }] }],
             ["tool-call", { ...answer(), content: [{ type: "toolCall", id: "tool", name: "bash", arguments: { command: "secret-command" } }] }],
             ["stop-reason", { ...answer(), stopReason: "length" }],
@@ -299,12 +300,12 @@ describe("append compaction", () => {
         }
         const split = fixture();
         split.event.preparation.isSplitTurn = true; split.event.preparation.messagesToSummarize = [split.messages[1]]; split.event.preparation.turnPrefixMessages = [split.progress];
-        split.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nЕсть", turnPrefix: "Нет заголовка" }) }] }) });
+        split.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nЕсть", "Нет заголовка") }] }) });
         expect(await appendCompaction(split.event, split.ctx, split.snapshot)).toMatchObject({ validationGuard: "turn-prefix-heading" });
         const provenance = fixture();
         provenance.progress.content = [{ type: "text", text: "Jobs 0133 отправлены на проверку; завершение не подтверждено." }];
         provenance.tail.content = "Jobs 0133 validated: 138/138.";
-        provenance.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nJob 0133 validated: 138 segments.", turnPrefix: "" }) }] }) });
+        provenance.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nJob 0133 validated: 138 segments.", "") }] }) });
         expect(await appendCompaction(provenance.event, provenance.ctx, provenance.snapshot)).toMatchObject({ validationGuard: "tail-provenance" });
     });
 

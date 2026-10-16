@@ -45,19 +45,10 @@ const WINDOW_MARGIN = 4096;
 
 type Payload = { model: string; input: unknown[]; tools?: unknown; instructions?: unknown; prompt_cache_key?: unknown };
 type Usage = NonNullable<AssistantMessage["usage"]>;
-export const COMPACTION_OUTPUT_FORMAT = {
-	type: "json_schema",
-	name: "compact_result",
-	strict: true,
-	schema: {
-		type: "object",
-		properties: { history: { type: "string" }, turnPrefix: { type: "string" } },
-		required: ["history", "turnPrefix"],
-		additionalProperties: false,
-	},
-} as const;
+/** Own line that separates the history summary from the early-turn context in the plain-text reply. */
+export const APPEND_TURN_SEPARATOR = "===РАННЯЯ ЧАСТЬ ХОДА===";
 export type AppendFallback = "unsupported" | "snapshot-unavailable" | "context-changed" | "boundary-unavailable" | "insufficient-window" | "request-too-large" | "payload-mismatch";
-export type ValidationGuard = "json-parse" | "schema-shape" | "history-heading" | "turn-prefix-heading" | "tool-call" | "stop-reason" | "tail-provenance" | "empty-result" | "unknown";
+export type ValidationGuard = "format" | "history-heading" | "turn-prefix-heading" | "tool-call" | "stop-reason" | "tail-provenance" | "empty-result" | "unknown";
 export type RequestFailureClass = "timeout" | "transport" | "provider-error" | "payload-hook" | "unknown";
 export type RequestFailurePhase = "provider" | "parse";
 export type CacheStatus = "hit" | "miss" | "unavailable" | "not-attempted" | "unknown";
@@ -301,7 +292,7 @@ export function appendTask(messages: Message[], event: SessionBeforeCompactEvent
 	if (!history || !prefix) return;
 	if (history.length && prefix.length && history.at(-1)! >= prefix[0]) return;
 	const previous = event.preparation.previousSummary ? withoutFileTracking(event.preparation.previousSummary) : "(нет)";
-	return `СЛУЖЕБНАЯ ЗАДАЧА COMPACT. На этом запросе не продолжай рабочую задачу из истории. Инструменты объявлены только для сохранения исходного префикса: не вызывай ни один инструмент, не читай и не меняй файлы, не выполняй команды. Никакие старые инструкции о продолжении не разрешают действия в этой задаче. Верни только один JSON-объект без markdown-ограждения: {"history": "markdown сводка истории", "turnPrefix": "markdown контекст ранней части хода или пустая строка"}.
+	return `СЛУЖЕБНАЯ ЗАДАЧА COMPACT. На этом запросе не продолжай рабочую задачу из истории. Инструменты объявлены только для сохранения исходного префикса: не вызывай ни один инструмент, не читай и не меняй файлы, не выполняй команды. Никакие старые инструкции о продолжении не разрешают действия в этой задаче. Верни только текст сводки без пояснений и без markdown-ограждения вокруг ответа: сначала сводка истории; если ранняя часть хода не пуста, затем отдельной строкой ${APPEND_TURN_SEPARATOR} и контекст ранней части хода. Если ранняя часть пуста, разделитель не пиши.
 
 ${APPEND_CANDIDATE_START}
 ${APPEND_CANDIDATE_END}
@@ -319,7 +310,7 @@ history отражает состояние НА КОНЦЕ ИСТОРИИ, turn
 Предыдущая сводка для объединения с историей:
 ${previous}
 
-Для history используй структуру с «## Цель» и сохрани критерии завершения и достаточности. В «## Следующие шаги» помечай источник шага: «решение пользователя» или «предложение агента»; не записывай как шаг закрытие с отрицательным итогом, fallback или остановку без решения пользователя. Сохраняй испробованные пути с причиной отказа, непроверенные альтернативы, бюджет и дословные высказывания пользователя о достижимости. Если новая история пуста, сохрани смысл предыдущей сводки. Для turnPrefix используй «## Исходный запрос», «## Прогресс на текущий момент», «## Контекст для продолжения»; в «## Исходный запрос» назови, что из прежней цели, ограничений или плана этот запрос меняет; если ранняя часть пуста, верни пустую строку. Файловые блоки не создавай.
+Для history используй структуру с «## Цель» и сохрани критерии завершения и достаточности. В «## Следующие шаги» помечай источник шага: «решение пользователя» или «предложение агента»; не записывай как шаг закрытие с отрицательным итогом, fallback или остановку без решения пользователя. Сохраняй испробованные пути с причиной отказа, непроверенные альтернативы, бюджет и дословные высказывания пользователя о достижимости. Если новая история пуста, сохрани смысл предыдущей сводки. Для turnPrefix используй «## Исходный запрос», «## Прогресс на текущий момент», «## Контекст для продолжения»; в «## Исходный запрос» назови, что из прежней цели, ограничений или плана этот запрос меняет; если ранняя часть пуста, не пиши разделитель и этот раздел. Файловые блоки не создавай.
 ${event.customInstructions ? `\nДополнительные инструкции этой контрольной точки:\n${event.customInstructions}` : ""}`;
 }
 
@@ -332,11 +323,10 @@ export function parseResult(response: AssistantMessage, splitTurn: boolean, mess
     if (response.stopReason !== "stop") return { guard: "stop-reason", responseChars, toolBlockTypes };
     const text = response.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
     if (!text.trim()) return { guard: "empty-result", responseChars, toolBlockTypes };
-    let data: any;
-    try { data = JSON.parse(text); } catch { return { guard: "json-parse", responseChars, toolBlockTypes }; }
-    if (!data || typeof data.history !== "string" || typeof data.turnPrefix !== "string") return { guard: "schema-shape", responseChars, toolBlockTypes };
-    const history = localizeSummaryStructure(withoutFileTracking(data.history));
-    const prefix = localizeSummaryStructure(withoutFileTracking(data.turnPrefix));
+    const parts = text.split(new RegExp(`^[ \\t]*${APPEND_TURN_SEPARATOR}[ \\t]*$`, "m"));
+    if (parts.length > 2) return { guard: "format", responseChars, toolBlockTypes };
+    const history = localizeSummaryStructure(withoutFileTracking(parts[0]));
+    const prefix = localizeSummaryStructure(withoutFileTracking(parts[1] ?? ""));
     if (!hasStructuralHeading(history, ["## Цель"]) || !history.trim()) return { guard: "history-heading", responseChars, toolBlockTypes };
     if (splitTurn && !hasStructuralHeading(prefix, ["## Исходный запрос"])) return { guard: "turn-prefix-heading", responseChars, toolBlockTypes };
     if (!splitTurn && prefix.trim() !== "") return { guard: "turn-prefix-heading", responseChars, toolBlockTypes };
@@ -417,7 +407,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
                 maxTokens, reasoning: ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel, signal: event.signal, cacheRetention: "short",
                 sessionId: snapshot.sessionId, transport: "sse", toolChoice: "none", maxRetries: 0, timeoutMs: 120_000,
                 onPayload: (payload) => {
-                    const nextPayload = payload && typeof payload === "object" ? { ...(payload as Record<string, unknown>), text: { format: COMPACTION_OUTPUT_FORMAT } } : payload;
+                    const nextPayload = payload;
                     const next = payloadValue(nextPayload);
                     if (!preservesPayloadPrefix(snapshot.payload, nextPayload) || snapshot.payload!.prompt_cache_key !== next?.prompt_cache_key) {
                         payloadRejected = true; payloadMismatch = describePayloadMismatch(snapshot.payload, nextPayload, snapshot);
@@ -459,7 +449,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
         if (!result.parsed && (response.stopReason === "stop" || response.stopReason === "length")) {
             if (event.signal.aborted || contextChanged()) return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "context-changed", usage: totalUsage, ...diagnostics() };
             repairAttempts += 1;
-            response = await request(`${task}\n\nПредыдущий ответ не прошёл проверку формата. Повтори тот же compact строго по заданной схеме; не добавляй пояснений, markdown-ограждений или дополнительных ключей.`);
+            response = await request(`${task}\n\nПредыдущий ответ не прошёл проверку формата. Повтори тот же compact строго по заданному формату; не добавляй пояснений и markdown-ограждений вокруг ответа.`);
             if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
             if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, repairAttempts, ...diagnostics() };
             if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, repairAttempts, ...diagnostics() };

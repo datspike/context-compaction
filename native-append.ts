@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream, type AssistantMessageEventStream, type AssistantMessage, type Message, type Provider } from "@earendil-works/pi-ai";
 import { convertToLlm, estimateTokens, type ExtensionAPI, type ExtensionContext, type MessageEndEvent, type SessionBeforeCompactEvent, type SessionBoundaryDraft, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
-import { appendTask, buildAppendCompaction, cacheStatus, classifyRequestFailure, COMPACTION_OUTPUT_FORMAT, parseResult, preservesPayloadPrefix, supported, type AppendFallback, type AppendOutcome } from "./append-compaction.js";
+import { appendTask, buildAppendCompaction, cacheStatus, classifyRequestFailure, parseResult, preservesPayloadPrefix, supported, type AppendFallback, type AppendOutcome } from "./append-compaction.js";
 
 import { isNativeCompactionMessage } from "./checkpoint.js";
 import { russianCompaction } from "./summary.js";
@@ -343,7 +343,7 @@ export class NativeAppend {
 		if (!value || !input || task?.role !== "user" || text(task) !== run.task || value.model !== run.model.id || value.prompt_cache_key !== run.sessionId) {
 			this.reject(run, "payload-mismatch", ctx, true); throw new Error("APPEND_COMPACTION_NATIVE_PAYLOAD_MISMATCH");
 		}
-		const next = { ...value, tool_choice: "none", text: { format: COMPACTION_OUTPUT_FORMAT }, max_output_tokens: run.maxTokens };
+		const next = { ...value, tool_choice: "none", max_output_tokens: run.maxTokens };
 		const budget = this.budget(run, next);
 		this.pi.appendEntry("context-compaction-budget", { version: 1, id: run.id, phase: "prepared", source: run.capability.source, inputSource: "sdk-preparation-and-visible-payload-estimate", ...budget });
 		if (!budget.allowed) {
