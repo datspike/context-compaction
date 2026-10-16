@@ -469,6 +469,8 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		pi.registerEntryRenderer<CompactCardData>(COMPACT_CARD_TYPE, (entry, options, theme) => entry.data ? renderCompactCard(entry.data, options.expanded, theme, language) : undefined);
 	}
 	pi.on("session_compact", async (event: any, ctx) => {
+		// A manual native compact is saved by Pi from the hook result; its receipts come from the native flow.
+		if (event.compactionEntry?.details?.nativeAppend) { pendingCard = undefined; await native.compacted(ctx); updateFooter(ctx); return; }
 
         const pending = pendingCard && scopeMatches(pendingCard.scope, ctx) ? pendingCard : undefined;
         pendingCard = undefined;
@@ -492,6 +494,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 	});
 	pi.on("session_compact_failed", (event: any, ctx) => {
 		if (native.handoffFailed(event, ctx)) return;
+		void native.compactFailed(ctx);
         pendingCard = undefined;
         const reason = event.reason as AuditReason;
 		const op = currentOperation(ctx);

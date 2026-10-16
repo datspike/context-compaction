@@ -64,7 +64,16 @@ interface Run {
 	responding?: boolean;
 	/** Original service response; the visible and persisted message is emptied so the summary is not shown twice. */
 	raw?: AssistantMessage;
+	/** Resolves the pending manual hook; Pi keeps its own compaction spinner until it settles. */
+	held?: (result: HookResult) => void;
+	/** The manual compaction is saved by Pi from the hook result, so verification waits for its saved entry. */
+	holding?: boolean;
+	saved?: boolean;
+	startTimer?: ReturnType<typeof setTimeout>;
 }
+/** How long a held manual compact waits for its service turn to begin before giving the session back. */
+export const nativeStartTimeout = { ms: 15_000 };
+type HookResult = { cancel: true } | { compaction: { summary: string; firstKeptEntryId: string; tokensBefore: number; usage?: unknown; details?: unknown } };
 
 function text(message: unknown): string {
 	const content = message && typeof message === "object" ? (message as { content?: unknown }).content : undefined;
@@ -247,7 +256,7 @@ export class NativeAppend {
 	}
 
 	/** Intercept prepared compaction only when the current provider can be guarded end to end. */
-	before(event: SessionBeforeCompactEvent, ctx: ExtensionContext): { cancel: true } | undefined {
+	before(event: SessionBeforeCompactEvent, ctx: ExtensionContext): { cancel: true } | Promise<HookResult> | undefined {
 		this.decline = "unsupported";
 		if (this.run?.phase === "fallback") return;
 		if (this.run) {
@@ -264,9 +273,20 @@ export class NativeAppend {
 		const id = randomUUID();
 		const run: Run = { id, service: `${SERVICE_PREFIX}${id}] Служебный запрос сводки; не выполняй рабочие действия.`, event, ctx, sessionId: ctx.sessionManager.getSessionId(), model: { provider: ctx.model!.provider, id: ctx.model!.id, baseUrl: ctx.model!.baseUrl }, capability, inputTokens: event.preparation.tokensBefore, modelMaxTokens: ctx.model!.maxTokens, fingerprint: digest(semanticBranch(ctx)), phase: "handoff", started: Date.now(), maxTokens, toolBlocks: 0, fallbackAllowed: false };
 		this.run = run;
-		run.abort = () => this.reject(run, "aborted", ctx);
+		run.abort = () => {
+			const unstarted = run.phase === "scheduled" || run.phase === "queued";
+			this.reject(run, "aborted", ctx);
+			// A held manual compact has no later turn_end to release it when the service turn never began.
+			if (unstarted && run.holding) void this.settled(ctx);
+		};
 		event.signal.addEventListener("abort", run.abort, { once: true });
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, "append compact: подготовка");
+		// A manual compact keeps Pi's own spinner and returns the result itself; cancelling would print a red error.
+		if (event.reason === "manual") {
+			run.phase = "scheduled"; run.holding = true;
+			run.timer = setTimeout(() => this.start(run, ctx), 0);
+			return new Promise<HookResult>((resolve) => { run.held = resolve; });
+		}
 		return { cancel: true };
 	}
 
@@ -285,10 +305,15 @@ export class NativeAppend {
 		if (!this.sameSession(run, ctx) || !this.sameModel(run, ctx) || digest(semanticBranch(ctx)) !== run.fingerprint || !this.registrationOwned(ctx)) {
 			this.reject(run, "context-changed", ctx); void this.settled(ctx); return;
 		}
-		if (run.event.reason === "manual" && !ctx.isIdle()) return;
+		if (run.event.reason === "manual" && !run.holding && !ctx.isIdle()) return;
 		run.phase = "queued";
 		this.pi.appendEntry("context-compaction-native", { version: 1, id: run.id, phase: "queued", sessionId: run.sessionId });
 		this.pi.sendMessage({ customType: STATUS_KEY, content: run.service, display: false }, { triggerTurn: true, deliverAs: run.event.reason === "manual" ? "followUp" : "steer" });
+		if (run.holding) run.startTimer = setTimeout(() => {
+			if (this.run !== run || run.phase !== "queued") return;
+			this.reject(run, "request-failed", ctx);
+			void this.settled(ctx);
+		}, nativeStartTimeout.ms);
 	}
 
 	/** Transform only our own service input; stale service records are never model instructions. */
@@ -435,8 +460,13 @@ export class NativeAppend {
 				run.outcome = { kind: "success", compaction: buildAppendCompaction(parsed.parsed, run.event, response.usage), cacheStatus: cacheStatus(response.usage, true), appendAttempt: [attempt] };
 				run.completion = this.completion(run);
 				run.phase = "drafted";
+				const marker = { version: 1, id: run.id, reason: run.event.reason };
+				if (run.holding) {
+					this.resolveHold(run, { compaction: { ...run.outcome.compaction, usage: response.usage, details: { ...run.outcome.compaction.details, nativeAppend: marker } } });
+					return { entries: this.cleanup(ctx, [run.serviceId!, event.messageEntryId, ...event.toolResultEntryIds]) };
+				}
 				return { entries: [
-					{ type: "compaction", summary: run.outcome.compaction.summary, firstKeptEntryId: run.outcome.compaction.firstKeptEntryId, usage: response.usage, details: { ...run.outcome.compaction.details, nativeAppend: { version: 1, id: run.id, reason: run.event.reason } } },
+					{ type: "compaction", summary: run.outcome.compaction.summary, firstKeptEntryId: run.outcome.compaction.firstKeptEntryId, usage: response.usage, details: { ...run.outcome.compaction.details, nativeAppend: marker } },
 					...this.cleanup(ctx, [run.serviceId!, event.messageEntryId, ...event.toolResultEntryIds]),
 				] };
 			}
@@ -447,13 +477,14 @@ export class NativeAppend {
 		}
 		const standard = await this.prepareStandard(ctx);
 		if (standard) return { ...standard, entries: [...standard.entries, ...this.cleanup(ctx, [event.messageEntryId, ...event.toolResultEntryIds])] };
+		this.resolveHold(run, { cancel: true });
 		return { entries: this.cleanup(ctx, [event.messageEntryId, ...event.toolResultEntryIds]) };
 	}
 
 	/** Preserve overflow recovery at a public boundary instead of creating a manual compact. */
 	private async prepareStandard(ctx: ExtensionContext): Promise<{ entries: SessionBoundaryDraft[] } | undefined> {
 		const run = this.run;
-		if (!run?.failure || !run.fallbackAllowed || !run.event.willRetry || run.phase !== "failed" || ctx.hasPendingMessages()) return;
+		if (!run?.failure || !run.fallbackAllowed || !(run.event.willRetry || run.holding) || run.phase !== "failed" || ctx.hasPendingMessages()) return;
 		if (!this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || run.signal?.aborted || run.event.signal.aborted) return;
 		const fingerprint = digest(semanticBranch(ctx));
 		run.phase = "standard";
@@ -469,13 +500,28 @@ export class NativeAppend {
 		run.outcome = { kind: "success", compaction: result.compaction, cacheStatus: cacheStatus(result.compaction.usage, true), appendAttempt: [{ attempt: 1, phase: "apply", toolBlocks: 0, toolBlockTypes: [], repairAttempts: 0 }] };
 		run.completion = this.completion(run);
 		run.phase = "drafted";
-		return { entries: [{ type: "compaction", summary: result.compaction.summary, firstKeptEntryId: result.compaction.firstKeptEntryId, usage: result.compaction.usage, details: { ...result.compaction.details, nativeAppend: { version: 1, id: run.id, reason: run.event.reason, standard: true } } }] };
+		const marker = { version: 1, id: run.id, reason: run.event.reason, standard: true };
+		if (run.holding) {
+			this.resolveHold(run, { compaction: { ...result.compaction, details: { ...result.compaction.details, nativeAppend: marker } } });
+			return { entries: [] };
+		}
+		return { entries: [{ type: "compaction", summary: result.compaction.summary, firstKeptEntryId: result.compaction.firstKeptEntryId, usage: result.compaction.usage, details: { ...result.compaction.details, nativeAppend: marker } }] };
+	}
+
+	/** The last real message before the service turn is a user request or tool result that no assistant message has answered. */
+	private awaitsAnswer(run: Run, ctx: ExtensionContext): boolean {
+		const branch = ctx.sessionManager.getBranch();
+		const serviceAt = branch.findIndex((entry) => entry.id === run.serviceId);
+		const last = (serviceAt < 0 ? branch : branch.slice(0, serviceAt)).filter((entry) => entry.type === "message").at(-1);
+		return last?.type === "message" && (last.message.role === "user" || last.message.role === "toolResult");
 	}
 
 	/** Resume only after the committed compaction survived every turn_end handler. */
 	async beforeSettle(ctx: ExtensionContext): Promise<{ continue: true } | undefined> {
 		const run = this.run;
-		if (!run?.event.willRetry || run.phase !== "drafted" || run.continuationStarted) return;
+		if (!run || run.phase !== "drafted" || run.continuationStarted) return;
+		// Threshold compaction before a request hands the turn to the service run; the interrupted user request still needs its answer.
+		if (!run.event.willRetry && !(run.event.reason === "threshold" && this.awaitsAnswer(run, ctx))) return;
 		await this.settled(ctx);
 		if (run.applied && !run.signal?.aborted && !run.event.signal.aborted && this.sameSession(run, ctx) && this.sameModel(run, ctx) && !ctx.hasPendingMessages()) return { continue: true };
 	}
@@ -488,6 +534,7 @@ export class NativeAppend {
 		if (run.phase === "handoff" || run.phase === "fallback" || run.phase === "standard") return;
 		if (!this.sameSession(run, ctx)) { this.release(run, ctx); return; }
 		if (run.phase === "drafted") {
+			if (run.holding && !run.saved) return;
 			const entry = ctx.sessionManager.getBranch().find((e) => e.type === "compaction" && (e.details as any)?.nativeAppend?.id === run.id);
 			const expected = run.outcome?.compaction;
 			const marker = (entry as any)?.details?.nativeAppend;
@@ -500,7 +547,8 @@ export class NativeAppend {
 				}
 				this.release(run, ctx);
 				await this.callbacks.applied(run.completion, ctx);
-				await this.callbacks.finished(ctx, true);
+				// A held manual compact reports completion through Pi's own callback once the compaction lock is released.
+				if (!run.holding) await this.callbacks.finished(ctx, true);
 				return;
 			}
 			run.failureReported = false;
@@ -522,8 +570,30 @@ export class NativeAppend {
 	/** Keep the original automatic trigger when a standalone fallback is requested via ctx.compact. */
 	fallbackReason(): SessionBeforeCompactEvent["reason"] | undefined { return this.fallbackScope?.reason; }
 
+	private resolveHold(run: Run, result: HookResult): void {
+		const held = run.held;
+		run.held = undefined;
+		held?.(result);
+	}
+	/** Pi saved the compaction returned from the manual hook; confirm the boundary and publish receipts. */
+	async compacted(ctx: ExtensionContext): Promise<void> {
+		const run = this.run;
+		if (!run?.holding || run.phase !== "drafted" || run.saved) return;
+		run.saved = true;
+		await this.settled(ctx);
+	}
+	/** Pi failed to save the compaction returned from the manual hook. */
+	async compactFailed(ctx: ExtensionContext): Promise<void> {
+		const run = this.run;
+		if (!run?.holding || run.phase !== "drafted" || run.saved) return;
+		run.saved = true;
+		await this.settled(ctx);
+	}
+
 	private release(run: Run, ctx: ExtensionContext): void {
+		this.resolveHold(run, { cancel: true });
 		if (run.timer) clearTimeout(run.timer);
+		if (run.startTimer) clearTimeout(run.startTimer);
 		if (run.abort) run.event.signal.removeEventListener("abort", run.abort);
 		if (this.run === run) this.run = undefined;
 		this.fallbackScope = undefined;

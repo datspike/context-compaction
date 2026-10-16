@@ -1,6 +1,6 @@
 import { MAX_COMPACT_PAYLOAD_CHARS } from "./compact-budget.js";
 import { APPEND_CANDIDATE_START, APPEND_TURN_SEPARATOR } from "./append-compaction.js";
-import { NativeAppend } from "./native-append.js";
+import { NativeAppend, nativeStartTimeout } from "./native-append.js";
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,7 +11,7 @@ import extension from "./index.js";
 
 const usage = { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 30, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const history = "## Цель\nСохранить локальный JSON ради автономной работы без сети.\n## Следующие шаги\nРешение пользователя: проверить импорт и экспорт Linux.";
-type Scenario = "success" | "split-turn" | "invalid-json" | "tail-leak" | "tool-calls" | "aborted" | "late-mutator" | "checkpoint" | "threshold" | "overflow" | "apply-rejected" | "late-context" | "late-envelope" | "model-switch" | "orphan" | "late-include" | "late-tools" | "queue-rejected" | "mid-convo-effort" | "late-effort" | "unexpected-tail" | "duplicate-effort" | "provider-hook-throw";
+type Scenario = "success" | "split-turn" | "invalid-json" | "tail-leak" | "tool-calls" | "aborted" | "late-mutator" | "checkpoint" | "threshold" | "threshold-pre" | "overflow" | "apply-rejected" | "late-context" | "late-envelope" | "model-switch" | "orphan" | "late-include" | "late-tools" | "queue-rejected" | "mid-convo-effort" | "late-effort" | "unexpected-tail" | "duplicate-effort" | "provider-hook-throw";
 
 async function until(predicate: () => boolean, description: string) {
 	const deadline = Date.now() + 4000;
@@ -91,12 +91,12 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 	});
 	const model = runtime.getModel("native-fixture", "native-model")!;
 	expect(model).toBeDefined();
-	const settings = SettingsManager.inMemory({ compaction: { enabled: scenario === "threshold" || scenario === "overflow", reserveTokens: scenario === "threshold" ? 30_000 : 4096, keepRecentTokens: 100 }, retry: { enabled: false, maxRetries: 0 }, cacheWarming: "off", transport: "sse" } as any);
+	const settings = SettingsManager.inMemory({ compaction: { enabled: scenario === "threshold" || scenario === "threshold-pre" || scenario === "overflow", reserveTokens: scenario === "threshold" || scenario === "threshold-pre" ? 30_000 : 4096, keepRecentTokens: 100 }, retry: { enabled: false, maxRetries: 0 }, cacheWarming: "off", transport: "sse" } as any);
 	const manager = SessionManager.create(root, join(root, "sessions"));
 	manager.appendMessage(createInitialSystemMessage("Follow the current service task.", [{ name: "read", description: "Read a synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }])!);
 	manager.appendMessage({ role: "user", content: "Решение пользователя: локальный JSON для автономной работы; нужен импорт и экспорт Linux. " + (budgetCase === "serialized" ? "\0".repeat(Math.ceil(MAX_COMPACT_PAYLOAD_CHARS / 6) + 4096) : "Обсуждаем варианты хранения. ".repeat(300)), timestamp: Date.now() });
 	if (scenario === "split-turn") manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "Проверка только запланирована. ".repeat(200) }], api: model.api, provider: model.provider, model: model.id, stopReason: "stop", usage, timestamp: Date.now() });
-	if (scenario !== "split-turn") manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "Локальный JSON выбран ради автономной работы." }], api: model.api, provider: model.provider, model: model.id, stopReason: "stop", usage: large ? { ...usage, input: 255_617, totalTokens: 255_627 } : usage, timestamp: Date.now() });
+	if (scenario !== "split-turn") manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "Локальный JSON выбран ради автономной работы." }], api: model.api, provider: model.provider, model: model.id, stopReason: "stop", usage: large ? { ...usage, input: 255_617, totalTokens: 255_627 } : scenario === "threshold-pre" ? { ...usage, input: 70_050, totalTokens: 70_060 } : usage, timestamp: Date.now() });
 	const tailText = "Импорт не проверен. Хвостовой маркер TAIL_73918. ".repeat(100);
 	const tailId = scenario === "split-turn" ? manager.appendMessage({ role: "assistant", content: [{ type: "text", text: tailText }], api: model.api, provider: model.provider, model: model.id, stopReason: "stop", usage, timestamp: Date.now() }) : manager.appendCustomMessageEntry("fixture-tail", tailText, false);
 	const oldTail = JSON.stringify(manager.getEntry(tailId));
@@ -213,7 +213,7 @@ for (const scenario of ["checkpoint", "threshold", "overflow"] as const) test(`n
 		await until(() => fixture.audits().some((audit: any) => audit.outcome === "success" && audit.native) && fixture.session.isIdle, `native ${scenario} success`);
 		if (scenario === "checkpoint") await until(() => fixture.payloads.length >= 3 && fixture.session.isIdle, "checkpoint continuation");
 		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
-		expect(fixture.payloads).toHaveLength(scenario === "threshold" ? 2 : 3);
+		expect(fixture.payloads).toHaveLength(scenario === "threshold" ? 2 : scenario === "checkpoint" ? 4 : 3);
 		expect(fixture.stats.toolExecutions).toBe(0);
 		expect(fixture.stats.networkCalls).toBe(0);
 		expect(JSON.stringify(fixture.manager.getEntry(fixture.tailId))).toBe(fixture.oldTail);
@@ -231,7 +231,19 @@ for (const scenario of ["checkpoint", "threshold", "overflow"] as const) test(`n
 	} finally { await fixture.close(); }
 }, 10_000);
 
-for (const entry of ["manual", "checkpoint", "threshold", "overflow"] as const) test(`native receipt and continuation require the actual saved boundary: ${entry}`, async () => {
+test("threshold compaction before a request still answers that request after the service turn", async () => {
+	const fixture = await setup("threshold-pre");
+	try {
+		await fixture.session.prompt("Продолжи исходную работу; контрольный запрос.");
+		await until(() => fixture.audits().some((audit: any) => audit.outcome === "success" && audit.native) && fixture.session.isIdle, "pre-request threshold success");
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
+		expect(fixture.payloads).toHaveLength(2);
+		expect(isNative(fixture.payloads.at(-1))).toBe(false);
+		expect(JSON.stringify(fixture.payloads.at(-1).input)).toContain("контрольный запрос");
+		expect(fixture.manager.buildSessionProjection().messages.at(-1)?.role).toBe("assistant");
+	} finally { await fixture.close(); }
+}, 10_000);
+for (const entry of ["threshold", "overflow"] as const) test(`native receipt and continuation require the actual saved boundary: ${entry}`, async () => {
 	const fixture = await setup(entry === "manual" ? "success" : entry, "drop-native");
 	try {
 		if (entry === "manual") await fixture.compact();
@@ -299,38 +311,58 @@ test("an early provider hook failure hides the native service message immediatel
 	} finally { await fixture.close(); }
 });
 
-test("a repeated manual handoff keeps one native operation and sends only one request", async () => {
+test("a manual compact completes through Pi itself instead of being cancelled", async () => {
 	const fixture = await setup();
 	try {
-		for (let i = 0; i < 2; i++) { try { await fixture.session.compact(); } catch (e) { expect(String(e)).toContain("cancelled"); } }
-		await until(() => fixture.audits().some((a: any) => a.outcome === "success"), "repeated handoff result");
-		expect(fixture.payloads).toHaveLength(1);
+		const result = await fixture.session.compact();
+		expect(result.summary).toContain("## Цель");
+		await until(() => fixture.audits().some((a: any) => a.native && a.outcome === "success") && fixture.session.isIdle, "held manual success");
 		expect(fixture.manager.getBranch().filter((e) => e.type === "compaction")).toHaveLength(1);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
+		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).not.toContain("[context-compaction-native:");
 	} finally { await fixture.close(); }
 });
 
-test("a changed session identity before queued start sends no stale request", async () => {
+test("Escape during a held manual compact cancels it without a compaction or a stale request", async () => {
 	const fixture = await setup();
 	try {
-		try { await fixture.session.compact(); } catch (e) { expect(String(e)).toContain("cancelled"); }
+		const done = fixture.session.compact().then(() => "", (e) => String(e));
+		for (let i = 0; i < 30; i++) await Promise.resolve();
+		fixture.session.abortCompaction();
+		expect(await done).toContain("cancelled");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(fixture.manager.getBranch().some((e) => e.type === "compaction")).toBe(false);
+		expect(fixture.session.isIdle).toBe(true);
+		expect(fixture.audits().some((a: any) => a.outcome === "success")).toBe(false);
+	} finally { await fixture.close(); }
+});
+
+test("a changed session identity before the service turn sends no stale request", async () => {
+	const fixture = await setup();
+	try {
+		const done = fixture.session.compact().then(() => "", (e) => String(e));
+		for (let i = 0; i < 30; i++) await Promise.resolve();
 		fixture.manager.newSession();
+		const r = await done;
+		expect(r).toContain("cancelled");
 		await new Promise((resolve) => setTimeout(resolve, 25));
 		expect(fixture.payloads).toHaveLength(0);
 		expect(fixture.manager.getBranch().some((e) => e.type === "compaction")).toBe(false);
-		expect(fixture.audits()).toHaveLength(0);
 	} finally { await fixture.close(); }
 });
 
-test("new ordinary input supersedes pending compact without losing its normal response", async () => {
+test("ordinary input and tree navigation are refused while a manual compact holds the session, and it still completes", async () => {
 	const fixture = await setup();
 	try {
-		try { await fixture.session.compact(); } catch (e) { expect(String(e)).toContain("cancelled"); }
-		await fixture.session.prompt("Новый обычный запрос вместо ожидающего compact.");
-		expect(fixture.payloads).toHaveLength(1);
-		expect(isNative(fixture.payloads[0])).toBe(false);
-		expect(fixture.manager.getBranch().some((e) => e.type === "compaction")).toBe(false);
-		expect(fixture.session.getLastAssistantText()).toContain("локальный JSON");
-		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).toContain("локальный JSON");
+		const compact = fixture.session.compact();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await expect(fixture.session.prompt("Новый обычный запрос во время compact.")).rejects.toThrow();
+		const target = fixture.manager.getBranch().find((e: any) => e.type === "message" && e.message.role === "assistant")!;
+		await expect(fixture.session.navigateTree(target.id, { summarize: false })).rejects.toThrow();
+		await compact;
+		await until(() => fixture.audits().some((a: any) => a.native && a.outcome === "success") && fixture.session.isIdle, "compact after refused input");
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
+		expect(fixture.manager.getBranch().filter((e) => e.type === "compaction")).toHaveLength(1);
 	} finally { await fixture.close(); }
 });
 
@@ -354,34 +386,18 @@ for (const kind of ["provider", "transport"] as const) for (const entry of ["man
 	} finally { await fixture.close(); }
 });
 
-test("idle tree cancellation releases the scheduled native operation", async () => {
-	const fixture = await setup();
-	try {
-		try { await fixture.session.compact(); } catch (error) { expect(String(error)).toContain("cancelled"); }
-		const target = fixture.manager.getBranch().find((e: any) => e.type === "message" && e.message.role === "assistant")!;
-		await fixture.session.navigateTree(target.id, { summarize: false });
-		expect(fixture.manager.getEntries().some((e: any) => e.type === "custom" && e.customType === "context-compaction-append" && e.data.native && e.data.reason === "context-changed")).toBe(true);
-		await fixture.session.prompt("Продолжи проверку импорта после перехода ветки.");
-		await fixture.compact();
-		await until(() => fixture.audits().some((a: any) => a.native && a.outcome === "success") && fixture.session.isIdle, "append after tree cancellation");
-		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
-		expect(fixture.stats.networkCalls).toBe(0);
-	} finally { await fixture.close(); }
-});
-
-test("an unstarted service submission can be cancelled and retried without reload", async () => {
+test("an unstarted service submission gives the session back and can be retried", async () => {
 	const fixture = await setup("queue-rejected");
+	const previous = nativeStartTimeout.ms; nativeStartTimeout.ms = 300;
 	try {
-		try { await fixture.session.compact(); } catch (error) { expect(String(error)).toContain("cancelled"); }
-		await until(() => fixture.manager.getBranch().some((e: any) => e.type === "custom" && e.customType === "context-compaction-native") && fixture.session.isIdle, "dropped service submission");
+		await expect(fixture.session.compact()).rejects.toThrow("cancelled");
 		expect(fixture.payloads).toHaveLength(0);
-		try { await fixture.session.compact(); } catch (error) { expect(String(error)).toContain("cancelled"); }
-		expect(fixture.audits().some((a: any) => a.native && a.reason === "context-changed")).toBe(true);
+		expect(fixture.audits().some((a: any) => a.native && a.reason === "request-failed")).toBe(true);
 		await fixture.compact();
 		await until(() => fixture.audits().some((a: any) => a.native && a.outcome === "success") && fixture.session.isIdle, "append after rejected submission");
 		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
 		expect(fixture.stats.networkCalls).toBe(0);
-	} finally { await fixture.close(); }
+	} finally { nativeStartTimeout.ms = previous; await fixture.close(); }
 });
 
 for (const failure of ["invalid-json", "tail-leak", "tool-calls"] as const) test(`overflow standard fallback resumes the original work once: ${failure}`, async () => {
@@ -533,7 +549,7 @@ test("native serialized rejection cannot escape through the real SDK standard fa
 	} finally { await fixture.close(); }
 });
 
-for (const mutation of ["summary", "tail"] as const) for (const entry of ["manual", "checkpoint", "threshold", "overflow"] as const) test(`mutated durable native ${mutation} cannot claim success or continue: ${entry}`, async () => {
+for (const mutation of ["summary", "tail"] as const) for (const entry of ["threshold", "overflow"] as const) test(`mutated durable native ${mutation} cannot claim success or continue: ${entry}`, async () => {
 	const fixture = await setup(entry === "manual" ? "success" : entry, mutation === "summary" ? "mutate-native" : "mutate-tail");
 	try {
 		if (entry === "manual") await fixture.compact(); else await fixture.session.prompt("Продолжи проверку импорта.");
