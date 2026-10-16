@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Message, Provider } from "@earendil-works/pi-ai";
-import { convertToLlm, estimateTokens, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionBoundaryDraft, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import { createAssistantMessageEventStream, type AssistantMessageEventStream, type AssistantMessage, type Message, type Provider } from "@earendil-works/pi-ai";
+import { convertToLlm, estimateTokens, type ExtensionAPI, type ExtensionContext, type MessageEndEvent, type SessionBeforeCompactEvent, type SessionBoundaryDraft, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { appendTask, buildAppendCompaction, cacheStatus, classifyRequestFailure, COMPACTION_OUTPUT_FORMAT, parseResult, preservesPayloadPrefix, supported, type AppendFallback, type AppendOutcome } from "./append-compaction.js";
 
 import { isNativeCompactionMessage } from "./checkpoint.js";
@@ -60,12 +60,39 @@ interface Run {
 	failureReported?: boolean;
 	applied?: boolean;
 	completion?: NativeCompletion;
+	/** True from the dispatch of our own request until its assistant message is finalized. */
+	responding?: boolean;
+	/** Original service response; the visible and persisted message is emptied so the summary is not shown twice. */
+	raw?: AssistantMessage;
 }
 
 function text(message: unknown): string {
 	const content = message && typeof message === "object" ? (message as { content?: unknown }).content : undefined;
 	if (typeof content === "string") return content;
 	return Array.isArray(content) ? content.map((p) => typeof p?.text === "string" ? p.text : "").join("\n") : "";
+}
+/** Pass only lifecycle events: the service JSON is the future summary and must not stream into the chat. */
+function withoutTextEvents(source: AssistantMessageEventStream, model: { api: string; provider: string; id: string }): AssistantMessageEventStream {
+	const out = createAssistantMessageEventStream();
+	void (async () => {
+		try {
+			let started = false;
+			for await (const event of source) {
+				if (event.type === "start") started = true;
+				else if (!started && (event.type === "done" || event.type === "error")) {
+					// Without a start event the agent loop would show the finished response as its first message.
+					out.push({ type: "start", partial: { ...(event.type === "done" ? event.message : event.error), content: [] } });
+					started = true;
+				}
+				if (!/^(text|thinking)_/.test(event.type)) out.push(event);
+			}
+		} catch (error) {
+			const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+			out.push({ type: "error", reason: "error", error: { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [], usage: zero, stopReason: "error", errorMessage: String(error), timestamp: Date.now() } as AssistantMessage });
+		}
+		out.end();
+	})();
+	return out;
 }
 function digest(value: unknown): string {
 	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -172,7 +199,8 @@ export class NativeAppend {
 				this.reject(run, "payload-mismatch", run.ctx, true);
 				throw new Error("APPEND_COMPACTION_FINAL_CONTEXT_MISMATCH");
 			}
-			return base.streamSimple({ ...model, contextWindow: run.capability.window }, context, {
+			run.responding = true;
+			return withoutTextEvents(base.streamSimple({ ...model, contextWindow: run.capability.window }, context, {
 				...options, transport: "sse", maxRetries: 0, timeoutMs: 120_000,
 				onPayload: async (payload) => {
 					const final = (await options?.onPayload?.(payload, model)) ?? payload;
@@ -191,7 +219,7 @@ export class NativeAppend {
 					run.sent = true;
 					return final;
 				},
-			});
+			}), model);
 		};
 		const proxy = new Proxy(base, { get(target, key) {
 			if (key === "streamSimple") return stream;
@@ -206,6 +234,16 @@ export class NativeAppend {
 			else if (previousConfig) registry.registerProvider(id, previousConfig);
 		} };
 		return true;
+	}
+
+	/** Take the service response out of the chat and the stored branch; parsing uses the copy kept here. */
+	messageEnd(event: MessageEndEvent): { message: AgentMessage } | undefined {
+		const run = this.run;
+		if (!run?.responding || event.message.role !== "assistant") return;
+		run.responding = false;
+		run.raw = { ...event.message, content: [...event.message.content] };
+		// Tool calls stay: the agent loop must still see and block them, and a failure must remain visible.
+		return { message: { ...event.message, content: event.message.content.filter((block) => block.type === "toolCall") } };
 	}
 
 	/** Intercept prepared compaction only when the current provider can be guarded end to end. */
@@ -376,7 +414,7 @@ export class NativeAppend {
 			return entries.length ? { entries } : undefined;
 		}
 		if (!this.sameSession(run, ctx)) return;
-		const response = event.message as AssistantMessage;
+		const response = run.raw ?? event.message as AssistantMessage;
 		const current = semanticBranch(ctx).filter((e) => e.id !== event.messageEntryId && !event.toolResultEntryIds.includes(e.id));
 		if (run.event.willRetry && (!this.sameModel(run, ctx) || digest(current) !== run.fingerprint)) { run.fallbackAllowed = false; this.reject(run, "context-changed", ctx); }
 		if (!run.failure && (!this.sameModel(run, ctx) || digest(current) !== run.fingerprint || !run.verified || !run.messages || !run.serviceId)) this.reject(run, "context-changed", ctx);

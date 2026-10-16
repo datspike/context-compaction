@@ -440,6 +440,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		if (internalModelTransition) { updateFooter(ctx); return; }
 		native.shutdown(ctx); await ensureWindow(ctx); updateFooter(ctx);
 	});
+	pi.on("message_end", (event) => native.messageEnd(event));
 	pi.on("turn_end", (event, ctx) => { updateFooter(ctx); return native.turn(event, ctx); });
 	pi.on("agent_before_settle", (_event, ctx) => native.beforeSettle(ctx));
 	pi.on("agent_settled", async (_event, ctx) => {

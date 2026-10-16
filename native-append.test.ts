@@ -69,7 +69,17 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 				if ((native && scenario === "aborted") || options?.signal?.aborted || !final) { message.content = []; message.stopReason = "aborted"; }
 				if (message.stopReason === "aborted") events.push({ type: "error", reason: "aborted", error: message });
 				else if (message.stopReason === "error") events.push({ type: "error", reason: "error", error: message });
-				else events.push({ type: "done", reason: message.stopReason, message });
+				else {
+					if (native && message.content[0]?.type === "text") {
+						// Stream the private JSON as a real provider would; the extension must keep it out of the chat.
+						const partial = { ...message, content: [] };
+						events.push({ type: "start", partial });
+						events.push({ type: "text_start", contentIndex: 0, partial: { ...message, content: [{ type: "text", text: "" }] } });
+						events.push({ type: "text_delta", contentIndex: 0, delta: message.content[0].text, partial: message });
+						events.push({ type: "text_end", contentIndex: 0, content: message.content[0].text, partial: message });
+					}
+					events.push({ type: "done", reason: message.stopReason, message });
+				}
 				events.end();
 			})().catch((error) => {
 				const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [], stopReason: "error", errorMessage: String(error), usage, timestamp: Date.now() };
@@ -158,6 +168,26 @@ for (const scenario of ["success", "split-turn", "late-envelope", "late-include"
 		const compaction: any = fixture.manager.getBranch().find((entry) => entry.type === "compaction");
 		expect(compaction.firstKeptEntryId).toBe(fixture.tailId);
 		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).not.toContain("[context-compaction-native:");
+	} finally { await fixture.close(); }
+});
+
+for (const [scenario, secret] of [["success", "Сохранить локальный JSON ради автономной работы"], ["invalid-json", "{broken"]] as const) test(`the service response text never streams into the chat or stays in the branch: ${scenario}`, async () => {
+	const fixture = await setup(scenario);
+	const events: any[] = [];
+	fixture.session.subscribe((event: any) => { if (event.type.startsWith("message_") && event.message?.role === "assistant") events.push(event); });
+	try {
+		await fixture.compact();
+		const service = events.filter((event) => event.message.api === "openai-responses");
+		expect(service.some((event) => event.type === "message_end")).toBe(true);
+		expect(service.some((event) => event.type === "message_update" && /^(text|thinking)_/.test(event.assistantMessageEvent.type))).toBe(false);
+		expect(JSON.stringify(events)).not.toContain(secret);
+		const assistants = fixture.manager.getBranch().filter((entry: any) => entry.type === "message" && entry.message.role === "assistant" && entry.message.api === "openai-responses" && entry.message.usage === usage);
+		expect(JSON.stringify(assistants)).not.toContain(secret);
+		if (scenario === "success") {
+			const compaction: any = fixture.manager.getBranch().find((entry) => entry.type === "compaction");
+			expect(compaction.summary).toContain(secret);
+			expect(JSON.stringify(fixture.manager.buildSessionProjection().messages).split(secret).length - 1).toBe(1);
+		}
 	} finally { await fixture.close(); }
 });
 
