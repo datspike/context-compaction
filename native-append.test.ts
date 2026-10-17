@@ -22,7 +22,7 @@ async function until(predicate: () => boolean, description: string) {
 }
 
 /** Real SDK and Responses conversion; all provider responses are synthetic and network is forbidden. */
-async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" | "overflow"}-provider-error` = "success", nativeFailure?: "invalid-json" | "tail-leak" | "tool-calls" | "cancel-standard" | "apply-rejected" | "transport-error" | "drop-native" | "mutate-native" | "mutate-tail", budgetCase?: "large" | "wrong-route" | "small" | "opaque" | "serialized" | "late-serialized") {
+async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" | "overflow"}-provider-error` = "success", nativeFailure?: "invalid-json" | "tail-leak" | "tool-calls" | "cancel-standard" | "apply-rejected" | "transport-error" | "drop-native" | "mutate-native" | "mutate-tail" | "missing-prefix-once", budgetCase?: "large" | "wrong-route" | "small" | "opaque" | "serialized" | "late-serialized", extras: { autoname?: boolean; ui?: boolean; abortStandard?: boolean; repairFailure?: "throw" | "cache-key" | "temperature" } = {}) {
 	const providerError = mode.endsWith("-provider-error");
 	const scenario = (providerError ? mode.replace("-provider-error", "").replace("manual", "success") : mode) as Scenario;
 	const parent = join(import.meta.dirname!, ".runtime"); mkdirSync(parent, { recursive: true });
@@ -34,7 +34,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 	let toolExecutions = 0, beforeStarts = 0, contextTransforms = 0, payloadTransforms = 0, networkCalls = 0, ordinaryResponses = 0;
 	const dispatchModels: { window: number; transport: unknown }[] = [];
 	let droppedService = false;
-	let standardFailures = 0;
+	let standardFailures = 0, compactStarts = 0, nativeResponses = 0;
 	let standardExpectedRequests = 1;
 	let latePayloadChars = 0;
 	let lastUserPrompt = "Проверить импорт.";
@@ -48,11 +48,16 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 			void (async () => {
 				let final: any;
 				await convertResponses(model, context, { ...options, apiKey: "offline-fixture", transport: "sse", maxRetries: 0,
-					onPayload: async (payload) => { final = (await options?.onPayload?.(payload, model)) ?? payload; if (nativeFailure === "cancel-standard" && ordinaryResponses === 1 && !isNative(final)) void session.abort(); throw new Error("SYNTHETIC_PROVIDER_CAPTURE"); },
+					onPayload: async (payload) => { final = (await options?.onPayload?.(extras.repairFailure && nativeResponses > 0 ? { ...payload, ...(extras.repairFailure === "cache-key" ? { prompt_cache_key: "wrong" } : extras.repairFailure === "temperature" ? { temperature: 0.9 } : {}) } : payload, model)) ?? payload; if (extras.repairFailure === "throw" && nativeResponses > 0) throw new Error("SYNTHETIC_REPAIR_TRANSPORT"); if (nativeFailure === "cancel-standard" && ordinaryResponses === 1 && !isNative(final)) void session.abort(); throw new Error("SYNTHETIC_PROVIDER_CAPTURE"); },
 					fetch: async () => { networkCalls++; throw new Error("NETWORK_FORBIDDEN"); },
 				}).result();
+				if (extras.repairFailure === "throw" && nativeResponses > 0 && isNative(final)) throw new Error("SYNTHETIC_REPAIR_TRANSPORT");
 				if (final && !options?.signal?.aborted) payloads.push(final);
 				const native = isNative(final);
+				if (native) nativeResponses++;
+				// pi-autoname renames the session while a later summary request is in flight.
+				if (!native && final && extras.abortStandard && nativeResponses > 0) session.abortCompaction();
+				if (!native && final && extras.autoname && nativeResponses > 0) { manager.appendSessionInfo("Автоимя сессии"); manager.appendCustomEntry("pi-autoname-state", { name: "Автоимя сессии" }); }
 				const task = (final?.input?.findLast((item: any) => item.role === "user")?.content ?? []).map((part: any) => part.text ?? "").join("\n");
 				const split = native && !task.includes("РАННЯЯ ЧАСТЬ ХОДА: (нет сообщений)");
 				const prefixSummary = "## Исходный запрос\n" + lastUserPrompt + "\n## Прогресс на текущий момент\nПроверка запланирована.\n## Контекст для продолжения\nНе считать импорт завершённым.";
@@ -65,6 +70,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 				}
 				if (native && providerError) { message.content = []; message.stopReason = "error"; message.errorMessage = nativeFailure === "transport-error" ? "OpenAI Responses stream ended before a terminal response event" : "SYNTHETIC_PROVIDER_ERROR"; if (nativeFailure === "transport-error") message.usage = { ...usage, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 }; }
 				if (native && (scenario === "invalid-json" || nativeFailure === "invalid-json" || nativeFailure === "cancel-standard" || nativeFailure === "apply-rejected")) message.content[0].text = "{broken";
+				if (native && nativeFailure === "missing-prefix-once" && nativeResponses === 1) message.content[0].text = reply(history, "");
 				if (native && (scenario === "tail-leak" || nativeFailure === "tail-leak")) message.content[0].text = reply("## Цель\nСвежий код TAIL_73918.", "");
 				if (native && (scenario === "tool-calls" || nativeFailure === "tool-calls")) { message.content = [{ type: "toolCall", id: "first", name: "read", arguments: { path: "/dev/null" } }, { type: "toolCall", id: "second", name: "read", arguments: { path: "/dev/null" } }]; message.stopReason = "toolUse"; }
 				if ((native && scenario === "aborted") || options?.signal?.aborted || !final) { message.content = []; message.stopReason = "aborted"; }
@@ -83,7 +89,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 				}
 				events.end();
 			})().catch((error) => {
-				const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [], stopReason: "error", errorMessage: String(error), usage, timestamp: Date.now() };
+				const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [], stopReason: "error", errorMessage: String(error), usage: { ...usage, totalTokens: 0 }, timestamp: Date.now() };
 				events.push({ type: "error", reason: "error", error: message }); events.end();
 			});
 			return events;
@@ -111,6 +117,8 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 	const loader = new DefaultResourceLoader({ cwd: root, agentDir: profile, settingsManager: settings, noContextFiles: true, noSkills: true, noPromptTemplates: true, noThemes: true, systemPrompt: "Follow the current service task.", extensionFactories: [
 		(pi) => {
 			pi.on("session_compact_failed", () => { standardFailures++; });
+			pi.on("session_before_compact", () => { compactStarts++; });
+			pi.on("turn_start", () => { ui.push("turn_start"); });
 			// SDK cut selection may split a turn; answer its distinct history and prefix requests.
 			pi.on("session_before_compact", (event) => { if (event.willRetry) standardExpectedRequests = event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0 ? Number(event.preparation.messagesToSummarize.length > 0) + 1 : 1; });
 			pi.on("before_agent_start", (event: any) => { if (event.messageType === "user" && !event.prompt.startsWith("[context-compaction-native:")) lastUserPrompt = event.prompt; beforeStarts++; event.systemPromptOptions.appendSystemPrompt = ["CURRENT_PROMPT_TRANSFORM"]; });
@@ -136,11 +144,15 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 	] });
 	await loader.reload(); expect(loader.getExtensions().errors).toEqual([]);
 	const { session } = await createAgentSession({ cwd: root, agentDir: profile, modelRuntime: runtime, model, thinkingLevel: "medium", settingsManager: settings, sessionManager: manager, resourceLoader: loader, tools: scenario === "checkpoint" ? ["read", "checkpoint_compact_continue"] : ["read"], customTools: [{ name: "read", label: "read", description: "Read synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } as any, execute: async () => { toolExecutions++; return { content: [{ type: "text", text: "fixture" }], details: {} }; } }] });
-	await session.bindExtensions({} as any);
+	const ui: string[] = [];
+	// Only the status texts are observed; every other UI method is a no-op.
+	const uiContext: any = Object.fromEntries(["addAutocompleteProvider", "confirm", "custom", "getAllThemes", "getEditorComponent", "getEditorText", "getTheme", "getToolsExpanded", "input", "onTerminalInput", "pasteToEditor", "select", "setEditorComponent", "setEditorText", "setFooter", "setHeader", "setHiddenThinkingLabel", "setTheme", "setTitle", "setToolsExpanded", "setWidget", "setWorkingIndicator", "setWorkingVisible"].map((key) => [key, () => undefined]));
+	Object.assign(uiContext, { setWorkingMessage: (message?: string) => ui.push(`working:${message ?? ""}`), setStatus: (statusKey: string, value?: string) => ui.push(`status:${statusKey}:${value ?? ""}`), notify: (message: string) => ui.push(`notify:${message}`) });
+	await session.bindExtensions(extras.ui ? { uiContext } : {} as any);
 	if (scenario === "checkpoint") session.setActiveToolsByName(["read", "checkpoint_compact_continue"]);
 	const originalFile = readFileSync(manager.getSessionFile()!);
 	const audits = () => manager.getBranch().filter((e: any) => e.type === "custom" && e.customType === "context-compaction-append").map((e: any) => e.data);
-	return { session, manager, model, runtime, tailId, oldTail, orphan, originalFile, payloads, dispatchModels, audits, get stats() { return { toolExecutions, beforeStarts, contextTransforms, payloadTransforms, networkCalls, standardFailures, standardExpectedRequests, latePayloadChars }; },
+	return { session, manager, model, runtime, tailId, oldTail, orphan, originalFile, payloads, dispatchModels, audits, ui, get stats() { return { toolExecutions, beforeStarts, contextTransforms, payloadTransforms, networkCalls, standardFailures, standardExpectedRequests, latePayloadChars, compactStarts, nativeResponses }; },
 		async compact() {
 			try { await session.compact(); } catch (error) { expect(String(error)).toContain("cancelled"); }
 			await until(() => audits().length > 0 && session.isIdle, `native result (${scenario})`);
@@ -337,6 +349,94 @@ test("Escape during a held manual compact cancels it without a compaction or a s
 	} finally { await fixture.close(); }
 });
 
+test("an invalid append result in a held manual compact completes through the standard summary in the same compact", async () => {
+	const fixture = await setup("invalid-json", undefined, undefined, { autoname: true });
+	try {
+		const result = await fixture.session.compact();
+		expect(result.summary).toContain("## Цель");
+		await until(() => fixture.session.isIdle && fixture.audits().length > 0, "held standard fallback");
+		const compactions: any[] = fixture.manager.getBranch().filter((e) => e.type === "compaction");
+		expect(compactions).toHaveLength(1);
+		expect(compactions[0].details.nativeAppend.standard).toBe(true);
+		expect(fixture.stats.compactStarts).toBe(1);
+		expect(fixture.stats.standardFailures).toBe(0);
+		// One format repair on the same cached prefix precedes the standard summary.
+		const native = fixture.payloads.filter((p) => isNative(p));
+		expect(native).toHaveLength(2);
+		expect(JSON.stringify(native[1].input.at(-1))).toContain("не прошёл проверку");
+		expect(native[1].tool_choice).toBe("none");
+		expect(fixture.manager.getBranch().some((e: any) => e.type === "custom" && e.customType === "context-compaction-standard")).toBe(false);
+		const failed: any = fixture.audits().find((a: any) => a.native && a.outcome === "cancel");
+		expect(failed.repairAttempts).toBe(1);
+		expect(failed.appendAttempt.at(-1).shape).toEqual({ separators: 0, goal: false, initialRequest: false, headings: 0 });
+		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).not.toContain("[context-compaction-native:");
+	} finally { await fixture.close(); }
+});
+
+test("Escape during the standard summary of a held manual compact cancels that compact once and starts no other", async () => {
+	const fixture = await setup("invalid-json", undefined, undefined, { abortStandard: true });
+	try {
+		expect(String(await fixture.session.compact().then(() => "", (e) => e))).toContain("cancelled");
+		await until(() => fixture.session.isIdle && fixture.audits().length > 0, "cancelled held fallback");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(fixture.manager.getBranch().some((e) => e.type === "compaction")).toBe(false);
+		expect(fixture.stats.compactStarts).toBe(1);
+		expect(fixture.stats.standardFailures).toBe(1);
+		expect(fixture.audits().some((a: any) => a.outcome === "success")).toBe(false);
+	} finally { await fixture.close(); }
+});
+
+test("the working line names the compact from the moment its service turn is queued", async () => {
+	const fixture = await setup("success", undefined, undefined, { ui: true });
+	try {
+		await fixture.session.compact();
+		await until(() => fixture.session.isIdle && fixture.audits().length > 0, "held success with UI");
+		const working = fixture.ui.indexOf("working:Compact: сжимаю контекст (append, кэш)…");
+		expect(working).toBeGreaterThan(-1);
+		expect(working).toBeLessThan(fixture.ui.indexOf("turn_start"));
+		// The service turn shows no other working text, and the default is restored when the compact ends.
+		expect(fixture.ui.filter((entry) => entry.startsWith("working:")).slice(0, -1).every((entry) => entry === "working:Compact: сжимаю контекст (append, кэш)…")).toBe(true);
+		expect(fixture.ui.filter((entry) => entry.startsWith("working:")).at(-1)).toBe("working:");
+		expect(fixture.ui.some((entry) => entry.startsWith("notify:"))).toBe(false);
+	} finally { await fixture.close(); }
+});
+
+for (const repairFailure of ["throw", "cache-key", "temperature"] as const) test(`repair failure is bounded and audited: ${repairFailure}`, async () => {
+	const fixture = await setup("split-turn", "missing-prefix-once", undefined, { repairFailure });
+	try {
+		await fixture.session.compact().catch(() => undefined);
+		await until(() => fixture.session.isIdle && fixture.audits().length > 0, "repair refusal");
+		const audit: any = fixture.audits()[0];
+		expect(audit.outcome).not.toBe("success");
+		expect(audit.repairAttempts).toBe(1);
+		expect(audit.appendAttempt).toHaveLength(2);
+		if (repairFailure === "throw") {
+			expect(audit.cacheStatus).toBe("unknown");
+			expect(fixture.stats.compactStarts).toBe(1);
+			expect(fixture.manager.getBranch().some((e) => e.type === "compaction")).toBe(false);
+		} else {
+			expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
+		}
+	} finally { await fixture.close(); }
+});
+
+test("a split-turn reply without the early-turn section is repaired once and applied as append", async () => {
+	const fixture = await setup("split-turn", "missing-prefix-once");
+	try {
+		const result = await fixture.session.compact();
+		expect(result.summary).toContain("## Исходный запрос");
+		await until(() => fixture.audits().some((a: any) => a.native && a.outcome === "success") && fixture.session.isIdle, "repaired append");
+		const success: any = fixture.audits().find((a: any) => a.native && a.outcome === "success");
+		expect(success.repairAttempts).toBe(1);
+		const card: any = fixture.manager.getBranch().findLast((e: any) => e.type === "custom" && e.customType === "context-compaction-card");
+		expect(card.data.repairAttempts).toBe(1);
+		expect(success.appendAttempt[0]).toMatchObject({ validationGuard: "turn-prefix-heading", shape: { separators: 0, goal: true, initialRequest: false } });
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(2);
+		expect(JSON.stringify(fixture.payloads.filter((p) => isNative(p))[1].input.at(-1))).toContain("===РАННЯЯ ЧАСТЬ ХОДА===");
+		expect(fixture.manager.getBranch().filter((e) => e.type === "compaction")).toHaveLength(1);
+	} finally { await fixture.close(); }
+});
+
 test("a manual compact still completes when an older standard compaction has the same summary", async () => {
 	// The summary of a compact that follows an earlier compaction differs from the first one, so learn it from a seeded run.
 	const seed = async (summary: string, verify: boolean): Promise<string> => {
@@ -432,8 +532,10 @@ for (const failure of ["invalid-json", "tail-leak", "tool-calls"] as const) test
 	try {
 		const request = "Продолжи исходный импорт ORIGINAL_OVERFLOW_491.";
 		await fixture.session.prompt(request);
-		await until(() => fixture.session.isIdle && fixture.payloads.length === 3 + fixture.stats.standardExpectedRequests, `overflow fallback continuation ${failure}`);
-		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1);
+		// A rejected text reply gets one format repair on the cached prefix; blocked tool calls do not.
+		const repairs = failure === "tool-calls" ? 0 : 1;
+		await until(() => fixture.session.isIdle && fixture.payloads.length === 3 + repairs + fixture.stats.standardExpectedRequests, `overflow fallback continuation ${failure}`);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(1 + repairs);
 		expect(JSON.stringify(fixture.payloads.at(-1).input)).toContain(request);
 		// A split request lives in the typed prefix summary, not a retained raw user message.
 		expect(fixture.manager.buildSessionProjection().messages.filter((m: any) => (m.role === "user" || m.role === "compactionSummary") && JSON.stringify(m).includes(request))).toHaveLength(1);
@@ -453,7 +555,7 @@ test("cancelling overflow standard fallback does not compact or resume", async (
 		await fixture.session.prompt("Продолжи исходную работу.");
 		await until(() => fixture.session.isIdle, "cancelled fallback settles");
 		expect(fixture.manager.getBranch().some((e) => e.type === "compaction")).toBe(false);
-		expect(fixture.payloads).toHaveLength(2);
+		expect(fixture.payloads).toHaveLength(3);
 		expect(fixture.audits().some((a: any) => a.outcome === "success")).toBe(false);
 		expect(fixture.stats.networkCalls).toBe(0);
 	} finally { await fixture.close(); }
@@ -465,7 +567,7 @@ test("rejected overflow standard boundary never resumes or claims success", asyn
 		await fixture.session.prompt("Продолжи исходную работу.");
 		await until(() => fixture.session.isIdle, "rejected fallback settles");
 		expect(fixture.manager.getBranch().some((e) => e.type === "compaction")).toBe(false);
-		expect(fixture.payloads).toHaveLength(2 + fixture.stats.standardExpectedRequests);
+		expect(fixture.payloads).toHaveLength(3 + fixture.stats.standardExpectedRequests);
 		expect(fixture.audits().some((a: any) => a.outcome === "success")).toBe(false);
 		expect(fixture.audits().some((a: any) => a.outcome === "unknown" && a.reason === "apply-failed")).toBe(true);
 		expect(fixture.stats.networkCalls).toBe(0);
@@ -561,10 +663,11 @@ test("native serialized rejection cannot escape through the real SDK standard fa
 	const fixture = await setup("success", undefined, "serialized");
 	try {
 		await fixture.compact();
-		try { await until(() => fixture.stats.standardFailures >= 2 && fixture.session.isIdle, "standard serialized refusal"); }
+		try { await until(() => fixture.stats.standardFailures >= 1 && fixture.session.isIdle && fixture.dispatchModels.length >= 2, "standard serialized refusal"); }
 		catch (error) { console.error("SERIALIZED_DIAGNOSTIC", JSON.stringify({ stats: fixture.stats, dispatches: fixture.dispatchModels, payloadCount: fixture.payloads.length, audits: fixture.audits() })); throw error; }
-		// Native handoff cancels the original compact; the rejected standard fallback cancels once more.
-		expect(fixture.stats.standardFailures).toBe(2);
+		// The held compact runs the standard summary itself, so its refusal fails that one compact.
+		expect(fixture.stats.standardFailures).toBe(1);
+		expect(fixture.stats.compactStarts).toBe(1);
 		expect(fixture.audits()[0].reason).toBe("request-too-large");
 		expect(fixture.dispatchModels).toHaveLength(2);
 		expect(fixture.payloads).toHaveLength(0);
@@ -600,5 +703,14 @@ test("native final budget records exact late serialization refusal", async () =>
 		expect(fixture.audits()[0].reason).toBe("request-too-large");
 		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(0);
 		expect(fixture.stats.networkCalls).toBe(0);
+	} finally { await fixture.close(); }
+});
+test("manual tool-call fallback keeps its actual lifecycle observable", async () => {
+	const fixture = await setup("tool-calls");
+	try {
+		await fixture.compact();
+		expect(fixture.stats.toolExecutions).toBe(0);
+		expect(fixture.manager.getBranch().filter((e) => e.type === "compaction")).toHaveLength(1);
+		expect(fixture.stats.compactStarts).toBe(2);
 	} finally { await fixture.close(); }
 });

@@ -185,6 +185,19 @@ expect(fixture.calls).toHaveLength(1);
 }
 });
 
+test("standard compact ignores session records that never reach the model", async () => {
+const fixture = guardedFixture();
+fixture.ctx.modelRegistry.complete = async (...args: any[]) => {
+fixture.calls.push(args);
+// pi-autoname renames the session while the summary request is in flight.
+fixture.branch.push({ id: "name", parentId: "root", type: "session_info" }, { id: "state", parentId: "name", type: "custom", customType: "pi-autoname-state" }, { id: "usage", parentId: "state", type: "usage" });
+return fixture.response;
+};
+const reasons: string[] = [];
+expect(await russianCompaction(fixture.event, fixture.ctx, { onFailure: (reason) => reasons.push(reason) })).toHaveProperty("compaction");
+expect(reasons).toEqual([]);
+});
+
 test("standard compact treats abort and owner loss as explicit cancellation", async () => {
 const aborted = guardedFixture();
 aborted.ctx.modelRegistry.complete = async (...args: any[]) => { aborted.calls.push(args); aborted.controller.abort(); return aborted.response; };

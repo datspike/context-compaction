@@ -348,7 +348,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 			{ type: "custom", customType: COMPACT_CARD_TYPE, data: { version: 2, kind: "standard", trigger: event.reason, tokensBefore: event.preparation.tokensBefore, summaryTokens: estimateSummaryTokens(outcome.compaction.summary), usage: outcome.compaction.usage, fallbackReason: standard.reason, appendUsage: appendUsageForAudit(standard), appendCacheStatus: standard.cacheStatus, provider: model.provider, model: model.id, durationMs } },
 		] : [
 			{ type: "custom", customType: "context-compaction-append", data: { ...appendAuditPayload(outcome, durationMs, model), native: true, correlation: id } },
-			{ type: "custom", customType: COMPACT_CARD_TYPE, data: { version: 2, kind: "append", trigger: event.reason, tokensBefore: event.preparation.tokensBefore, summaryTokens: estimateSummaryTokens(outcome.compaction.summary), usage: outcome.compaction.usage, appendUsage: outcome.compaction.usage, appendCacheStatus: outcome.cacheStatus, provider: model.provider, model: model.id, durationMs, appendDurationMs: durationMs, repairAttempts: 0 } },
+			{ type: "custom", customType: COMPACT_CARD_TYPE, data: { version: 2, kind: "append", trigger: event.reason, tokensBefore: event.preparation.tokensBefore, summaryTokens: estimateSummaryTokens(outcome.compaction.summary), usage: outcome.compaction.usage, appendUsage: outcome.compaction.usage, appendCacheStatus: outcome.cacheStatus, provider: model.provider, model: model.id, durationMs, appendDurationMs: durationMs, repairAttempts: outcome.repairAttempts ?? 0 } },
 		],
 		applied: async ({ event, outcome, standard }, ctx) => {
 			if (standard) pendingCard = undefined;

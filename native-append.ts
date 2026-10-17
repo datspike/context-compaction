@@ -2,14 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream, type AssistantMessageEventStream, type AssistantMessage, type Message, type Provider } from "@earendil-works/pi-ai";
 import { convertToLlm, estimateTokens, type ExtensionAPI, type ExtensionContext, type MessageEndEvent, type SessionBeforeCompactEvent, type SessionBoundaryDraft, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
-import { appendTask, buildAppendCompaction, cacheStatus, classifyRequestFailure, parseResult, preservesPayloadPrefix, supported, type AppendFallback, type AppendOutcome } from "./append-compaction.js";
+import { appendTask, buildAppendCompaction, cacheStatus, classifyRequestFailure, parseResult, preservesPayloadPrefix, repairInstruction, supported, type AppendAttemptReceipt, type AppendFallback, type AppendOutcome } from "./append-compaction.js";
 
 import { isNativeCompactionMessage } from "./checkpoint.js";
-import { russianCompaction } from "./summary.js";
+import { combineUsage, isContextEntry, russianCompaction } from "./summary.js";
 import { calculateCompactBudget, resolveCompactCapability, type CompactCapability, type CompactCapabilityOverride } from "./compact-budget.js";
 
 const SERVICE_PREFIX = "[context-compaction-native:";
 const STATUS_KEY = "context-compaction-native";
+const WORKING_APPEND = "Compact: сжимаю контекст (append, кэш)…";
+const WORKING_STANDARD = "Compact: append не прошёл проверку, стандартная сводка…";
 type Success = Extract<AppendOutcome, { kind: "success" }>;
 type Failure = Exclude<AppendOutcome, Success>;
 type Phase = "handoff" | "scheduled" | "queued" | "context" | "payload" | "response" | "drafted" | "failed" | "fallback" | "standard";
@@ -70,6 +72,12 @@ interface Run {
 	holding?: boolean;
 	saved?: boolean;
 	startTimer?: ReturnType<typeof setTimeout>;
+	/** The extension itself aborted the held manual compact to stop the service turn; only then a standalone fallback is still due. */
+	selfAborted?: boolean;
+	repairAttempt?: AppendAttemptReceipt;
+	repairUnknown?: boolean;
+	/** The guarded provider request of the service turn; a format repair continues it on the same cached prefix. */
+	request?: { model: Parameters<Provider["streamSimple"]>[0]; context: Parameters<Provider["streamSimple"]>[1]; options: Parameters<Provider["streamSimple"]>[2]; payload?: unknown };
 }
 /** How long a held manual compact waits for its service turn to begin before giving the session back. */
 export const nativeStartTimeout = { ms: 15_000 };
@@ -103,6 +111,21 @@ function withoutTextEvents(source: AssistantMessageEventStream, model: { api: st
 	})();
 	return out;
 }
+/** The SDK may place a reasoning-effort control after the final user message; a continuation moves it behind its new messages. */
+function withoutTrailingEffort(payload: unknown): unknown {
+	const value = payload as { input?: unknown[] } | undefined;
+	const last = Array.isArray(value?.input) ? value.input.at(-1) as { type?: unknown } | undefined : undefined;
+	return last?.type === "configuration_update" ? { ...value, input: value!.input!.slice(0, -1) } : payload;
+}
+/** Repair may append input, but must not change routing, cache identity or execution controls. */
+function sameRepairEnvelope(before: unknown, after: unknown): boolean {
+	const envelope = (value: unknown) => {
+		if (!value || typeof value !== "object") return value;
+		const { input, ...rest } = value as Record<string, unknown>;
+		return rest;
+	};
+	return digest(envelope(before)) === digest(envelope(after));
+}
 function digest(value: unknown): string {
 	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
@@ -115,7 +138,7 @@ function payloadDigest(value: unknown): string {
 	return digest(request);
 }
 function semanticBranch(ctx: ExtensionContext) {
-	return ctx.sessionManager.getBranch().filter((e) => e.type !== "custom" && e.type !== "session_info" && e.type !== "usage" && !(e.type === "custom_message" && e.customType === STATUS_KEY));
+	return ctx.sessionManager.getBranch().filter((e) => isContextEntry(e) && !(e.type === "custom_message" && e.customType === STATUS_KEY));
 }
 function isService(message: { role?: string; customType?: string; content?: unknown }, ctx: ExtensionContext): boolean {
 	const supportedRole = message.role === "user" || message.role === "custom" || (message.role === undefined && message.customType === STATUS_KEY);
@@ -152,7 +175,7 @@ export class NativeAppend {
 		return JSON.stringify([ctx.sessionManager.getSessionId(), assistant, boundary]);
 	}
 	private decline: AppendFallback = "unsupported";
-	private registration?: { registry: ExtensionContext["modelRegistry"]; id: string; proxy: Provider; restore: () => void };
+	private registration?: { registry: ExtensionContext["modelRegistry"]; id: string; base: Provider; proxy: Provider; restore: () => void };
 	private fallbackScope?: { sessionId: string; reason: SessionBeforeCompactEvent["reason"] };
 
 	constructor(private readonly pi: ExtensionAPI, private readonly callbacks: Callbacks, private readonly capabilities: readonly CompactCapabilityOverride[] = []) {}
@@ -202,8 +225,11 @@ export class NativeAppend {
 		const stream: Provider["streamSimple"] = (model, context, options) => {
 			const run = this.run;
 			const ownRequest = run && options?.sessionId === run.sessionId && run.task && text(context.messages.at(-1) ?? {}) === run.task;
+			// A rejected run leaves its raw service message in the turn; it is an instruction to this extension, never a model request.
+			if (!ownRequest && run && text(context.messages.at(-1) ?? {}).startsWith(SERVICE_PREFIX)) throw new Error("APPEND_COMPACTION_SERVICE_REQUEST_REFUSED");
 			if (!ownRequest) return base.streamSimple(model, context, options);
 			run.signal = options?.signal;
+			run.request = { model, context, options };
 			if (digest(context.messages.slice(0, -1).filter((message) => message.role !== "system")) !== digest(run.messages?.filter((message) => message.role !== "system"))) {
 				this.reject(run, "payload-mismatch", run.ctx, true);
 				throw new Error("APPEND_COMPACTION_FINAL_CONTEXT_MISMATCH");
@@ -226,6 +252,7 @@ export class NativeAppend {
 					}
 					run.verified = true;
 					run.sent = true;
+					if (run.request) run.request.payload = final;
 					return final;
 				},
 			}), model);
@@ -236,7 +263,7 @@ export class NativeAppend {
 			return typeof value === "function" ? value.bind(target) : value;
 		} });
 		registry.registerProvider(proxy);
-		this.registration = { registry, id, proxy, restore: () => {
+		this.registration = { registry, id, base, proxy, restore: () => {
 			if (registry.getRegisteredNativeProvider(id) !== proxy) return;
 			registry.unregisterProvider(id);
 			if (previousNative) registry.registerProvider(previousNative);
@@ -307,6 +334,7 @@ export class NativeAppend {
 		}
 		if (run.event.reason === "manual" && !run.holding && !ctx.isIdle()) return;
 		run.phase = "queued";
+		if (ctx.hasUI) ctx.ui.setWorkingMessage(WORKING_APPEND);
 		this.pi.appendEntry("context-compaction-native", { version: 1, id: run.id, phase: "queued", sessionId: run.sessionId });
 		this.pi.sendMessage({ customType: STATUS_KEY, content: run.service, display: false }, { triggerTurn: true, deliverAs: run.event.reason === "manual" ? "followUp" : "steer" });
 		if (run.holding) run.startTimer = setTimeout(() => {
@@ -347,7 +375,7 @@ export class NativeAppend {
 		if (!run.serviceId || !run.task) { this.reject(run, "boundary-unavailable", ctx, true); return; }
 		run.fingerprint = digest(semanticBranch(ctx));
 		run.phase = "payload";
-		if (ctx.hasUI) ctx.ui.setWorkingMessage("Append compact: создаю сводку");
+		if (ctx.hasUI) ctx.ui.setWorkingMessage(WORKING_APPEND);
 		return { messages: [...filtered.slice(0, -1), { ...last, content: [{ type: "text", text: run.task }] }] };
 	}
 
@@ -388,7 +416,8 @@ export class NativeAppend {
 		const run = this.run;
 		if (!run || run.phase === "drafted" || run.phase === "fallback") return;
 		run.toolBlocks += 1;
-		this.reject(run, "invalid-result", ctx, true);
+		// Only an abort stops the agent from answering the blocked tool results with an unguarded request.
+		this.reject(run, "invalid-result", ctx, true, true);
 		if (run.failure) {
 			run.failure.validationGuard = "tool-call";
 			const attempt = run.failure.appendAttempt.at(-1);
@@ -397,7 +426,11 @@ export class NativeAppend {
 		return { block: true, reason: "Compaction never executes tools" };
 	}
 
-	private reject(run: Run, reason: Failure["reason"], ctx: ExtensionContext, fallback = false, abortCurrent = true): void {
+	/**
+	 * Record the first failure. Pi's abort also cancels a held manual compact, so a held run that may still fall back keeps its compact alive:
+	 * the failing request ends the service turn by itself, and a raw service message never reaches the provider (see install).
+	 */
+	private reject(run: Run, reason: Failure["reason"], ctx: ExtensionContext, fallback = false, abortCurrent = !(run.holding && fallback)): void {
 		if (this.run !== run || run.phase === "drafted") return;
 		if (!run.failure) {
 			const fallbackReason = ["unsupported", "snapshot-unavailable", "boundary-unavailable", "insufficient-window", "request-too-large", "payload-mismatch"].includes(reason);
@@ -407,7 +440,7 @@ export class NativeAppend {
 		}
 		run.phase = "failed";
 		if (run.timer) clearTimeout(run.timer);
-		if (abortCurrent && !(fallback && run.event.willRetry) && this.sameSession(run, ctx) && !ctx.isIdle()) ctx.abort();
+		if (abortCurrent && !(fallback && run.event.willRetry) && this.sameSession(run, ctx) && !ctx.isIdle()) { if (run.holding) run.selfAborted = true; ctx.abort(); }
 	}
 
 	/** Hide orphaned service turns as well as the current service response, using append-only edits. */
@@ -439,41 +472,65 @@ export class NativeAppend {
 			return entries.length ? { entries } : undefined;
 		}
 		if (!this.sameSession(run, ctx)) return;
-		const response = run.raw ?? event.message as AssistantMessage;
-		const current = semanticBranch(ctx).filter((e) => e.id !== event.messageEntryId && !event.toolResultEntryIds.includes(e.id));
-		if (run.event.willRetry && (!this.sameModel(run, ctx) || digest(current) !== run.fingerprint)) { run.fallbackAllowed = false; this.reject(run, "context-changed", ctx); }
-		if (!run.failure && (!this.sameModel(run, ctx) || digest(current) !== run.fingerprint || !run.verified || !run.messages || !run.serviceId)) this.reject(run, "context-changed", ctx);
-		if (!run.failure && response.stopReason === "aborted") this.reject(run, "aborted", ctx);
+		let response = run.raw ?? event.message as AssistantMessage;
+		let usage = response.usage;
+		const changed = () => digest(semanticBranch(ctx).filter((e) => e.id !== event.messageEntryId && !event.toolResultEntryIds.includes(e.id))) !== run.fingerprint;
+		// Pi's abort also cancels the held manual compact; its service turn ends here anyway, and Escape still cancels through the compact signal.
+		const abortCurrent = !run.holding;
+		if (run.event.willRetry && (!this.sameModel(run, ctx) || changed())) { run.fallbackAllowed = false; this.reject(run, "context-changed", ctx); }
+		if (!run.failure && (!this.sameModel(run, ctx) || changed() || !run.verified || !run.messages || !run.serviceId)) this.reject(run, "context-changed", ctx, false, abortCurrent);
+		if (!run.failure && response.stopReason === "aborted") this.reject(run, "aborted", ctx, false, abortCurrent);
 		if (!run.failure && response.stopReason === "error") {
 			// An SDK error may be a lost stream, not a confirmed rejection by the provider.
-			this.reject(run, "request-failed", ctx);
+			this.reject(run, "request-failed", ctx, false, abortCurrent);
 			run.failure!.requestFailure = { ...classifyRequestFailure(response.errorMessage, "provider"), hasUsage: response.usage?.totalTokens > 0 };
 			for (const attempt of run.failure!.appendAttempt) attempt.stopReason = response.stopReason;
 		}
 		if (!run.failure) {
-			const parsed = parseResult(response, run.event.preparation.isSplitTurn && run.event.preparation.turnPrefixMessages.length > 0, run.messages!, run.event);
-			const attempt = { attempt: 1, phase: parsed.parsed ? "apply" as const : "parse" as const, stopReason: response.stopReason, toolBlocks: Math.max(run.toolBlocks, parsed.toolBlockTypes.length), toolBlockTypes: parsed.toolBlockTypes, responseChars: parsed.responseChars, repairAttempts: 0 };
-			if (!parsed.parsed) {
-				this.reject(run, "invalid-result", ctx, response.stopReason === "stop" || response.stopReason === "length");
-				run.failure = { ...run.failure!, validationGuard: parsed.guard, appendAttempt: [attempt] };
+			const splitTurn = run.event.preparation.isSplitTurn && run.event.preparation.turnPrefixMessages.length > 0;
+			let parsed = parseResult(response, splitTurn, run.messages!, run.event);
+			const receipt = (attempt: number, result: typeof parsed, message: AssistantMessage, repairs: number): AppendAttemptReceipt => ({ attempt, phase: result.parsed ? "apply" : "parse", stopReason: message.stopReason, ...(result.guard ? { validationGuard: result.guard } : {}), toolBlocks: Math.max(attempt === 1 ? run.toolBlocks : 0, result.toolBlockTypes.length), toolBlockTypes: result.toolBlockTypes, responseChars: result.responseChars, ...(!result.parsed && result.shape ? { shape: result.shape } : {}), repairAttempts: repairs });
+			const attempts = [receipt(1, parsed, response, 0)];
+			let repairAttempts = 0;
+			if (!parsed.parsed && (response.stopReason === "stop" || response.stopReason === "length") && parsed.guard !== "tool-call") {
+				const repaired = await this.repair(run, response, parsed.guard, splitTurn, ctx);
+				repairAttempts = run.repairAttempt ? 1 : 0;
+				if (repaired) {
+					repairAttempts = 1;
+					response = repaired;
+					usage = combineUsage(usage, repaired.usage);
+					parsed = parseResult(repaired, splitTurn, run.messages!, run.event);
+					attempts.push(receipt(2, parsed, repaired, 1));
+				}
+				if (!repaired && run.repairAttempt) attempts.push(run.repairAttempt);
+				if (!run.failure && (this.run !== run || !this.sameSession(run, ctx) || !this.sameModel(run, ctx) || changed())) this.reject(run, "context-changed", ctx, false, abortCurrent);
+				if (this.run !== run) return;
+			}
+			// Escape or a context change may have rejected the run while the repair was in flight.
+			const interrupted = run.failure as Failure | undefined;
+			if (interrupted) {
+				run.failure = { ...interrupted, appendAttempt: attempts, ...(repairAttempts ? { repairAttempts } : {}) };
+			} else if (!parsed.parsed) {
+				this.reject(run, "invalid-result", ctx, response.stopReason === "stop" || response.stopReason === "length", abortCurrent);
+				run.failure = { ...run.failure!, validationGuard: parsed.guard, appendAttempt: attempts, ...(repairAttempts ? { repairAttempts } : {}) };
 			} else {
-				run.outcome = { kind: "success", compaction: buildAppendCompaction(parsed.parsed, run.event, response.usage), cacheStatus: cacheStatus(response.usage, true), appendAttempt: [attempt] };
+				run.outcome = { kind: "success", compaction: buildAppendCompaction(parsed.parsed, run.event, usage), cacheStatus: cacheStatus(usage, true), appendAttempt: attempts, ...(repairAttempts ? { repairAttempts } : {}) };
 				run.completion = this.completion(run);
 				run.phase = "drafted";
 				const marker = { version: 1, id: run.id, reason: run.event.reason };
 				if (run.holding) {
-					this.resolveHold(run, { compaction: { ...run.outcome.compaction, usage: response.usage, details: { ...run.outcome.compaction.details, nativeAppend: marker } } });
+					this.resolveHold(run, { compaction: { ...run.outcome.compaction, usage, details: { ...run.outcome.compaction.details, nativeAppend: marker } } });
 					return { entries: this.cleanup(ctx, [run.serviceId!, event.messageEntryId, ...event.toolResultEntryIds]) };
 				}
 				return { entries: [
-					{ type: "compaction", summary: run.outcome.compaction.summary, firstKeptEntryId: run.outcome.compaction.firstKeptEntryId, usage: response.usage, details: { ...run.outcome.compaction.details, nativeAppend: marker } },
+					{ type: "compaction", summary: run.outcome.compaction.summary, firstKeptEntryId: run.outcome.compaction.firstKeptEntryId, usage, details: { ...run.outcome.compaction.details, nativeAppend: marker } },
 					...this.cleanup(ctx, [run.serviceId!, event.messageEntryId, ...event.toolResultEntryIds]),
 				] };
 			}
 		}
 		if (run.failure?.kind === "cancel") {
-			const usage = response.stopReason !== "aborted" && response.usage?.totalTokens > 0 ? response.usage : undefined;
-			run.failure = { ...run.failure, usage, cacheStatus: cacheStatus(usage, Boolean(run.sent)) };
+			const spent = response.stopReason !== "aborted" && usage?.totalTokens > 0 ? usage : undefined;
+			run.failure = { ...run.failure, usage: spent, cacheStatus: run.repairUnknown ? "unknown" : cacheStatus(spent, Boolean(run.sent)) };
 		}
 		const standard = await this.prepareStandard(ctx);
 		if (standard) return { ...standard, entries: [...standard.entries, ...this.cleanup(ctx, [event.messageEntryId, ...event.toolResultEntryIds])] };
@@ -484,15 +541,26 @@ export class NativeAppend {
 	/** Preserve overflow recovery at a public boundary instead of creating a manual compact. */
 	private async prepareStandard(ctx: ExtensionContext): Promise<{ entries: SessionBoundaryDraft[] } | undefined> {
 		const run = this.run;
-		if (!run?.failure || !run.fallbackAllowed || !(run.event.willRetry || run.holding) || run.phase !== "failed" || ctx.hasPendingMessages()) return;
-		if (!this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || run.signal?.aborted || run.event.signal.aborted) return;
+		// A released hold can no longer return a compaction, so a late summary would only strand the run.
+		if (!run?.failure || !run.fallbackAllowed || !(run.event.willRetry || run.holding) || (run.holding && !run.held) || run.phase !== "failed" || ctx.hasPendingMessages()) return;
+		// A held manual compact belongs to Pi's compact signal, not to the finished service turn.
+		const signal = run.holding ? run.event.signal : run.signal ?? run.event.signal;
+		if (!this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || signal.aborted || run.event.signal.aborted) return;
 		const fingerprint = digest(semanticBranch(ctx));
 		run.phase = "standard";
 		run.fallbackAllowed = false;
-		const result = await russianCompaction({ ...run.event, signal: run.signal ?? run.event.signal }, ctx, { model: this.serviceModel(ctx), capability: run.capability, isCurrent: () => this.run === run && run.phase === "standard" && this.registrationOwned(ctx) && digest(semanticBranch(ctx)) === fingerprint });
+		if (ctx.hasUI) ctx.ui.setWorkingMessage(WORKING_STANDARD);
+		const result = await russianCompaction({ ...run.event, signal }, ctx, {
+			model: this.serviceModel(ctx), capability: run.capability,
+			isCurrent: () => this.run === run && run.phase === "standard" && this.registrationOwned(ctx) && digest(semanticBranch(ctx)) === fingerprint,
+			onFailure: (reason) => {
+				this.pi.appendEntry("context-compaction-standard", { version: 1, reason });
+				if (reason !== "aborted" && ctx.hasUI) ctx.ui.notify(`Compact: ${reason}`, "warning");
+			},
+		});
 		if (this.run !== run || run.phase !== "standard") return;
 		if (!run.failureReported) { run.failureReported = true; this.callbacks.failed(run.failure, Date.now() - run.started, run.model, ctx); }
-		if (!("compaction" in result) || !this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || digest(semanticBranch(ctx)) !== fingerprint || run.signal?.aborted || run.event.signal.aborted || ctx.hasPendingMessages()) {
+		if (!("compaction" in result) || !this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || digest(semanticBranch(ctx)) !== fingerprint || signal.aborted || run.event.signal.aborted || ctx.hasPendingMessages()) {
 			run.phase = "failed";
 			return;
 		}
@@ -506,6 +574,47 @@ export class NativeAppend {
 			return { entries: [] };
 		}
 		return { entries: [{ type: "compaction", summary: result.compaction.summary, firstKeptEntryId: result.compaction.firstKeptEntryId, usage: result.compaction.usage, details: { ...result.compaction.details, nativeAppend: marker } }] };
+	}
+
+	/**
+	 * Ask once more on the same cached prefix: the rejected reply and a short correction follow the original task.
+	 * The request bypasses the agent loop, so the reply stays private; it is refused unless the original payload is its exact prefix.
+	 */
+	private async repair(run: Run, response: AssistantMessage, guard: Parameters<typeof repairInstruction>[0], splitTurn: boolean, ctx: ExtensionContext): Promise<AssistantMessage | undefined> {
+		const request = run.request, base = this.registration?.base;
+		if (!request?.payload || !base || !this.registrationOwned(ctx)) return;
+		const signal = AbortSignal.any([run.event.signal, ...(run.signal && !run.holding ? [run.signal] : [])]);
+		if (signal.aborted) return;
+		const correction: Message = { role: "user", content: repairInstruction(guard, splitTurn), timestamp: Date.now() };
+		let accepted = false;
+		run.repairAttempt = { attempt: 2, phase: "provider", toolBlocks: 0, toolBlockTypes: [], repairAttempts: 1 };
+		try {
+			const repaired = await base.streamSimple({ ...request.model, contextWindow: run.capability.window }, { ...request.context, messages: [...request.context.messages, response, correction] }, {
+				...request.options, signal, transport: "sse", maxRetries: 0, timeoutMs: 120_000,
+				onPayload: async (payload) => {
+					const final = (await request.options?.onPayload?.(payload, request.model)) ?? payload;
+					const next = final && typeof final === "object" ? { ...(final as Record<string, unknown>), tool_choice: "none", max_output_tokens: run.maxTokens } : final;
+					const budget = this.budget(run, next);
+					this.pi.appendEntry("context-compaction-budget", { version: 1, id: run.id, phase: "repair", source: run.capability.source, inputSource: "sdk-preparation-and-visible-payload-estimate", ...budget });
+					if (this.run !== run || !this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || signal.aborted || !budget.allowed || !preservesPayloadPrefix(withoutTrailingEffort(request.payload), next) || !sameRepairEnvelope(request.payload, next)) throw new Error("APPEND_COMPACTION_REPAIR_REJECTED");
+					accepted = true;
+					return next;
+				},
+			}).result();
+			run.repairAttempt.stopReason = repaired.stopReason;
+			run.repairUnknown = accepted && (repaired.stopReason === "error" || repaired.stopReason === "aborted");
+			if (!accepted || repaired.stopReason === "error" || repaired.stopReason === "aborted") {
+				this.reject(run, signal.aborted || repaired.stopReason === "aborted" ? "aborted" : "request-failed", ctx, false, false);
+				if (run.failure && accepted && repaired.stopReason === "error") run.failure.requestFailure = { ...classifyRequestFailure(repaired.errorMessage, "provider"), hasUsage: false };
+			}
+			return accepted ? repaired : undefined;
+		} catch (error) {
+			run.repairUnknown = accepted;
+			// Once dispatched, an unknown outcome cannot authorize another paid summary request.
+			this.reject(run, signal.aborted ? "aborted" : accepted ? "request-failed" : "payload-mismatch", ctx, !accepted && !signal.aborted, false);
+			if (run.failure && accepted) run.failure.requestFailure = { ...classifyRequestFailure(error, "provider"), hasUsage: false };
+			return;
+		}
 	}
 
 	/** The last real message before the service turn is a user request or tool result that no assistant message has answered. */
@@ -555,8 +664,11 @@ export class NativeAppend {
 			run.phase = "failed"; run.failure = { kind: "cancel", reason: "context-changed", cacheStatus: run.outcome?.cacheStatus ?? "unknown", usage: run.outcome?.compaction.usage, appendAttempt: run.outcome?.appendAttempt ?? [] };
 		}
 		if (!run.failure) this.reject(run, "request-failed", ctx);
+		// A held manual compact returns the standard summary from its own hook; a second compact would replace its signal and cancel it.
+		if (run.holding && run.phase === "failed" && await this.prepareStandard(ctx)) return;
+		if (this.run !== run) return;
 		if (!run.failureReported) { run.failureReported = true; this.callbacks.failed(run.failure!, Date.now() - run.started, run.model, ctx); }
-		if (run.fallbackAllowed && this.sameModel(run, ctx) && ctx.isIdle() && !ctx.hasPendingMessages()) {
+		if (run.fallbackAllowed && (!run.holding || run.selfAborted) && this.sameModel(run, ctx) && ctx.isIdle() && !ctx.hasPendingMessages()) {
 			run.phase = "fallback";
 			run.fallbackAllowed = false;
 			this.fallbackScope = { sessionId: run.sessionId, reason: run.event.reason };

@@ -227,6 +227,11 @@ function sameRoute(left: RouteIdentity | undefined, right: RouteIdentity | undef
     return left?.registry === right?.registry && left?.provider === right?.provider && sameModelIdentity(left?.model, right?.model);
 }
 
+/** Extension state, session names and usage records never reach the model, so other extensions may append them during a summary request. */
+export function isContextEntry(entry: { type?: unknown } | null | undefined): boolean {
+    return entry?.type !== "custom" && entry?.type !== "session_info" && entry?.type !== "usage";
+}
+
 function branchIdentity(ctx: ExtensionContext): string | undefined {
     const manager = ctx.sessionManager as any;
     if (!manager || typeof manager.getBranch !== "function")
@@ -234,14 +239,12 @@ function branchIdentity(ctx: ExtensionContext): string | undefined {
     const branch = manager.getBranch();
     if (!Array.isArray(branch))
         return undefined;
-    const leaf = typeof manager.getLeafId === "function" ? manager.getLeafId() : undefined;
-    const entries = branch.map((entry: any, index: number) => ({
-        index,
+    // The leaf moves with every appended record; the ordered model-visible entries identify the summarized context.
+    const entries = branch.filter(isContextEntry).map((entry: any) => ({
         id: entry?.id ?? null,
-        parentId: entry?.parentId ?? null,
         type: entry?.type ?? null,
     }));
-    return JSON.stringify({ leaf, entries });
+    return JSON.stringify(entries);
 }
 
 function sessionIdentity(ctx: ExtensionContext): SessionIdentity {
@@ -327,7 +330,7 @@ function reasonForFailure(error: unknown, ctx: ExtensionContext, guard: Compacti
     return abortError(error) ? "aborted" : "request-failed";
 }
 
-function combineUsage(first: any, second: any): any {
+export function combineUsage(first: any, second: any): any {
     if (!first)
         return second;
     if (!second)
