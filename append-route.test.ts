@@ -18,7 +18,7 @@ const kindOf = (payload: any): "append" | "work" | "standard" => {
 	return (payload?.input?.length ?? 0) <= 2 && /<conversation>|# Conversation|context summarization/.test(JSON.stringify(payload?.input?.at(-1) ?? "")) ? "standard" : "work";
 };
 
-type Options = { tui?: boolean; append?: boolean; promptCache?: Record<string, number>; unstableTools?: boolean; appendReply?: string[]; maxTokens?: number; growAppend?: boolean; failFirstWork?: boolean };
+type Options = { tui?: boolean; append?: boolean; promptCache?: Record<string, number>; unstableTools?: boolean; appendReply?: string[]; maxTokens?: number; growAppend?: boolean; failFirstWork?: boolean; thresholdInTurn?: boolean };
 
 /** Real SDK and Responses conversion; every provider response is synthetic and the network is forbidden. */
 async function setup(options: Options = {}) {
@@ -47,6 +47,13 @@ async function setup(options: Options = {}) {
 				const text = kind === "append" ? options.appendReply?.[appendReplies++] ?? (split ? `${history}\n${APPEND_TURN_SEPARATOR}\n${prefix}` : history) : kind === "standard" ? `${history}\n${prefix}` : "Импорт проверен, продолжаю.";
 				// A transient provider failure after the payload was sent; Pi retries the same context.
 				const transient = kind === "work" && options.failFirstWork && works++ === 0;
+				// The first two working replies call a tool, so Pi compacts by threshold inside the turn and continues it right away.
+				const toolTurn = kind === "work" && options.thresholdInTurn && works++ < 2;
+				if (toolTurn) {
+					const call: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, stopReason: "toolUse", usage, timestamp: Date.now(), content: [{ type: "toolCall", id: `call-${works}`, name: "read", arguments: { path: "a.txt" } }] };
+					events.push({ type: "start", partial: { ...call, content: [] } }); events.push({ type: "done", reason: "toolUse", message: call }); events.end();
+					return;
+				}
 				const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, stopReason: final && !transient ? "stop" : "error", errorMessage: transient ? "503 service unavailable" : final ? undefined : "payload refused", usage, timestamp: Date.now(), content: final && !transient ? [{ type: "text", text }] : [] };
 				if (!final || transient) events.push({ type: "error", reason: "error", error: message });
 				else { events.push({ type: "start", partial: { ...message, content: [] } }); events.push({ type: "done", reason: "stop", message }); }
@@ -56,7 +63,7 @@ async function setup(options: Options = {}) {
 		},
 	});
 	const model = runtime.getModel("route-fixture", "route-model")!;
-	const settings = SettingsManager.inMemory({ compaction: { enabled: false, reserveTokens: 4096, keepRecentTokens: 100 }, retry: options.failFirstWork ? { enabled: true, maxRetries: 1, baseDelayMs: 1 } : { enabled: false, maxRetries: 0 }, cacheWarming: "off", transport: "sse" } as any);
+	const settings = SettingsManager.inMemory({ compaction: options.thresholdInTurn ? { enabled: true, reserveTokens: 94_000, keepRecentTokens: 100 } : { enabled: false, reserveTokens: 4096, keepRecentTokens: 100 }, retry: options.failFirstWork ? { enabled: true, maxRetries: 1, baseDelayMs: 1 } : { enabled: false, maxRetries: 0 }, cacheWarming: "off", transport: "sse" } as any);
 	const manager = SessionManager.create(root, join(root, "sessions"));
 	manager.appendMessage(createInitialSystemMessage("Follow the current task.", [{ name: "read", description: "Read a synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }])!);
 	manager.appendMessage({ role: "user", content: "Решение пользователя: локальный JSON для автономной работы. " + "Обсуждаем варианты хранения. ".repeat(300), timestamp: Date.now() - 10_000 });
@@ -75,7 +82,7 @@ async function setup(options: Options = {}) {
 		(pi) => { const old = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = profile; try { extension(pi); } finally { if (old === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = old; } },
 	] });
 	await loader.reload(); expect(loader.getExtensions().errors).toEqual([]);
-	const { session } = await createAgentSession({ cwd: root, agentDir: profile, modelRuntime: runtime, model, thinkingLevel: "medium", settingsManager: settings, sessionManager: manager, resourceLoader: loader, tools: ["read"], customTools: [{ name: "read", label: "read", description: "Read synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } as any, execute: async () => ({ content: [{ type: "text", text: "fixture" }], details: {} }) }] });
+	const { session } = await createAgentSession({ cwd: root, agentDir: profile, modelRuntime: runtime, model, thinkingLevel: "medium", settingsManager: settings, sessionManager: manager, resourceLoader: loader, tools: ["read"], customTools: [{ name: "read", label: "read", description: "Read synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } as any, execute: async () => ({ content: [{ type: "text", text: options.thresholdInTurn ? "Строка файла. ".repeat(1500) : "fixture" }], details: {} }) }] });
 	const notices: string[] = [], footer: string[] = [], working: (string | undefined)[] = [];
 	const noop = () => undefined;
 	const uiContext: any = { notify: (message: string) => notices.push(message), setStatus: (statusKey: string, value?: string) => { if (statusKey === "context-compaction") footer.push(value ?? ""); }, setWorkingMessage: (message?: string) => working.push(message), setWorkingVisible: noop, setWidget: noop, setFooter: noop, setHeader: noop, setTitle: noop, select: noop, confirm: noop, input: noop, custom: noop, setEditorText: noop, getEditorText: () => "", theme: undefined };
@@ -216,5 +223,16 @@ test("a successful automatic retry of a failed working request is a warm prefix 
 		expect(f.payloads.filter((p) => p.kind === "work")).toHaveLength(2);
 		await f.compact();
 		expect(f.custom("context-compaction-append").at(-1)).toMatchObject({ outcome: "success", cacheCheck: { warmed: true, stopReason: "stop" } });
+	} finally { await f.close(); }
+});
+
+test("a request sent right after a threshold compact inside a turn is a warm prefix for the next append", async () => {
+	const f = await setup({ thresholdInTurn: true });
+	try {
+		await f.session.prompt("Проверь импорт.");
+		const audits = f.custom("context-compaction-append");
+		// The second compact follows a single request sent right after the first one.
+		expect(audits.length).toBeGreaterThanOrEqual(2);
+		expect(audits.slice(0, 2)).toMatchObject([{ outcome: "success" }, { outcome: "success", cacheCheck: { warmed: true } }]);
 	} finally { await f.close(); }
 });

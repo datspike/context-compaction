@@ -118,10 +118,14 @@ export class AppendRoute {
 		const last = context.messages.at(-1) as { role?: string; timestamp?: number } | undefined;
 		if (!this.manager || !last || typeof last.timestamp !== "number") return;
 		const branch = this.manager.getBranch(), omitted = omittedFromContext(branch);
-		const entry = [...branch].reverse().find((item) => !outsideContext(item) && item.type !== "thinking_level_change" && !omitted.has(item.id));
-		if (entry?.type === "message" && entry.message.role === last.role && entry.message.timestamp === last.timestamp) return entry.id;
-		// Pi turns a custom message into a user message with the entry timestamp.
-		if (entry?.type === "custom_message" && last.role === "user" && new Date(entry.timestamp).getTime() === last.timestamp) return entry.id;
+		const contextual = [...branch].reverse().filter((item) => !outsideContext(item) && item.type !== "thinking_level_change" && !omitted.has(item.id));
+		const matches = (entry: (typeof branch)[number] | undefined): boolean => entry?.type === "message" ? entry.message.role === last.role && entry.message.timestamp === last.timestamp
+			// Pi turns a custom message into a user message with the entry timestamp.
+			: entry?.type === "custom_message" && last.role === "user" && new Date(entry.timestamp).getTime() === last.timestamp;
+		if (matches(contextual[0])) return contextual[0].id;
+		// A threshold compact inside a turn is followed by a request whose context already holds the summary and ends with the kept tail;
+		// the compaction itself is then the point the append continues from.
+		if (contextual[0]?.type === "compaction" && matches(contextual[1])) return contextual[0].id;
 		return;
 	}
 
