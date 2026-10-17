@@ -12,6 +12,8 @@ const SERVICE_PREFIX = "[context-compaction-native:";
 const STATUS_KEY = "context-compaction-native";
 const WORKING_APPEND = "Compact: сжимаю контекст (append, кэш)…";
 const WORKING_STANDARD = "Compact: append не прошёл проверку, стандартная сводка…";
+/** Stored instead of the hidden service reply: retry and goal drivers read an empty or truncated stop as a failed answer and interrupt the session. */
+export const SERVICE_PLACEHOLDER = "Compact: ответ служебного запроса сводки скрыт.";
 type Success = Extract<AppendOutcome, { kind: "success" }>;
 type Failure = Exclude<AppendOutcome, Success>;
 type Phase = "handoff" | "scheduled" | "queued" | "context" | "payload" | "response" | "drafted" | "failed" | "fallback" | "standard";
@@ -279,7 +281,10 @@ export class NativeAppend {
 		run.responding = false;
 		run.raw = { ...event.message, content: [...event.message.content] };
 		// Tool calls stay: the agent loop must still see and block them, and a failure must remain visible.
-		return { message: { ...event.message, content: event.message.content.filter((block) => block.type === "toolCall") } };
+		const toolCalls = event.message.content.filter((block) => block.type === "toolCall");
+		const stopReason = event.message.stopReason === "length" && !toolCalls.length ? "stop" : event.message.stopReason;
+		const content = stopReason === "stop" ? [{ type: "text" as const, text: SERVICE_PLACEHOLDER }, ...toolCalls] : toolCalls;
+		return { message: { ...event.message, stopReason, content } };
 	}
 
 	/** Intercept prepared compaction only when the current provider can be guarded end to end. */
@@ -288,6 +293,8 @@ export class NativeAppend {
 		if (this.run?.phase === "fallback") return;
 		if (this.run) {
 			if (event.reason === "manual" && this.run.event.reason === "manual" && this.run.phase === "scheduled") return { cancel: true };
+			// The pending service turn already compacts this boundary; dropping it here would strand its queued message.
+			if (event.reason === "threshold" && this.awaitsService(this.run, ctx)) return { cancel: true };
 			// A service response must not recursively compact, nor recover overflow twice.
 			this.cancel(ctx);
 			return { cancel: true };
@@ -354,6 +361,16 @@ export class NativeAppend {
 			if (message.role === "user" || message.role === "custom") orphan = isService(message, ctx) && (!run || text(message) !== run.service);
 			return !orphan || message.role === "system";
 		});
+		// A queued message outlives the operation that was abandoned before it arrived; it carries no task of its own.
+		// Dropping it leaves the request to answer the work before it, and an abort would read as a provider failure.
+		if (last && isService(last, ctx) && (!run || text(last) !== run.service)) {
+			if (filtered.at(-1)?.role === "assistant" && run?.phase !== "failed") ctx.abort();
+			return { messages: filtered };
+		}
+		// Other steering may precede the queued service message, or it may be queued after this request was assembled.
+		// It still arrives on a later turn of this run, so this request is ordinary work; agent_settled releases a message that never came.
+		if (run?.phase === "queued" && !this.sameSession(run, ctx)) { this.reject(run, "context-changed", ctx, false, false); void this.settled(ctx); }
+		if (run?.phase === "queued" && (!last || !isService(last, ctx))) return filtered.length !== messages.length ? { messages: filtered } : undefined;
 		if (run && (last?.role === "user" || last?.role === "custom") && !isService(last, ctx) && run.phase !== "drafted" && run.phase !== "fallback") {
 			this.reject(run, "context-changed", ctx, false, false);
 			void this.settled(ctx);
@@ -414,7 +431,8 @@ export class NativeAppend {
 	/** Block every proposed tool, including additional calls after an earlier one was rejected. */
 	tool(ctx: ExtensionContext): { block: true; reason: string } | undefined {
 		const run = this.run;
-		if (!run || run.phase === "drafted" || run.phase === "fallback") return;
+		// Only the service turn itself is guarded; ordinary turns may run while its message waits in the queue.
+		if (!run || run.phase === "drafted" || run.phase === "fallback" || !run.serviceId) return;
 		run.toolBlocks += 1;
 		// Only an abort stops the agent from answering the blocked tool results with an unguarded request.
 		this.reject(run, "invalid-result", ctx, true, true);
@@ -471,7 +489,8 @@ export class NativeAppend {
 			const entries = this.cleanup(ctx);
 			return entries.length ? { entries } : undefined;
 		}
-		if (!this.sameSession(run, ctx)) return;
+		// A turn that ran while the service message still waits in the queue is ordinary work.
+		if (!this.sameSession(run, ctx) || run.phase === "queued") return;
 		let response = run.raw ?? event.message as AssistantMessage;
 		let usage = response.usage;
 		const changed = () => digest(semanticBranch(ctx).filter((e) => e.id !== event.messageEntryId && !event.toolResultEntryIds.includes(e.id))) !== run.fingerprint;
@@ -623,6 +642,11 @@ export class NativeAppend {
 		const serviceAt = branch.findIndex((entry) => entry.id === run.serviceId);
 		const last = (serviceAt < 0 ? branch : branch.slice(0, serviceAt)).filter((entry) => entry.type === "message").at(-1);
 		return last?.type === "message" && (last.message.role === "user" || last.message.role === "toolResult");
+	}
+
+	/** The service message is still waiting for its own turn or that turn is in flight. */
+	private awaitsService(run: Run, ctx: ExtensionContext): boolean {
+		return this.sameSession(run, ctx) && (run.phase === "queued" || run.phase === "payload" || run.phase === "response");
 	}
 
 	/** Resume only after the committed compaction survived every turn_end handler. */

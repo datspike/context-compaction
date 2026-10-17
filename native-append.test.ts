@@ -1,6 +1,6 @@
 import { MAX_COMPACT_PAYLOAD_CHARS } from "./compact-budget.js";
 import { APPEND_CANDIDATE_START, APPEND_TURN_SEPARATOR } from "./append-compaction.js";
-import { NativeAppend, nativeStartTimeout } from "./native-append.js";
+import { NativeAppend, nativeStartTimeout, SERVICE_PLACEHOLDER } from "./native-append.js";
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,7 +11,7 @@ import extension from "./index.js";
 
 const usage = { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 30, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const history = "## Цель\nСохранить локальный JSON ради автономной работы без сети.\n## Следующие шаги\nРешение пользователя: проверить импорт и экспорт Linux.";
-type Scenario = "success" | "split-turn" | "invalid-json" | "tail-leak" | "tool-calls" | "aborted" | "late-mutator" | "checkpoint" | "threshold" | "threshold-pre" | "overflow" | "apply-rejected" | "late-context" | "late-envelope" | "model-switch" | "orphan" | "late-include" | "late-tools" | "queue-rejected" | "mid-convo-effort" | "late-effort" | "unexpected-tail" | "duplicate-effort" | "provider-hook-throw";
+type Scenario = "success" | "split-turn" | "invalid-json" | "tail-leak" | "tool-calls" | "aborted" | "late-mutator" | "checkpoint" | "threshold" | "threshold-pre" | "overflow" | "apply-rejected" | "late-context" | "late-envelope" | "model-switch" | "orphan" | "late-include" | "late-tools" | "queue-rejected" | "mid-convo-effort" | "late-effort" | "unexpected-tail" | "duplicate-effort" | "provider-hook-throw" | "threshold-tool" | "threshold-steer" | "threshold-stale" | "native-length";
 
 async function until(predicate: () => boolean, description: string) {
 	const deadline = Date.now() + 4000;
@@ -65,10 +65,13 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 				if (!native && final) {
 					ordinaryResponses++;
 					if (ordinaryResponses === 1 && scenario === "threshold") message.usage = { ...usage, input: 70_050, totalTokens: 70_060 };
+					if (ordinaryResponses === 2 && scenario === "threshold-steer") message.usage = { ...usage, input: 70_400, totalTokens: 70_410 };
+					if (ordinaryResponses === 1 && (scenario === "threshold-tool" || scenario === "threshold-steer" || scenario === "threshold-stale")) { message.usage = { ...usage, input: 70_050, totalTokens: 70_060 }; message.content = [{ type: "toolCall", id: "work", name: "read", arguments: { path: "/dev/null" } }]; message.stopReason = "toolUse"; }
 					if (ordinaryResponses === 1 && scenario === "overflow") { message.stopReason = "error"; message.errorMessage = "maximum context length exceeded"; }
 					if (ordinaryResponses === 1 && scenario === "checkpoint") { message.content = [{ type: "toolCall", id: "checkpoint", name: "checkpoint_compact_continue", arguments: { mainObjective: "Сохранить автономное хранение", completedCheckpoint: "Выбран локальный JSON", continuationTarget: "Проверить импорт и экспорт Linux" } }]; message.stopReason = "toolUse"; }
 				}
 				if (native && providerError) { message.content = []; message.stopReason = "error"; message.errorMessage = nativeFailure === "transport-error" ? "OpenAI Responses stream ended before a terminal response event" : "SYNTHETIC_PROVIDER_ERROR"; if (nativeFailure === "transport-error") message.usage = { ...usage, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 }; }
+				if (native && scenario === "native-length") message.stopReason = "length";
 				if (native && (scenario === "invalid-json" || nativeFailure === "invalid-json" || nativeFailure === "cancel-standard" || nativeFailure === "apply-rejected")) message.content[0].text = "{broken";
 				if (native && nativeFailure === "missing-prefix-once" && nativeResponses === 1) message.content[0].text = reply(history, "");
 				if (native && (scenario === "tail-leak" || nativeFailure === "tail-leak")) message.content[0].text = reply("## Цель\nСвежий код TAIL_73918.", "");
@@ -97,7 +100,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 	});
 	const model = runtime.getModel("native-fixture", "native-model")!;
 	expect(model).toBeDefined();
-	const settings = SettingsManager.inMemory({ compaction: { enabled: scenario === "threshold" || scenario === "threshold-pre" || scenario === "overflow", reserveTokens: scenario === "threshold" || scenario === "threshold-pre" ? 30_000 : 4096, keepRecentTokens: 100 }, retry: { enabled: false, maxRetries: 0 }, cacheWarming: "off", transport: "sse" } as any);
+	const settings = SettingsManager.inMemory({ compaction: { enabled: scenario === "threshold" || scenario === "threshold-pre" || scenario === "threshold-tool" || scenario === "threshold-steer" || scenario === "threshold-stale" || scenario === "overflow", reserveTokens: scenario === "threshold" || scenario === "threshold-pre" || scenario === "threshold-tool" || scenario === "threshold-steer" || scenario === "threshold-stale" ? 30_000 : 4096, keepRecentTokens: 100 }, retry: { enabled: false, maxRetries: 0 }, cacheWarming: "off", transport: "sse" } as any);
 	const manager = SessionManager.create(root, join(root, "sessions"));
 	manager.appendMessage(createInitialSystemMessage("Follow the current service task.", [{ name: "read", description: "Read a synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }])!);
 	manager.appendMessage({ role: "user", content: "Решение пользователя: локальный JSON для автономной работы; нужен импорт и экспорт Linux. " + (budgetCase === "serialized" ? "\0".repeat(Math.ceil(MAX_COMPACT_PAYLOAD_CHARS / 6) + 4096) : "Обсуждаем варианты хранения. ".repeat(300)), timestamp: Date.now() });
@@ -140,6 +143,10 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 		...(scenario === "late-include" ? [(pi: any) => pi.on("before_provider_request", (event: any) => ({ ...event.payload, include: [...(event.payload.include ?? []), "web_search_call.action.sources"] }))] : []),
 		...(scenario === "late-mutator" ? [(pi: any) => { pi.on("before_provider_request", (event: any) => ({ ...event.payload, tool_choice: "auto" })); }] : []),
 		...(budgetCase === "late-serialized" ? [(pi: any) => pi.on("before_provider_request", (event: any) => { const payload = { ...event.payload, tools: [...(event.payload.tools ?? []), { type: "function", name: "large_declaration", description: "x".repeat(MAX_COMPACT_PAYLOAD_CHARS), parameters: { type: "object", properties: {} } }] }; latePayloadChars = JSON.stringify(payload).length; return payload; })] : []),
+		// A goal driver steers its own reminder right after a turn, ahead of the service message queued by the next threshold check.
+		...(scenario === "threshold-steer" ? [(pi: any) => { let sent = false; pi.on("turn_end", () => { if (sent) return; sent = true; pi.sendMessage({ customType: "fixture-due", content: "Напоминание драйвера цели.", display: false }, { deliverAs: "steer", triggerTurn: true }); }); }] : []),
+		// A service message of an operation abandoned earlier is still queued and arrives after a tool result.
+		...(scenario === "threshold-stale" ? [(pi: any) => { let sent = false; pi.on("turn_end", () => { if (sent) return; sent = true; const id = "6f1d2c1e-3a4b-4c5d-8e9f-0a1b2c3d4e5f"; pi.appendEntry("context-compaction-native", { version: 1, id, phase: "queued", sessionId: manager.getSessionId() }); pi.sendMessage({ customType: "context-compaction-native", content: `[context-compaction-native:${id}] Служебный запрос сводки; не выполняй рабочие действия.`, display: false }, { deliverAs: "steer", triggerTurn: true }); }); }] : []),
 		...(scenario === "provider-hook-throw" ? [(pi: any) => pi.on("before_provider_request", (event: any) => { if (isNative(event.payload)) throw new Error("SYNTHETIC_BEFORE_PROVIDER_FAILURE"); })] : []),
 	] });
 	await loader.reload(); expect(loader.getExtensions().errors).toEqual([]);
@@ -714,3 +721,60 @@ test("manual tool-call fallback keeps its actual lifecycle observable", async ()
 		expect(fixture.stats.compactStarts).toBe(2);
 	} finally { await fixture.close(); }
 });
+
+
+/** Retry and goal drivers treat a stop without text or tool calls as a failed answer and interrupt an autonomous session. */
+const emptyStop = (message: any): boolean => message?.role === "assistant" && (message.stopReason === "length" || message.stopReason === "stop" && message.content.every((part: any) => part.type !== "toolCall" && !(part.type === "text" && part.text.trim())));
+const assistants = (fixture: Awaited<ReturnType<typeof setup>>): any[] => fixture.manager.getBranch().flatMap((entry: any) => entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : []);
+
+test("a threshold compact after a tool result leaves a completed service answer, not an empty stop", async () => {
+	const fixture = await setup("threshold-tool");
+	try {
+		await fixture.session.prompt("Продолжи исходную работу; контрольный запрос.");
+		await until(() => fixture.audits().some((audit: any) => audit.outcome === "success" && audit.native) && fixture.session.isIdle, "threshold after a tool result");
+		expect(fixture.payloads.map((payload) => isNative(payload))).toEqual([false, true, false]);
+		const service = assistants(fixture).find((message) => JSON.stringify(message.content).includes(SERVICE_PLACEHOLDER));
+		expect(service?.stopReason).toBe("stop");
+		expect(assistants(fixture).some(emptyStop)).toBe(false);
+		expect(assistants(fixture).some((message) => message.stopReason === "error" || message.stopReason === "aborted")).toBe(false);
+		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).not.toContain(SERVICE_PLACEHOLDER);
+	} finally { await fixture.close(); }
+}, 10_000);
+
+test("other steering ahead of the queued service message runs as work, and the service turn still compacts without an abort", async () => {
+	const fixture = await setup("threshold-steer");
+	try {
+		await fixture.session.prompt("Продолжи исходную работу; контрольный запрос.");
+		await until(() => fixture.audits().some((audit: any) => audit.outcome === "success" && audit.native) && fixture.session.isIdle, "service turn after foreign steering");
+		expect(fixture.payloads.map((payload) => isNative(payload))).toEqual([false, false, true]);
+		expect(JSON.stringify(fixture.payloads[1].input.at(-1))).toContain("Напоминание драйвера цели.");
+		expect(fixture.audits()).toHaveLength(1);
+		expect(fixture.manager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(assistants(fixture).some((message) => message.stopReason === "error" || message.stopReason === "aborted")).toBe(false);
+		expect(assistants(fixture).some(emptyStop)).toBe(false);
+		expect(fixture.stats.toolExecutions).toBe(1);
+		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).not.toContain("[context-compaction-native:");
+	} finally { await fixture.close(); }
+}, 10_000);
+
+test("a truncated service reply is stored as a completed answer", async () => {
+	const fixture = await setup("native-length");
+	try {
+		await fixture.compact();
+		expect(assistants(fixture).some(emptyStop)).toBe(false);
+		expect(assistants(fixture).some((message) => message.stopReason === "stop" && JSON.stringify(message.content).includes(SERVICE_PLACEHOLDER))).toBe(true);
+	} finally { await fixture.close(); }
+}, 10_000);
+
+test("a stale service message after a tool result is dropped instead of aborting the work", async () => {
+	const fixture = await setup("threshold-stale");
+	try {
+		await fixture.session.prompt("Продолжи исходную работу; контрольный запрос.");
+		await until(() => fixture.audits().some((audit: any) => audit.outcome === "success" && audit.native) && fixture.session.isIdle, "service turn after a stale message");
+		expect(fixture.payloads.map((payload) => isNative(payload))).toEqual([false, false, true]);
+		expect(JSON.stringify(fixture.payloads[1])).not.toContain("6f1d2c1e-3a4b-4c5d-8e9f-0a1b2c3d4e5f");
+		expect(fixture.payloads[1].input.at(-1).type).toBe("function_call_output");
+		expect(assistants(fixture).some((message) => message.stopReason === "error" || message.stopReason === "aborted")).toBe(false);
+		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).not.toContain("[context-compaction-native:");
+	} finally { await fixture.close(); }
+}, 10_000);
