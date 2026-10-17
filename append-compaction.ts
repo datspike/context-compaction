@@ -42,19 +42,22 @@ function repeatsTailOnlyFact(output: string, messages: Message[], allowed: numbe
 }
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { createInitialSystemMessage, getCurrentSystemPrompt, getCurrentTools, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, Provider } from "@earendil-works/pi-ai";
 import { convertToLlm, estimateTokens, sessionEntryToContextMessages, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 import { collectFileLists, formatFileHints, withoutFileTracking } from "./file-hints.js";
 import { hasStructuralHeading, localizeSummaryStructure, RUSSIAN_COMPACTION_FOCUS, SPLIT_TURN_HEADER } from "./summary.js";
 
-const MAX_SNAPSHOT_CHARS = 16 * 1024 * 1024;
 const WINDOW_MARGIN = 4096;
 
 type Payload = { model: string; input: unknown[]; tools?: unknown; instructions?: unknown; prompt_cache_key?: unknown };
 type Usage = NonNullable<AssistantMessage["usage"]>;
 /** Own line that separates the history summary from the early-turn context in the plain-text reply. */
 export const APPEND_TURN_SEPARATOR = "===РАННЯЯ ЧАСТЬ ХОДА===";
-export type AppendFallback = "unsupported" | "snapshot-unavailable" | "context-changed" | "boundary-unavailable" | "insufficient-window" | "request-too-large" | "payload-mismatch";
+/**
+ * Why no paid append request was sent. `no-sent-request`, `not-warmed`, `cache-expired` and `route-changed`
+ * come from the cache check against the last working request of this process.
+ */
+export type AppendFallback = "unsupported" | "disabled" | "no-sent-request" | "not-warmed" | "cache-expired" | "route-changed" | "snapshot-unavailable" | "context-changed" | "boundary-unavailable" | "insufficient-window" | "request-too-large" | "payload-mismatch";
 export type ValidationGuard = "format" | "history-heading" | "turn-prefix-heading" | "tool-call" | "stop-reason" | "tail-provenance" | "empty-result" | "unknown";
 export type RequestFailureClass = "timeout" | "transport" | "provider-error" | "payload-hook" | "unknown";
 export type RequestFailurePhase = "provider" | "parse";
@@ -71,6 +74,16 @@ export interface AppendAttemptReceipt {
     outputTokenShare?: number;
     repairAttempts: number;
     shape?: ResponseShape;
+    durationMs?: number;
+    usage?: AttemptUsage;
+}
+/** Tokens and price of one provider attempt; numbers only. */
+export interface AttemptUsage {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    cost: number;
 }
 /** Structure of a rejected reply without its text: separator lines, required headings and the number of headings. */
 export interface ResponseShape {
@@ -99,6 +112,11 @@ export function shouldUseStandardCompactFallback(outcome: AppendOutcome): boolea
 	return outcome.kind === "fallback" || (outcome.kind === "cancel" && (outcome.reason === "invalid-result" || outcome.reason === "request-failed"));
 }
 
+type StreamArgs = Parameters<Provider["streamSimple"]>;
+/**
+ * The last working request sent by this process: what the append request continues.
+ * `payload` is the final provider payload after every `before_provider_request` handler.
+ */
 export interface AppendSnapshot {
     sessionId: string;
     anchor: string;
@@ -108,6 +126,21 @@ export interface AppendSnapshot {
     systemShape?: SystemShape;
     capturedInputContentChars?: number;
     payload?: Payload;
+    /** Captured request; when present the append request reuses its model, context envelope and options. */
+    request?: { model: StreamArgs[0]; context: StreamArgs[1]; options: StreamArgs[2] };
+    /** Provider that sends the request without the capturing wrapper. */
+    stream?: Provider["streamSimple"];
+    /** Effective compact window; defaults to the registry declaration. */
+    window?: number;
+}
+/** Raw text of a rejected reply, for the private session record only. */
+export interface RejectedReply { attempt: number; guard?: ValidationGuard; tailMatch?: TailMatch; stopReason: string; text: string }
+
+/** The SDK may place a reasoning-effort control after the final user message; a continuation moves it behind its new messages. */
+export function withoutTrailingEffort(payload: unknown): unknown {
+	const value = payload as { input?: unknown[] } | undefined;
+	const last = Array.isArray(value?.input) ? value.input.at(-1) as { type?: unknown } | undefined : undefined;
+	return last?.type === "configuration_update" ? { ...value, input: value!.input!.slice(0, -1) } : payload;
 }
 
 function payloadValue(value: unknown): Payload | undefined {
@@ -151,7 +184,7 @@ function characterCount(value: unknown): number {
     return value.reduce((sum, item) => sum + (item && typeof item === "object" && typeof (item as { text?: unknown }).text === "string" ? (item as { text: string }).text.length : 0), 0);
 }
 
-function systemShape(message: Message | undefined): SystemShape | undefined {
+export function systemShape(message: Message | undefined): SystemShape | undefined {
     if (!message || message.role !== "system") return;
     const sections = Object.values((message as Message & { sections?: Record<string, unknown> }).sections ?? {});
     return { contentChars: characterCount(message.content), sectionsChars: sections.reduce<number>((sum, value) => sum + characterCount(value), 0), sectionCount: sections.length };
@@ -162,14 +195,8 @@ function inputContentChars(item: unknown): number | undefined {
     return characterCount((item as { content?: unknown }).content);
 }
 
-const SYSTEM_SHAPE_TOLERANCE = 256;
-
-function systemPayloadDistance(shape: SystemShape, contentChars: number): number {
-    return Math.abs(contentChars - shape.contentChars - shape.sectionsChars);
-}
-
 /** Reports only fixed field names and sizes; never persists text, key values, or hashes. */
-function describePayloadMismatch(previous: unknown, next: unknown, source?: Pick<AppendSnapshot, "systemShape" | "capturedInputContentChars">): PayloadMismatch {
+export function describePayloadMismatch(previous: unknown, next: unknown, source?: Pick<AppendSnapshot, "systemShape" | "capturedInputContentChars">): PayloadMismatch {
     const a = payloadValue(previous), b = payloadValue(next);
     if (!a || !b) return { fields: ["invalid-payload"] };
     const result: PayloadMismatch = { fields: [], inputLengths: [a.input.length, b.input.length], ...(source?.systemShape ? { sourceSystemShape: source.systemShape } : {}), ...(source?.capturedInputContentChars === undefined ? {} : { capturedInputContentChars: source.capturedInputContentChars }) };
@@ -200,75 +227,17 @@ export function supported(ctx: ExtensionContext): boolean {
 	return ctx.model?.api === "openai-responses" && !!compat && "supportsMidConvoSystemMessages" in compat && compat.supportsMidConvoSystemMessages === true;
 }
 
-/** Naming metadata can arrive while a request is running without changing its context. */
+/** Entries that never reach the model: naming, labels and extension metadata may arrive while a request runs. */
+export function outsideContext(entry: { type: string }): boolean {
+	return entry.type === "custom" || entry.type === "session_info" || entry.type === "label";
+}
 function leaf(ctx: ExtensionContext): string | undefined {
-	return [...ctx.sessionManager.getBranch()].reverse().find((entry) =>
-		entry.type !== "session_info" && !(entry.type === "custom" && entry.customType === "pi-autoname-state"),
-	)?.id;
+	return [...ctx.sessionManager.getBranch()].reverse().find((entry) => !outsideContext(entry))?.id;
 }
 function session(ctx: ExtensionContext): string | undefined { return ctx.sessionManager.getSessionId(); }
 
-/** One in-memory snapshot per extension runtime; never saves prompts or provider payloads. */
-export class AppendCapture {
-    private snapshot: AppendSnapshot | undefined;
-    private effectivePrompt: string | undefined;
-    clear(): void { this.snapshot = undefined; this.effectivePrompt = undefined; }
-    context(messages: AgentMessage[], ctx: ExtensionContext): void {
-        const converted = convertToLlm(messages);
-        if (!matchesCurrentLeaf(converted, ctx)) return;
-        this.clear();
-        const anchor = leaf(ctx), sessionId = session(ctx);
-        if (!supported(ctx) || !anchor || !sessionId || messages[0]?.role !== "system") return;
-        const effectivePrompt = ctx.getSystemPrompt?.();
-        if (JSON.stringify(converted).length + (effectivePrompt?.length ?? 0) > MAX_SNAPSHOT_CHARS) return;
-        this.effectivePrompt = effectivePrompt;
-        this.snapshot = { sessionId, anchor, provider: ctx.model!.provider, modelId: ctx.model!.id, messages: structuredClone(converted), systemShape: systemShape(converted[0]) };
-    }
-    payload(value: unknown, ctx: ExtensionContext): void {
-        let snapshot = this.snapshot;
-        const payload = payloadValue(value);
-        if (!snapshot || snapshot.sessionId !== session(ctx) || snapshot.provider !== ctx.model?.provider || snapshot.modelId !== ctx.model?.id || !payload || payload.model !== snapshot.modelId) { this.clear(); return; }
-        const first = payload.input[0] as { role?: string; content?: unknown } | undefined;
-        const content = first?.content;
-        const text = typeof content === "string" ? content : Array.isArray(content) && content.every((part) => part && typeof part.text === "string") ? content.map((part) => part.text).join("\n") : undefined;
-        // Pi can force a different leading prompt after context_with_system. Only
-        // adopt that projection once the real provider payload proves it was used.
-        const forced = this.effectivePrompt !== undefined && getCurrentSystemPrompt(snapshot.messages) !== this.effectivePrompt;
-        if (!snapshot.payload && this.effectivePrompt !== undefined) {
-            const expected = forced ? this.effectivePrompt : getCurrentSystemPrompt(snapshot.messages.slice(0, 1));
-            if ((first?.role !== "developer" && first?.role !== "system") || text !== expected) return;
-        }
-        if (!snapshot.payload && forced) {
-            const head = createInitialSystemMessage(this.effectivePrompt, getCurrentTools(snapshot.messages));
-            if (head) {
-                const messages = [head, ...snapshot.messages.filter((message) => message.role !== "system")];
-                if (JSON.stringify(messages).length > MAX_SNAPSHOT_CHARS) { this.clear(); return; }
-                snapshot = { ...snapshot, messages, systemShape: systemShape(head) };
-            }
-        }
-        const candidateChars = inputContentChars(payload.input[0]);
-        if (snapshot.systemShape && candidateChars !== undefined) {
-            const candidateDistance = systemPayloadDistance(snapshot.systemShape, candidateChars);
-            if (candidateDistance > SYSTEM_SHAPE_TOLERANCE) return;
-            if (snapshot.payload && snapshot.capturedInputContentChars !== undefined && candidateDistance >= systemPayloadDistance(snapshot.systemShape, snapshot.capturedInputContentChars)) return;
-        }
-        if (snapshot.payload) return;
-        if (JSON.stringify(payload).length > MAX_SNAPSHOT_CHARS) { this.clear(); return; }
-        this.snapshot = { ...snapshot, capturedInputContentChars: candidateChars, payload: structuredClone(payload) };
-    }
-    get(): AppendSnapshot | undefined { return this.snapshot; }
-}
-
 function messageKey(message: Message): string {
 	return JSON.stringify(message);
-}
-
-function matchesCurrentLeaf(messages: Message[], ctx: ExtensionContext): boolean {
-	const current = [...ctx.sessionManager.getBranch()].reverse().find((entry) => entry.type === "message");
-	if (!current) return true;
-	const currentMessages = convertToLlm(sessionEntryToContextMessages(current));
-	const offset = messages.length - currentMessages.length;
-	return offset >= 0 && currentMessages.every((message, index) => messageKey(message) === messageKey(messages[offset + index]));
 }
 
 function positions(messages: Message[], selected: Message[], startIndex = 0): number[] | undefined {
@@ -401,8 +370,18 @@ function attemptReceipt(attempt: number, response: AssistantMessage | undefined,
     const output = response?.stopReason === "error" || response?.stopReason === "aborted" ? undefined : response?.usage?.output;
     return { attempt, phase, ...(response?.stopReason ? { stopReason: response.stopReason } : {}), toolBlocks: toolBlockTypes.length, toolBlockTypes, ...(response ? { responseChars } : {}), ...(typeof output === "number" && maxTokens > 0 ? { outputTokenShare: Number((output / maxTokens).toFixed(4)) } : {}), repairAttempts };
 }
-/** Returns fallback only before sending; failed/unknown paid requests never silently retry. */
-export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: ExtensionContext, snapshot: AppendSnapshot | undefined): Promise<AppendOutcome> {
+function attemptUsage(usage: Usage | undefined): AttemptUsage | undefined {
+    return usage ? { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, cost: usage.cost.total } : undefined;
+}
+function replyText(response: AssistantMessage): string {
+    return response.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n");
+}
+/**
+ * Send the append request as a continuation of the captured working request.
+ * Returns fallback only before sending; failed or unknown paid requests never silently retry.
+ * `onRejected` receives the raw text of each rejected reply for the private session record.
+ */
+export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: ExtensionContext, snapshot: AppendSnapshot | undefined, onRejected?: (reply: RejectedReply) => void): Promise<AppendOutcome> {
     const preflight = (reason: AppendFallback): AppendOutcome => ({ kind: "fallback", reason, appendAttempt: [attemptReceipt(0, undefined, "preflight", 0, 0)], cacheStatus: "not-attempted" });
     if (!supported(ctx)) return preflight("unsupported");
     if (!snapshot?.payload) return preflight("snapshot-unavailable");
@@ -410,22 +389,22 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
     const anchorIndex = entries.findIndex((entry) => entry.id === snapshot.anchor);
     if (snapshot.sessionId !== session(ctx) || snapshot.provider !== ctx.model!.provider || snapshot.modelId !== ctx.model!.id || anchorIndex < 0) return preflight("context-changed");
     const additions = entries.slice(anchorIndex + 1);
-    const safeCustomTypes = new Set(["pi-autoname-state", "context-compaction-audit", "context-compaction-mode", "context-compaction-card"]);
-    if (additions.some((entry) => entry.type !== "message" && entry.type !== "session_info" && !(entry.type === "custom" && safeCustomTypes.has(entry.customType)))) return preflight("context-changed");
-    const messages = [...snapshot.messages, ...convertToLlm(additions.flatMap(sessionEntryToContextMessages))];
+    // New messages continue the captured prefix; anything that rewrites earlier context does not.
+    if (additions.some((entry) => entry.type !== "message" && entry.type !== "custom_message" && entry.type !== "thinking_level_change" && !outsideContext(entry))) return preflight("context-changed");
+    const added = convertToLlm(additions.flatMap(sessionEntryToContextMessages));
+    const messages = [...snapshot.messages, ...added];
     const task = appendTask(messages, event);
     if (!task) return preflight("boundary-unavailable");
-    const declared = ctx.modelRegistry.find(ctx.model!.provider, ctx.model!.id)?.contextWindow ?? ctx.model!.contextWindow;
-    const window = declared;
-    const maxTokens = Math.min(Math.floor(event.preparation.settings.reserveTokens * 0.8), ctx.model!.maxTokens);
-    const contextUsage = ctx.getContextUsage()?.tokens;
+    const model = snapshot.request?.model ?? ctx.model!;
+    const window = snapshot.window ?? ctx.modelRegistry.find(ctx.model!.provider, ctx.model!.id)?.contextWindow ?? ctx.model!.contextWindow;
+    const maxTokens = Math.min(Math.floor(event.preparation.settings.reserveTokens * 0.8), model.maxTokens);
     const serializedPayloadEstimate = Math.ceil(JSON.stringify(snapshot.payload).length / 3);
-    const additionsEstimate = convertToLlm(additions.flatMap(sessionEntryToContextMessages)).reduce((sum, message) => sum + estimateTokens(message), 0);
-    const inputEstimate = contextUsage ?? serializedPayloadEstimate + additionsEstimate;
+    const inputEstimate = ctx.getContextUsage()?.tokens ?? serializedPayloadEstimate + added.reduce((sum, message) => sum + estimateTokens(message), 0);
     const taskEstimate = Math.ceil(task.length / 3);
     if (!(window > 0 && maxTokens > 0) || inputEstimate + taskEstimate + maxTokens + WINDOW_MARGIN > window) return preflight("insufficient-window");
     if (event.signal.aborted) return { kind: "cancel", reason: "aborted", appendAttempt: [attemptReceipt(0, undefined, "preflight", 0, 0)], cacheStatus: "not-attempted" };
     const initialLeaf = leaf(ctx);
+    const prefix = withoutTrailingEffort(snapshot.payload);
     let payloadRejected = false;
     let totalUsage: Usage | undefined;
     let repairAttempts = 0;
@@ -445,29 +424,38 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
         };
     };
     const diagnostics = () => ({ appendAttempt: structuredClone(appendAttempt), ...(validationGuard ? { validationGuard } : {}), ...(requestFailure ? { requestFailure: { ...requestFailure, hasUsage: Boolean(totalUsage) } } : {}), cacheStatus: cacheStatus(totalUsage, appendAttempt.length > 0) });
+    const captured = snapshot.request;
+    const stream = snapshot.stream ?? ((...args: StreamArgs) => ctx.modelRegistry.streamSimple(...args));
     const request = async (content: string): Promise<AssistantMessage> => {
         payloadRejected = false;
         const attempt = appendAttempt.length + 1;
+        const started = Date.now();
+        // A captured request keeps its own options (cache retention, session, reasoning, headers) and its payload hooks,
+        // so other extensions shape the append payload exactly as they shaped the working one.
+        const base = captured ? { ...captured.options, onResponse: undefined, onProviderStreamEvent: undefined } : { reasoning: ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel, cacheRetention: "short" as const, sessionId: snapshot.sessionId };
         try {
-            const response = await ctx.modelRegistry.streamSimple(ctx.model!, { messages: [...messages, { role: "user", content, timestamp: Date.now() }] }, {
-                maxTokens, reasoning: ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel, signal: event.signal, cacheRetention: "short",
-                sessionId: snapshot.sessionId, transport: "sse", toolChoice: "none", maxRetries: 0, timeoutMs: 120_000,
-                onPayload: (payload) => {
-                    const nextPayload = payload;
+            const response = await stream({ ...model, contextWindow: window }, { ...captured?.context, messages: [...messages, { role: "user", content, timestamp: Date.now() }] } as StreamArgs[1], {
+                ...base, maxTokens, signal: event.signal, transport: "sse", toolChoice: "none", maxRetries: 0, timeoutMs: 120_000,
+                onPayload: async (payload, payloadModel) => {
+                    const final = (captured ? await captured.options?.onPayload?.(payload, payloadModel) : undefined) ?? payload;
+                    const nextPayload = final && typeof final === "object" ? { ...(final as Record<string, unknown>), tool_choice: "none" } : final;
                     const next = payloadValue(nextPayload);
-                    if (!preservesPayloadPrefix(snapshot.payload, nextPayload) || snapshot.payload!.prompt_cache_key !== next?.prompt_cache_key) {
-                        payloadRejected = true; payloadMismatch = describePayloadMismatch(snapshot.payload, nextPayload, snapshot);
+                    if (!preservesPayloadPrefix(prefix, nextPayload) || snapshot.payload!.prompt_cache_key !== next?.prompt_cache_key) {
+                        payloadRejected = true; payloadMismatch = describePayloadMismatch(prefix, nextPayload, snapshot);
                         throw new Error("APPEND_COMPACTION_PAYLOAD_MISMATCH");
                     }
                     return nextPayload;
                 },
             }).result();
-            appendAttempt.push(attemptReceipt(attempt, response, "provider", repairAttempts, maxTokens));
+            const receipt = attemptReceipt(attempt, response, "provider", repairAttempts, maxTokens);
+            receipt.durationMs = Date.now() - started;
+            if (response.stopReason !== "aborted" && !payloadRejected) { const spent = attemptUsage(response.usage); if (spent) receipt.usage = spent; }
+            appendAttempt.push(receipt);
             if (response.stopReason === "error" && !payloadRejected) requestFailure = classifyRequestFailure((response as AssistantMessage & { errorMessage?: unknown }).errorMessage, "provider");
-            else if (response.stopReason !== "aborted") addUsage(response.usage);
+            else if (response.stopReason !== "aborted" && !payloadRejected) addUsage(response.usage);
             return response;
         } catch (error) {
-            appendAttempt.push(attemptReceipt(attempt, undefined, "provider", repairAttempts, maxTokens));
+            appendAttempt.push({ ...attemptReceipt(attempt, undefined, "provider", repairAttempts, maxTokens), durationMs: Date.now() - started });
             if (!payloadRejected) requestFailure = classifyRequestFailure(error, "provider");
             throw error;
         }
@@ -485,30 +473,31 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
         current.responseChars = result.responseChars;
         current.repairAttempts = repairAttempts;
         if (typeof response.usage?.output === "number" && maxTokens > 0) current.outputTokenShare = Number((response.usage.output / maxTokens).toFixed(4));
+        if (!result.parsed) onRejected?.({ attempt: current.attempt, ...(result.guard ? { guard: result.guard } : {}), ...(result.tailMatch ? { tailMatch: result.tailMatch } : {}), stopReason: response.stopReason, text: replyText(response) });
     };
+    const splitTurn = event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0;
     try {
         let response = await request(task);
         if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
         if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, ...diagnostics() };
         if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, ...diagnostics() };
         if (response.stopReason === "error") return { kind: "cancel", reason: "request-failed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
-        let result = parseResult(response, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, messages, event);
+        let result = parseResult(response, splitTurn, messages, event);
         updateAttempt(result, response);
-        if (!result.parsed && (response.stopReason === "stop" || response.stopReason === "length")) {
+        if (!result.parsed && result.guard !== "tool-call" && (response.stopReason === "stop" || response.stopReason === "length")) {
             if (event.signal.aborted || contextChanged()) return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "context-changed", usage: totalUsage, ...diagnostics() };
             repairAttempts += 1;
-            response = await request(`${task}\n\n${repairInstruction(result.guard, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, result.repairHint)}`);
+            response = await request(`${task}\n\n${repairInstruction(result.guard, splitTurn, result.repairHint)}`);
             if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
             if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, repairAttempts, ...diagnostics() };
             if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, repairAttempts, ...diagnostics() };
             if (response.stopReason === "error") return { kind: "cancel", reason: "request-failed", usage: totalUsage, repairAttempts, ...diagnostics() };
-            result = parseResult(response, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, messages, event);
+            result = parseResult(response, splitTurn, messages, event);
             updateAttempt(result, response);
         }
         if (!result.parsed) {
             validationGuard = result.guard ?? "unknown";
-            const reason = "invalid-result" as const;
-            return { kind: "cancel", reason, usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
+            return { kind: "cancel", reason: "invalid-result", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
         }
         return { kind: "success", ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics(), compaction: buildAppendCompaction(result.parsed, event, totalUsage ?? response.usage) };
     } catch {

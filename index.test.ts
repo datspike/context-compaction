@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import extension, { appendAuditPayload, appendUsageForAudit } from "./index.js";
+import extension, { appendAuditPayload, appendUsageForAudit, getContextArgumentCompletions } from "./index.js";
 
 const params = { mainObjective: "Продолжить цель", completedCheckpoint: "Завершён этап", continuationTarget: "Сделать следующий шаг" };
 let sequence = 0;
@@ -23,11 +23,12 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 	const sent: string[] = [];
 	const setModelCalls: any[] = [];
 	const notices: Array<{ text: string; level: string }> = [];
+	const footers: string[] = [];
 	const sessionManager = { getEntries: () => branch, getBranch: () => branch, getSessionId: () => sessionId, getSessionFile: () => undefined };
 	const ctx: any = {
 		cwd: "/tmp/context-compaction-test",
 		hasUI: true,
-		ui: { notify(text: string, level: string) { notices.push({ text, level }); }, setStatus() {} },
+		ui: { notify(text: string, level: string) { notices.push({ text, level }); }, setStatus(_key: string, value?: string) { footers.push(value ?? ""); } },
         model: { provider: options.modelProvider ?? "openai", id: options.modelId ?? "gpt-5.6-sol", api: "openai-responses", contextWindow: 272_000, maxTokens: 128_000, compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true } },
         modelRegistry: { getAll: () => [{ provider: options.modelProvider ?? "openai", id: options.modelId ?? "gpt-5.6-sol", contextWindow: options.registryContextWindow ?? 600_000, cost: { tiers: options.registryTiers ?? [{ inputTokensAbove: options.registryContextWindow ?? 600_000 }] } }], find: () => ctx.model },
 		sessionManager,
@@ -72,7 +73,7 @@ function setup(options: { branch?: any[]; sessionId?: string; setModelResult?: b
 		rmSync(agentDir, { recursive: true, force: true });
 	}
 	return {
-		ctx, tool, command, audits, renderers, compactOptions, sent, notices, setModelCalls,
+		ctx, tool, command, audits, renderers, compactOptions, sent, notices, footers, setModelCalls,
 		setModelBarrier(value: () => Promise<void>) { modelBarrier = value; },
 		hasEvent(name: string) { return handlers.has(name); },
 		get thinkingLevel() { return thinkingLevel; },
@@ -215,19 +216,36 @@ test("writes a durable compact card after session_compact and never before it", 
 	expect(runtime.notices.filter((notice) => notice.text.includes("append compact"))).toHaveLength(0);
 });
 
-test("does not reuse a legacy snapshot when the guarded native provider is unavailable", async () => {
+test("falls back before any paid request when the provider wrapper is unavailable", async () => {
     const branch = [{ id: "a", type: "message", message: { role: "user", content: "Начать работу" } }, { id: "b", type: "message", message: { role: "assistant", content: "Проверка выполнена." } }, { id: "c", type: "message", message: { role: "user", content: "Новый хвост." } }];
     const runtime = setup({ language: "ru", appendCompaction: true, branch });
     const user = branch[0].message, progress = branch[1].message, tail = branch[2].message;
     const payload = { model: runtime.ctx.model.id, input: [{ role: "developer", content: "Original system" }, { role: "user", content: user.content }, { role: "assistant", content: progress.content }, { role: "user", content: tail.content }], tools: [], prompt_cache_key: "fixture-session" };
     runtime.ctx.modelRegistry.streamSimple = (_model: any, _context: any, options: any) => ({ result: async () => { await options.onPayload({ ...payload, input: [...payload.input, { role: "user", content: "candidate" }] }); return { role: "assistant", content: [{ type: "text", text: JSON.stringify({ history: "## Цель\nСохранить замысел.", turnPrefix: "" }) }], stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 100, cacheWrite: 0, totalTokens: 115, cost: { input: 0.01, output: 0.01, cacheRead: 0.01, cacheWrite: 0, total: 0.03 } } }; } });
     await runtime.event("context_with_system", { messages: [{ role: "system", content: "Original system", timestamp: 0 }, user, progress, tail] });
-    await runtime.event("before_provider_request", { payload });
     const preparation = { messagesToSummarize: [user, progress], turnPrefixMessages: [], isSplitTurn: false, firstKeptEntryId: "c", tokensBefore: 100, fileOps: { read: new Set(), edited: new Set(), created: new Set() }, settings: { reserveTokens: 4096, keepRecentTokens: 1024 } };
     await runtime.event("session_before_compact", { reason: "threshold", signal: new AbortController().signal, branchEntries: runtime.getBranch(), preparation, willRetry: false });
     expect(runtime.audits.filter((entry) => entry.type === "context-compaction-append" && entry.data.outcome === "success")).toHaveLength(0);
     await runtime.event("session_compact_failed", { reason: "threshold", willRetry: false, preparation });
     expect(runtime.audits.find((entry) => entry.type === "context-compaction-append")?.data).toMatchObject({ outcome: "fallback", reason: "unsupported", cacheStatus: "not-attempted" });
+});
+
+test("/context append is a window-local override reset by the next session and never persisted", async () => {
+	const runtime = setup({ appendCompaction: false });
+	await runtime.event("session_start", { reason: "startup" });
+	expect(runtime.footers.at(-1)).toEndWith("append off");
+	await runtime.command("append on", runtime.ctx);
+	expect(runtime.footers.at(-1)).toEndWith("append on*");
+	expect(runtime.notices.at(-1)?.text).toContain("только это окно");
+	await runtime.command("append  off", runtime.ctx);
+	expect(runtime.footers.at(-1)).toEndWith("append off");
+	await runtime.command("append on", runtime.ctx);
+	await runtime.event("session_start", { reason: "new" });
+	expect(runtime.footers.at(-1)).toEndWith("append off");
+	await runtime.command("append maybe", runtime.ctx);
+	expect(runtime.notices.at(-1)).toMatchObject({ level: "error" });
+	expect(runtime.audits.some((entry) => entry.type === "context-compaction-mode" && JSON.stringify(entry.data).includes("append"))).toBe(false);
+	expect(getContextArgumentCompletions("append o")?.map((item) => item.value)).toEqual(["append on", "append off"]);
 });
 
 describe("session-local context modes", () => {
