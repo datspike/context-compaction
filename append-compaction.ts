@@ -10,11 +10,11 @@ function normalizedTokens(value: string): string[] {
 	return value.toLocaleLowerCase().match(/[a-zа-яё0-9][a-zа-яё0-9._/-]*/gi) ?? [];
 }
 
-/** Rejects a summary when it repeats a distinctive numeric tail fact absent from the allowed prefix. */
+/** Where a summary repeats a numeric fact found only outside its assigned range; a diagnostic, not a rejection. */
 export interface TailMatch { source: "system" | "user" | "assistant" | "toolResult" | "message-boundary"; messageIndex: number; kind: "number" | "ngram"; }
 
 /** Returns source metadata only: matching text may contain private identifiers. */
-function repeatsTailOnlyFact(output: string, messages: Message[], allowed: number[], previous: string): { match: TailMatch; hint: string } | undefined {
+function repeatsTailOnlyFact(output: string, messages: Message[], allowed: number[], previous: string): TailMatch | undefined {
 	const allowedText = [...allowed.map((index) => messageText(messages[index])), previous].join("\n");
 	const allowedNumbers = new Set(allowedText.match(/\d{2,}/g) ?? []);
 	const ngrams = (value: string) => {
@@ -32,12 +32,12 @@ function repeatsTailOnlyFact(output: string, messages: Message[], allowed: numbe
 		const message = messages[index], value = messageText(message);
 		const source = message.role;
 		const number = (value.match(/\d{2,}/g) ?? []).find((token) => !allowedNumbers.has(token) && outputNumbers.has(token));
-		if (number) return { match: { source, messageIndex: index, kind: "number" }, hint: `Число ${number.slice(0, 64)} отсутствует в назначенных сообщениях и прежней сводке. Удали утверждения, которые опираются на него.` };
-		if ([...ngrams(value)].some((ngram) => !allowedNgrams.has(ngram) && outputNgrams.has(ngram))) return { match: { source, messageIndex: index, kind: "ngram" }, hint: `Числовое утверждение пришло из сообщения ${index} (${source}), а не из назначенного диапазона. Не включай его в сводку.` };
+		if (number) return { source, messageIndex: index, kind: "number" };
+		if ([...ngrams(value)].some((ngram) => !allowedNgrams.has(ngram) && outputNgrams.has(ngram))) return { source, messageIndex: index, kind: "ngram" };
 	}
 	// Preserve the existing cross-message check while reporting it separately.
 	const tail = messages.filter((_message, index) => !allowed.includes(index)).map(messageText).join("\n");
-	if ([...ngrams(tail)].some((ngram) => !allowedNgrams.has(ngram) && outputNgrams.has(ngram))) return { match: { source: "message-boundary", messageIndex: -1, kind: "ngram" }, hint: "Числовое утверждение найдено на стыке сообщений вне назначенного диапазона. Не включай его в сводку." };
+	if ([...ngrams(tail)].some((ngram) => !allowedNgrams.has(ngram) && outputNgrams.has(ngram))) return { source: "message-boundary", messageIndex: -1, kind: "ngram" };
 	return undefined;
 }
 
@@ -299,7 +299,7 @@ ${previous}
 ${event.customInstructions ? `\nДополнительные инструкции этой контрольной точки:\n${event.customInstructions}` : ""}`;
 }
 
-type ParseResult = { repairHint?: string; tailMatch?: TailMatch; parsed?: { history: string; prefix: string }; guard?: ValidationGuard; responseChars: number; toolBlockTypes: string[]; shape?: ResponseShape };
+type ParseResult = { tailMatch?: TailMatch; parsed?: { history: string; prefix: string }; guard?: ValidationGuard; responseChars: number; toolBlockTypes: string[]; shape?: ResponseShape };
 
 /** Layout demanded for this exact boundary; an explicit split-turn requirement is what the model most often misses. */
 function replyLayout(splitTurn: boolean): string {
@@ -309,14 +309,12 @@ function replyLayout(splitTurn: boolean): string {
 }
 
 /** Short correction after a rejected reply; in the native path the original task stays in the cached prefix above it. */
-export function repairInstruction(guard: ValidationGuard | undefined, splitTurn: boolean, hint?: string): string {
+export function repairInstruction(guard: ValidationGuard | undefined, splitTurn: boolean): string {
 	const problem = guard === "turn-prefix-heading"
-		? splitTurn ? `нет отдельной строки ${APPEND_TURN_SEPARATOR} с разделом «## Исходный запрос» после неё` : "ранняя часть хода пуста, а ответ содержит разделитель или её контекст"
+		? `нет отдельной строки ${APPEND_TURN_SEPARATOR} с разделом «## Исходный запрос» после неё`
 		: guard === "history-heading" ? "сводка истории не содержит раздела «## Цель»"
-		: guard === "format" ? `строка ${APPEND_TURN_SEPARATOR} встречается больше одного раза`
-		: guard === "tail-provenance" ? "сводка содержит факты сохранённого хвоста, которых нет в назначенных сообщениях"
 		: guard === "empty-result" ? "ответ пустой" : "ответ не соответствует формату";
-	return `Предыдущий ответ не прошёл проверку: ${problem}. ${guard === "tail-provenance" && hint ? hint : ""} Повтори тот же compact по задаче выше, не продолжая рабочую задачу и не вызывая инструменты. ${replyLayout(splitTurn)} Без пояснений и без markdown-ограждения вокруг ответа.`;
+	return `Предыдущий ответ не прошёл проверку: ${problem}. Повтори тот же compact по задаче выше, не продолжая рабочую задачу и не вызывая инструменты. ${replyLayout(splitTurn)} Без пояснений и без markdown-ограждения вокруг ответа.`;
 }
 
 function responseShape(text: string): ResponseShape {
@@ -337,18 +335,21 @@ export function parseResult(response: AssistantMessage, splitTurn: boolean, mess
     const text = response.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
     if (!text.trim()) return { guard: "empty-result", responseChars, toolBlockTypes };
     const shape = responseShape(text);
-    const parts = text.split(new RegExp(`^[ \\t]*${APPEND_TURN_SEPARATOR}[ \\t]*$`, "m"));
-    if (parts.length > 2) return { guard: "format", responseChars, toolBlockTypes, shape };
-    const history = localizeSummaryStructure(withoutFileTracking(parts[0]));
-    const prefix = localizeSummaryStructure(withoutFileTracking(parts[1] ?? ""));
+    // Structure checks match the standard compact: history needs «## Цель», a split turn also needs «## Исходный запрос».
+    // The reply is cut at the first separator; a repeated or unneeded separator is not a reason to pay for a repair.
+    const separator = new RegExp(`^[ \\t]*${APPEND_TURN_SEPARATOR}[ \\t]*$`, "m");
+    const cut = separator.exec(text);
+    const head = cut ? text.slice(0, cut.index) : text, rest = cut ? text.slice(cut.index + cut[0].length) : "";
+    const withoutSeparators = (value: string) => value.replace(new RegExp(separator.source, "gm"), "");
+    const history = localizeSummaryStructure(withoutFileTracking(splitTurn ? head : withoutSeparators(text)));
+    const prefix = splitTurn ? localizeSummaryStructure(withoutFileTracking(withoutSeparators(rest))) : "";
     if (!hasStructuralHeading(history, ["## Цель"]) || !history.trim()) return { guard: "history-heading", responseChars, toolBlockTypes, shape };
     if (splitTurn && !hasStructuralHeading(prefix, ["## Исходный запрос"])) return { guard: "turn-prefix-heading", responseChars, toolBlockTypes, shape };
-    if (!splitTurn && prefix.trim() !== "") return { guard: "turn-prefix-heading", responseChars, toolBlockTypes, shape };
     const historyIndices = positions(messages, convertToLlm(event.preparation.messagesToSummarize)) ?? [];
     const prefixIndices = positions(messages, convertToLlm(event.preparation.turnPrefixMessages), (historyIndices.at(-1) ?? -1) + 1) ?? [];
     const tailMatch = repeatsTailOnlyFact(`${history}\n${prefix}`, messages, [...historyIndices, ...prefixIndices], event.preparation.previousSummary ? withoutFileTracking(event.preparation.previousSummary) : "");
-    if (tailMatch) return { guard: "tail-provenance", tailMatch: tailMatch.match, repairHint: tailMatch.hint, responseChars, toolBlockTypes, shape };
-    return { parsed: { history, prefix }, responseChars, toolBlockTypes };
+    // A tail overlap is only recorded: in accepted real summaries it was almost always a repeated status, version or test count.
+    return { parsed: { history, prefix }, ...(tailMatch ? { tailMatch } : {}), responseChars, toolBlockTypes };
 }
 
 /** Derive cache status from observed usage, without inferring a hit from request identity. */
@@ -487,7 +488,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
         if (!result.parsed && result.guard !== "tool-call" && (response.stopReason === "stop" || response.stopReason === "length")) {
             if (event.signal.aborted || contextChanged()) return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "context-changed", usage: totalUsage, ...diagnostics() };
             repairAttempts += 1;
-            response = await request(`${task}\n\n${repairInstruction(result.guard, splitTurn, result.repairHint)}`);
+            response = await request(`${task}\n\n${repairInstruction(result.guard, splitTurn)}`);
             if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
             if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, repairAttempts, ...diagnostics() };
             if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, repairAttempts, ...diagnostics() };

@@ -229,12 +229,16 @@ describe("append compaction", () => {
 		expect(task).toContain("запланированное до границы должно остаться запланированным");
 		expect(JSON.stringify(messages)).toBe(original);
 	});
-	test("rejects a summary that imports a numeric fact only present in the saved tail", async () => {
+	test("accepts a summary that repeats a tail number and records only where the overlap came from", async () => {
 		const f = fixture();
 		f.progress.content = [{ type: "text", text: "Jobs 0133 и 0134 отправлены на проверку; завершение ещё не подтверждено." }];
 		f.tail.content = "Jobs 0133 validated: 138/138; 0134 validated: 90/90.";
-		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nJob 0133 validated: 138 segments; job 0134 validated: 90 segments.", "") }] }) });
-		expect(await appendCompaction(f.event, f.ctx, f.snapshot)).toMatchObject({ kind: "cancel", reason: "invalid-result" });
+		let calls = 0;
+		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => { calls++; return { ...answer(), content: [{ type: "text", text: reply("## Цель\nJob 0133 validated: 138 segments; job 0134 validated: 90 segments.", "") }] }; } });
+		const outcome = await appendCompaction(f.event, f.ctx, f.snapshot);
+		expect(outcome).toMatchObject({ kind: "success", appendAttempt: [{ attempt: 1, tailMatch: { source: "user", kind: "number" } }] });
+		expect(outcome).not.toHaveProperty("validationGuard"); expect(calls).toBe(1);
+		expect(JSON.stringify(outcome.appendAttempt)).not.toContain("138");
 	});
 
 	test("window accounts for full envelope, output/reasoning and margin; session override cannot invent capability", async () => {
@@ -270,7 +274,6 @@ describe("append compaction", () => {
 	});
     test("records a distinct validation guard without persisting response text", async () => {
         const cases: Array<[string, any]> = [
-            ["format", { ...answer(), content: [{ type: "text", text: `## Цель\nА\n${APPEND_TURN_SEPARATOR}\nx\n${APPEND_TURN_SEPARATOR}\ny` }] }],
             ["history-heading", { ...answer(), content: [{ type: "text", text: reply("Нет заголовка", "") }] }],
             ["empty-result", { ...answer(), content: [{ type: "text", text: "" }] }],
             ["tool-call", { ...answer(), content: [{ type: "toolCall", id: "tool", name: "bash", arguments: { command: "secret-command" } }] }],
@@ -287,13 +290,15 @@ describe("append compaction", () => {
         split.event.preparation.isSplitTurn = true; split.event.preparation.messagesToSummarize = [split.messages[1]]; split.event.preparation.turnPrefixMessages = [split.progress];
         split.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nЕсть", "Нет заголовка") }] }) });
         expect(await appendCompaction(split.event, split.ctx, split.snapshot)).toMatchObject({ validationGuard: "turn-prefix-heading" });
-        const provenance = fixture();
-        provenance.progress.content = [{ type: "text", text: "Jobs 0133 отправлены на проверку; завершение не подтверждено." }];
-        provenance.tail.content = "Jobs 0133 validated: 138/138.";
-        provenance.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nJob 0133 validated: 138 segments.", "") }] }) });
-        const rejected = await appendCompaction(provenance.event, provenance.ctx, provenance.snapshot);
-        expect(rejected).toMatchObject({ validationGuard: "tail-provenance", appendAttempt: [{ tailMatch: { source: "user", kind: "number" } }, { tailMatch: { source: "user", kind: "number" } }] });
-        expect(JSON.stringify(rejected)).not.toContain("138");
+        // A repeated or unneeded separator is cut, not rejected.
+        for (const [splitTurn, text] of [[false, `## Цель\nА\n${APPEND_TURN_SEPARATOR}\nB`], [true, `## Цель\nА\n${APPEND_TURN_SEPARATOR}\n## Исходный запрос\nx\n${APPEND_TURN_SEPARATOR}\ny`]] as const) {
+            const g = fixture();
+            if (splitTurn) { g.event.preparation.isSplitTurn = true; g.event.preparation.messagesToSummarize = [g.messages[1]]; g.event.preparation.turnPrefixMessages = [g.progress]; }
+            g.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text }] }) });
+            const outcome = await appendCompaction(g.event, g.ctx, g.snapshot);
+            expect(outcome.kind).toBe("success");
+            if (outcome.kind === "success") { expect(outcome.compaction.summary).not.toContain(APPEND_TURN_SEPARATOR); expect(outcome.compaction.summary).toContain(splitTurn ? "y" : "B"); }
+        }
     });
 
 });
@@ -316,20 +321,4 @@ test("append setting is default-on, supports opt-out, and rejects ambiguous valu
 		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { appendCompaction: false } })); expect(loadSummarySettings(dir).appendCompaction).toBe(false);
 		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { appendCompaction: "true" } })); expect(() => loadSummarySettings(dir)).toThrow("contextCompaction.appendCompaction must be a boolean");
 	} finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("tail provenance repair identifies the conflicting number without persisting it in receipts", async () => {
-	const f = fixture();
-	f.tail.content = "Частный номер заявки 981723, результат пока неизвестен.";
-	let calls = 0;
-	f.ctx.modelRegistry.streamSimple = (_model: any, context: any) => ({ result: async () => {
-		calls++;
-		if (calls === 1) return { ...answer(), content: [{ type: "text", text: "## Цель\nЗавершить заявку 981723." }] };
-		expect(context.messages.at(-1).content).toContain("Число 981723 отсутствует");
-		return answer();
-	} });
-	const outcome = await appendCompaction(f.event, f.ctx, f.snapshot);
-	expect(outcome.kind).toBe("success");
-	expect(calls).toBe(2);
-	expect(JSON.stringify(outcome)).not.toContain("981723");
 });
