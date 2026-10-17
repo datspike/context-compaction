@@ -143,7 +143,8 @@ describe("public compaction lifecycle", () => {
 		const ordinaryMessages = [{ role: "user", content: "Continue the work", timestamp: 1 }];
 		expect(await runtime.event("context_with_system", { messages: ordinaryMessages })).toBeUndefined();
 		expect(ordinaryMessages[0].content).toBe("Continue the work");
-		expect(runtime.hasEvent("before_provider_request")).toBe(false);
+		// The request stage only observes provider requests; it never changes the payload.
+		expect(await runtime.event("before_provider_request", { payload: { model: "fixture" } })).toBeUndefined();
 		const callback = await startManual(runtime);
 		expect(callback.customInstructions).toContain("## Main objective");
 		expect(callback.customInstructions).not.toContain("## Главная цель");

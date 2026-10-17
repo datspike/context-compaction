@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createRequestStage, REQUEST_STAGE_EVENTS, type RequestStageEvent } from "./request-stage.js";
 import { AppendRoute, withoutLegacyServiceTurns, type CacheCheck } from "./append-route.js";
 import { resolveCompactCapability } from "./compact-budget.js";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -83,8 +84,8 @@ const APPEND_COMPLETIONS: ContextCompletion[] = [
 	{ value: "append off", label: "off", description: "Выключить append compact до смены сессии" },
 	{ value: "append status", label: "status", description: "Показать режим append и проверку кэша" },
 ];
-const WORKING_APPEND = "Compact: append по кэшу последнего запроса…";
-const WORKING_STANDARD = "Compact: стандартная сводка…";
+const WORKING_APPEND = "Compact: append по кэшу последнего запроса";
+const WORKING_STANDARD = "Compact: стандартная сводка";
 const STATUS_KEY = "context-compaction";
 const GLOBAL_STATE = globalThis as typeof globalThis & { __piContextCompactionLegacyNoticesV2?: Set<string> };
 const LEGACY_NOTICE_SESSIONS = GLOBAL_STATE.__piContextCompactionLegacyNoticesV2 ??= new Set<string>();
@@ -193,13 +194,8 @@ export default function contextCompaction(pi: ExtensionAPI): void {
     const serviceModel = (ctx: ExtensionContext) => ctx.model ? { ...ctx.model, contextWindow: capability(ctx).window } : undefined;
     /** The wrapper exists only while append is enabled; disabling it leaves the provider untouched. */
     const syncRoute = (ctx: ExtensionContext): void => { if (appendEnabled()) route.install(ctx); else route.uninstall(); };
-    /** The working line is touched only while this compact sends its own request, and released right after. */
-    let workingSet = false;
-    const working = (ctx: ExtensionContext, message?: string): void => {
-        if (!ctx.hasUI || (message === undefined && !workingSet)) return;
-        workingSet = message !== undefined;
-        ctx.ui.setWorkingMessage(message);
-    };
+    /** The working line has one owner: the request stage, which also shows the compact label while this extension compacts. */
+    const stage = createRequestStage();
     let summarySequence = 0;
     const standard = async (event: any, ctx: ExtensionContext) => {
         const generation = ++summarySequence;
@@ -214,30 +210,31 @@ export default function contextCompaction(pi: ExtensionAPI): void {
     };
     /** One hook result for every trigger: append on a warm cached prefix, otherwise the standard summary in the same compact. */
     const summarize = async (event: any, ctx: ExtensionContext) => {
+        try { return await compactOnce(event, ctx); } finally { stage.endCompaction(); }
+    };
+    const compactOnce = async (event: any, ctx: ExtensionContext) => {
         pendingCard = undefined;
         const model = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
         const correlation = randomUUID();
         const started = Date.now();
         const plan = appendEnabled() ? route.plan(ctx, capability(ctx)) : { fallback: "disabled" as const, check: { captured: false } };
         let outcome: AppendOutcome;
+        stage.beginCompaction(ctx, "fallback" in plan ? WORKING_STANDARD : WORKING_APPEND);
         if ("fallback" in plan) outcome = { kind: "fallback", reason: plan.fallback, cacheStatus: "not-attempted", appendAttempt: [{ attempt: 0, phase: "preflight", toolBlocks: 0, toolBlockTypes: [], repairAttempts: 0 }] };
         else {
-            working(ctx, WORKING_APPEND);
             // The rejected reply stays in this private session, outside the model context, for later inspection.
             outcome = await appendCompaction(event, ctx, plan.snapshot, (reply) => pi.appendEntry("context-compaction-append-reply", { version: 1, correlation, ...reply }));
         }
         const appendDurationMs = Date.now() - started;
         pi.appendEntry("context-compaction-append", { ...appendAuditPayload(outcome, appendDurationMs, model, plan.check), correlation });
         if (outcome.kind === "success") {
-            working(ctx);
             pendingCard = { kind: "append", provider: model?.provider, model: model?.id, durationMs: appendDurationMs, appendDurationMs, appendUsage: outcome.compaction.usage, appendCacheStatus: outcome.cacheStatus, repairAttempts: outcome.repairAttempts ?? 0, scope: currentScope(ctx) };
             return { compaction: outcome.compaction };
         }
-        if (!shouldUseStandardCompactFallback(outcome)) { working(ctx); return { cancel: true }; }
-        if (outcome.appendAttempt.some((attempt) => attempt.phase !== "preflight")) working(ctx, WORKING_STANDARD);
+        if (!shouldUseStandardCompactFallback(outcome)) return { cancel: true };
+        stage.beginCompaction(ctx, WORKING_STANDARD);
         const standardStarted = Date.now();
         const compact = await standard(event, ctx);
-        working(ctx);
         if (!("compaction" in compact)) return compact;
         pendingCard = { kind: "standard", fallbackReason: outcome.reason, provider: model?.provider, model: model?.id, appendDurationMs, appendUsage: appendUsageForAudit(outcome) as CompactCardData["appendUsage"], appendCacheStatus: outcome.cacheStatus, durationMs: Date.now() - standardStarted, repairAttempts: "repairAttempts" in outcome ? outcome.repairAttempts ?? 0 : 0, scope: currentScope(ctx) };
         return compact;
@@ -443,7 +440,10 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 	});
 	pi.on("session_before_switch", () => { ++summarySequence; operation = undefined; route.reset(); });
 	pi.on("session_before_fork", () => { ++summarySequence; operation = undefined; route.reset(); });
-	pi.on("session_start", async (_event, ctx) => {
+	const shared = new Set<RequestStageEvent>(["session_start", "model_select", "turn_end", "agent_settled", "session_before_compact", "session_compact", "session_compact_failed", "session_shutdown"]);
+	for (const type of REQUEST_STAGE_EVENTS) if (!shared.has(type)) pi.on(type as any, (event: unknown, ctx: ExtensionContext) => stage.observe(type, event, ctx));
+	pi.on("session_start", async (event, ctx) => {
+		stage.observe("session_start", event, ctx);
 		++summarySequence;
 		route.reset(ctx);
 		appendOverride = undefined;
@@ -459,14 +459,16 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		await ensureWindow(ctx);
 		updateFooter(ctx);
 	});
-	pi.on("model_select", async (_event, ctx) => {
+	pi.on("model_select", async (event, ctx) => {
+		stage.observe("model_select", event, ctx);
 		++summarySequence;
 		if (operation && (!internalModelTransition || operation.modelRoute !== manualIdentity(ctx))) operation = undefined;
 		if (internalModelTransition) { updateFooter(ctx); return; }
 		route.reset(ctx); syncRoute(ctx); await ensureWindow(ctx); updateFooter(ctx);
 	});
-	pi.on("turn_end", (_event, ctx) => { updateFooter(ctx); });
-	pi.on("agent_settled", async (_event, ctx) => {
+	pi.on("turn_end", (event, ctx) => { stage.observe("turn_end", event, ctx); updateFooter(ctx); });
+	pi.on("agent_settled", async (event, ctx) => {
+		stage.observe("agent_settled", event, ctx);
 		const op = currentOperation(ctx);
 		if (!op || !ctx.isIdle() || !isCurrent(ctx, op, "pending")) return;
 		op.lifecycle = "running";
@@ -474,6 +476,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		ctx.compact({ customInstructions: buildInstructions(buildLedger(op.params, language), language), onComplete: () => { void continueManualAfterCompaction(ctx, op); }, onError: () => { fail(ctx, op); } });
 	});
 	pi.on("session_before_compact", async (event: any, ctx) => {
+		stage.observe("session_before_compact", event, ctx);
 		const reason = event.reason as AuditReason;
 		const op = currentOperation(ctx);
 		if (op?.lifecycle === "running" && reason === "manual") {
@@ -491,6 +494,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		pi.registerEntryRenderer<CompactCardData>(COMPACT_CARD_TYPE, (entry, options, theme) => entry.data ? renderCompactCard(entry.data, options.expanded, theme, language) : undefined);
 	}
 	pi.on("session_compact", async (event: any, ctx) => {
+		stage.observe("session_compact", event, ctx);
         const pending = pendingCard && scopeMatches(pendingCard.scope, ctx) ? pendingCard : undefined;
         pendingCard = undefined;
         const { scope: _pendingScope, ...card } = pending ?? {};
@@ -512,6 +516,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		external(ctx, "success", reason, Boolean(event.willRetry), event.compactionEntry?.tokensBefore);
 	});
 	pi.on("session_compact_failed", (event: any, ctx) => {
+		stage.observe("session_compact_failed", event, ctx);
         pendingCard = undefined;
         const reason = event.reason as AuditReason;
 		const op = currentOperation(ctx);
@@ -520,7 +525,7 @@ export default function contextCompaction(pi: ExtensionAPI): void {
 		external(ctx, "error", reason, Boolean(event.willRetry), event.preparation?.tokensBefore);
 		updateFooter(ctx);
 	});
-	pi.on("session_shutdown", (_event, ctx) => { ++summarySequence; route.uninstall(); const op = currentOperation(ctx); if (op) cancel(ctx, op); });
+	pi.on("session_shutdown", (event, ctx) => { stage.observe("session_shutdown", event, ctx); ++summarySequence; route.uninstall(); const op = currentOperation(ctx); if (op) cancel(ctx, op); });
 }
 
 export { compactedSinceLastUserMessage, prepareArguments } from "./checkpoint.js";

@@ -20,6 +20,11 @@
     "summary.ts",
     "append-compaction.ts",
     "append-route.ts",
+    "request-stage.ts",
+    "request-stage/request-stage-controller.mjs",
+    "request-stage/generation-meter.mjs",
+    "request-stage/generation-telemetry.mjs",
+    "request-stage/rate-overlay.mjs",
     "file-hints.ts",
     "README.md",
     "docs/workflows.md",
@@ -33,7 +38,8 @@
   "scripts": {
     "test": "node scripts/with-pi-runtime.mjs test",
     "typecheck": "node scripts/with-pi-runtime.mjs typecheck",
-    "verify": "npm run typecheck && npm test"
+    "test:stage": "node --test request-stage/*.test.mjs",
+    "verify": "npm run typecheck && npm test && npm run test:stage"
   },
   "pi": {
     "extensions": [

@@ -18,7 +18,7 @@ const kindOf = (payload: any): "append" | "work" | "standard" => {
 	return (payload?.input?.length ?? 0) <= 2 && /<conversation>|# Conversation|context summarization/.test(JSON.stringify(payload?.input?.at(-1) ?? "")) ? "standard" : "work";
 };
 
-type Options = { append?: boolean; promptCache?: Record<string, number>; unstableTools?: boolean; appendReply?: string[] };
+type Options = { tui?: boolean; append?: boolean; promptCache?: Record<string, number>; unstableTools?: boolean; appendReply?: string[] };
 
 /** Real SDK and Responses conversion; every provider response is synthetic and the network is forbidden. */
 async function setup(options: Options = {}) {
@@ -72,13 +72,13 @@ async function setup(options: Options = {}) {
 	] });
 	await loader.reload(); expect(loader.getExtensions().errors).toEqual([]);
 	const { session } = await createAgentSession({ cwd: root, agentDir: profile, modelRuntime: runtime, model, thinkingLevel: "medium", settingsManager: settings, sessionManager: manager, resourceLoader: loader, tools: ["read"], customTools: [{ name: "read", label: "read", description: "Read synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } as any, execute: async () => ({ content: [{ type: "text", text: "fixture" }], details: {} }) }] });
-	const notices: string[] = [], footer: string[] = [];
+	const notices: string[] = [], footer: string[] = [], working: (string | undefined)[] = [];
 	const noop = () => undefined;
-	const uiContext: any = { notify: (message: string) => notices.push(message), setStatus: (statusKey: string, value?: string) => { if (statusKey === "context-compaction") footer.push(value ?? ""); }, setWorkingMessage: noop, setWidget: noop, setFooter: noop, setHeader: noop, setTitle: noop, select: noop, confirm: noop, input: noop, custom: noop, setEditorText: noop, getEditorText: () => "", theme: undefined };
+	const uiContext: any = { notify: (message: string) => notices.push(message), setStatus: (statusKey: string, value?: string) => { if (statusKey === "context-compaction") footer.push(value ?? ""); }, setWorkingMessage: (message?: string) => working.push(message), setWorkingVisible: noop, setWidget: noop, setFooter: noop, setHeader: noop, setTitle: noop, select: noop, confirm: noop, input: noop, custom: noop, setEditorText: noop, getEditorText: () => "", theme: undefined };
 	const errors: unknown[] = [];
-	await session.bindExtensions({ uiContext, onError: (error: unknown) => errors.push(error) } as any);
+	await session.bindExtensions({ uiContext, ...(options.tui ? { mode: "tui" } : {}), onError: (error: unknown) => errors.push(error) } as any);
 	const custom = (type: string) => manager.getBranch().filter((entry: any) => entry.type === "custom" && entry.customType === type).map((entry: any) => entry.data);
-	return { session, manager, payloads, notices, footer, custom, get network() { return network; },
+	return { session, manager, payloads, notices, footer, working, custom, get network() { return network; },
 		async compact() { try { await session.compact(); } catch (error) { expect(String(error)).toContain("cancelled"); } },
 		async close() { expect(errors).toEqual([]); await session.abort(); session.dispose(); rmSync(root, { recursive: true, force: true }); },
 	};
@@ -167,5 +167,20 @@ test("/context append on works for this window only, even when the profile disab
 		expect(f.payloads.filter((p) => p.kind === "append")).toHaveLength(1);
 		await f.session.prompt("/context append status");
 		expect(f.notices.at(-1)).toContain("только это окно");
+	} finally { await f.close(); }
+});
+
+test("during append the working line shows the compact, not the generation of the request it reuses", async () => {
+	const f = await setup({ tui: true });
+	try {
+		await f.session.prompt("Проверь импорт.");
+		const before = f.working.length;
+		await f.compact();
+		const during = f.working.slice(before);
+		expect(f.custom("context-compaction-append").at(-1)).toMatchObject({ outcome: "success" });
+		const shown = during.filter((message) => message !== undefined);
+		// The append request reuses the working payload hooks, yet only the compact label is shown, and the line is released after.
+		expect(shown).toEqual(["Compact: append по кэшу последнего запроса · compact длится 0:00"]);
+		expect(during.at(-1)).toBeUndefined();
 	} finally { await f.close(); }
 });
