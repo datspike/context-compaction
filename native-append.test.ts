@@ -74,7 +74,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 				if (native && scenario === "native-length") message.stopReason = "length";
 				if (native && (scenario === "invalid-json" || nativeFailure === "invalid-json" || nativeFailure === "cancel-standard" || nativeFailure === "apply-rejected")) message.content[0].text = "{broken";
 				if (native && nativeFailure === "missing-prefix-once" && nativeResponses === 1) message.content[0].text = reply(history, "");
-				if (native && (scenario === "tail-leak" || nativeFailure === "tail-leak")) message.content[0].text = reply("## Цель\nСвежий код TAIL_73918.", "");
+				if (native && (scenario === "tail-leak" || nativeFailure === "tail-leak")) message.content[0].text = reply(scenario === "threshold-tool" ? "## Цель\nСвежий код TOOL_981723." : "## Цель\nСвежий код TAIL_73918.", "");
 				if (native && (scenario === "tool-calls" || nativeFailure === "tool-calls")) { message.content = [{ type: "toolCall", id: "first", name: "read", arguments: { path: "/dev/null" } }, { type: "toolCall", id: "second", name: "read", arguments: { path: "/dev/null" } }]; message.stopReason = "toolUse"; }
 				if ((native && scenario === "aborted") || options?.signal?.aborted || !final) { message.content = []; message.stopReason = "aborted"; }
 				if (message.stopReason === "aborted") events.push({ type: "error", reason: "aborted", error: message });
@@ -152,7 +152,7 @@ async function setup(mode: Scenario | `${"manual" | "checkpoint" | "threshold" |
 		...(scenario === "provider-hook-throw" ? [(pi: any) => pi.on("before_provider_request", (event: any) => { if (isNative(event.payload)) throw new Error("SYNTHETIC_BEFORE_PROVIDER_FAILURE"); })] : []),
 	] });
 	await loader.reload(); expect(loader.getExtensions().errors).toEqual([]);
-	const { session } = await createAgentSession({ cwd: root, agentDir: profile, modelRuntime: runtime, model, thinkingLevel: "medium", settingsManager: settings, sessionManager: manager, resourceLoader: loader, tools: scenario === "checkpoint" ? ["read", "checkpoint_compact_continue"] : ["read"], customTools: [{ name: "read", label: "read", description: "Read synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } as any, execute: async () => { toolExecutions++; return { content: [{ type: "text", text: "fixture" }], details: {} }; } }] });
+	const { session } = await createAgentSession({ cwd: root, agentDir: profile, modelRuntime: runtime, model, thinkingLevel: "medium", settingsManager: settings, sessionManager: manager, resourceLoader: loader, tools: scenario === "checkpoint" ? ["read", "checkpoint_compact_continue"] : ["read"], customTools: [{ name: "read", label: "read", description: "Read synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } as any, execute: async () => { toolExecutions++; return { content: [{ type: "text", text: scenario === "threshold-tool" && nativeFailure === "tail-leak" ? "Свежий код TOOL_981723." : "fixture" }], details: {} }; } }] });
 	const ui: string[] = [];
 	// Only the status texts are observed; every other UI method is a no-op.
 	const uiContext: any = Object.fromEntries(["addAutocompleteProvider", "confirm", "custom", "getAllThemes", "getEditorComponent", "getEditorText", "getTheme", "getToolsExpanded", "input", "onTerminalInput", "pasteToEditor", "select", "setEditorComponent", "setEditorText", "setFooter", "setHeader", "setHiddenThinkingLabel", "setTheme", "setTitle", "setToolsExpanded", "setWidget", "setWorkingIndicator", "setWorkingVisible"].map((key) => [key, () => undefined]));
@@ -798,3 +798,22 @@ test("a stale service message after a tool result is dropped instead of aborting
 		expect(JSON.stringify(fixture.manager.buildSessionProjection().messages)).not.toContain("[context-compaction-native:");
 	} finally { await fixture.close(); }
 }, 10_000);
+
+for (const failure of ["invalid-json", "tail-leak", "tool-calls"] as const) test(`threshold fallback after a tool result resumes once: ${failure}`, async () => {
+	const fixture = await setup("threshold-tool", failure);
+	try {
+		await fixture.session.prompt("Продолжи исходную проверку импорта.");
+		await until(() => fixture.session.isIdle, "threshold fallback settles");
+		const cards: any[] = fixture.manager.getBranch().filter((e: any) => e.type === "custom" && e.customType === "context-compaction-card");
+		expect(cards.at(-1)?.data.kind).toBe("standard");
+		expect(cards.at(-1)?.data.trigger).toBe("threshold");
+		const branch = fixture.manager.getBranch();
+		const compactAt = branch.findIndex((entry) => entry.type === "compaction");
+		expect(branch.slice(compactAt + 1).filter((entry: any) => entry.type === "message" && entry.message.role === "assistant")).toHaveLength(1);
+		expect(assistants(fixture).some((message) => message.stopReason === "error" || message.stopReason === "aborted")).toBe(false);
+		expect(fixture.payloads.filter((p) => isNative(p))).toHaveLength(failure === "tool-calls" ? 1 : 2);
+		expect(fixture.payloads.at(-1)).not.toSatisfy(isNative);
+		expect(fixture.manager.getBranch().filter((e) => e.type === "compaction")).toHaveLength(1);
+		expect(fixture.stats.networkCalls).toBe(0);
+	} finally { await fixture.close(); }
+});

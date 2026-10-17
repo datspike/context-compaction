@@ -11,27 +11,34 @@ function normalizedTokens(value: string): string[] {
 }
 
 /** Rejects a summary when it repeats a distinctive numeric tail fact absent from the allowed prefix. */
-function repeatsTailOnlyFact(output: string, messages: Message[], allowed: number[], previous: string): boolean {
+export interface TailMatch { source: "system" | "user" | "assistant" | "toolResult" | "message-boundary"; messageIndex: number; kind: "number" | "ngram"; }
+
+/** Returns source metadata only: matching text may contain private identifiers. */
+function repeatsTailOnlyFact(output: string, messages: Message[], allowed: number[], previous: string): { match: TailMatch; hint: string } | undefined {
 	const allowedText = [...allowed.map((index) => messageText(messages[index])), previous].join("\n");
 	const allowedNumbers = new Set(allowedText.match(/\d{2,}/g) ?? []);
-	const allowedNgrams = new Set<string>();
-	for (const tokens of [normalizedTokens(allowedText)]) for (let i = 0; i + 2 < tokens.length; i++) {
-		const ngram = tokens.slice(i, i + 3).join(" ");
-		if (tokens.slice(i, i + 3).some((token) => /\d/.test(token))) allowedNgrams.add(ngram);
+	const ngrams = (value: string) => {
+		const tokens = normalizedTokens(value), result: string[] = [];
+		for (let i = 0; i + 2 < tokens.length; i++) {
+			const group = tokens.slice(i, i + 3);
+			if (group.some((token) => /\d/.test(token))) result.push(group.join(" "));
+		}
+		return new Set(result);
+	};
+	const allowedNgrams = ngrams(allowedText), outputNgrams = ngrams(output);
+	const outputNumbers = new Set(output.match(/\d{2,}/g) ?? []);
+	for (let index = 0; index < messages.length; index++) {
+		if (allowed.includes(index)) continue;
+		const message = messages[index], value = messageText(message);
+		const source = message.role;
+		const number = (value.match(/\d{2,}/g) ?? []).find((token) => !allowedNumbers.has(token) && outputNumbers.has(token));
+		if (number) return { match: { source, messageIndex: index, kind: "number" }, hint: `Число ${number.slice(0, 64)} отсутствует в назначенных сообщениях и прежней сводке. Удали утверждения, которые опираются на него.` };
+		if ([...ngrams(value)].some((ngram) => !allowedNgrams.has(ngram) && outputNgrams.has(ngram))) return { match: { source, messageIndex: index, kind: "ngram" }, hint: `Числовое утверждение пришло из сообщения ${index} (${source}), а не из назначенного диапазона. Не включай его в сводку.` };
 	}
-	const tailText = messages.filter((_message, index) => !allowed.includes(index)).map(messageText).join("\n");
-	const outputTokens = normalizedTokens(output);
-	const tailTokens = normalizedTokens(tailText);
-	const tailOnlyNumbers = new Set((tailText.match(/\d{2,}/g) ?? []).filter((token) => !allowedNumbers.has(token)));
-	if ((output.match(/\d{2,}/g) ?? []).some((token) => tailOnlyNumbers.has(token))) return true;
-	for (let i = 0; i + 2 < tailTokens.length; i++) {
-		const ngramTokens = tailTokens.slice(i, i + 3);
-		if (!ngramTokens.some((token) => /\d/.test(token))) continue;
-		const ngram = ngramTokens.join(" ");
-		if (allowedNgrams.has(ngram)) continue;
-		for (let j = 0; j + 2 < outputTokens.length; j++) if (outputTokens.slice(j, j + 3).join(" ") === ngram) return true;
-	}
-	return false;
+	// Preserve the existing cross-message check while reporting it separately.
+	const tail = messages.filter((_message, index) => !allowed.includes(index)).map(messageText).join("\n");
+	if ([...ngrams(tail)].some((ngram) => !allowedNgrams.has(ngram) && outputNgrams.has(ngram))) return { match: { source: "message-boundary", messageIndex: -1, kind: "ngram" }, hint: "Числовое утверждение найдено на стыке сообщений вне назначенного диапазона. Не включай его в сводку." };
+	return undefined;
 }
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -57,6 +64,7 @@ export interface AppendAttemptReceipt {
     phase: "preflight" | "provider" | "parse" | "apply";
     stopReason?: string;
     validationGuard?: ValidationGuard;
+    tailMatch?: TailMatch;
     toolBlocks: number;
     toolBlockTypes: string[];
     responseChars?: number;
@@ -322,7 +330,7 @@ ${previous}
 ${event.customInstructions ? `\nДополнительные инструкции этой контрольной точки:\n${event.customInstructions}` : ""}`;
 }
 
-type ParseResult = { parsed?: { history: string; prefix: string }; guard?: ValidationGuard; responseChars: number; toolBlockTypes: string[]; shape?: ResponseShape };
+type ParseResult = { repairHint?: string; tailMatch?: TailMatch; parsed?: { history: string; prefix: string }; guard?: ValidationGuard; responseChars: number; toolBlockTypes: string[]; shape?: ResponseShape };
 
 /** Layout demanded for this exact boundary; an explicit split-turn requirement is what the model most often misses. */
 function replyLayout(splitTurn: boolean): string {
@@ -332,14 +340,14 @@ function replyLayout(splitTurn: boolean): string {
 }
 
 /** Short correction after a rejected reply; in the native path the original task stays in the cached prefix above it. */
-export function repairInstruction(guard: ValidationGuard | undefined, splitTurn: boolean): string {
+export function repairInstruction(guard: ValidationGuard | undefined, splitTurn: boolean, hint?: string): string {
 	const problem = guard === "turn-prefix-heading"
 		? splitTurn ? `нет отдельной строки ${APPEND_TURN_SEPARATOR} с разделом «## Исходный запрос» после неё` : "ранняя часть хода пуста, а ответ содержит разделитель или её контекст"
 		: guard === "history-heading" ? "сводка истории не содержит раздела «## Цель»"
 		: guard === "format" ? `строка ${APPEND_TURN_SEPARATOR} встречается больше одного раза`
 		: guard === "tail-provenance" ? "сводка содержит факты сохранённого хвоста, которых нет в назначенных сообщениях"
 		: guard === "empty-result" ? "ответ пустой" : "ответ не соответствует формату";
-	return `Предыдущий ответ не прошёл проверку: ${problem}. Повтори тот же compact по задаче выше, не продолжая рабочую задачу и не вызывая инструменты. ${replyLayout(splitTurn)} Без пояснений и без markdown-ограждения вокруг ответа.`;
+	return `Предыдущий ответ не прошёл проверку: ${problem}. ${guard === "tail-provenance" && hint ? hint : ""} Повтори тот же compact по задаче выше, не продолжая рабочую задачу и не вызывая инструменты. ${replyLayout(splitTurn)} Без пояснений и без markdown-ограждения вокруг ответа.`;
 }
 
 function responseShape(text: string): ResponseShape {
@@ -369,7 +377,8 @@ export function parseResult(response: AssistantMessage, splitTurn: boolean, mess
     if (!splitTurn && prefix.trim() !== "") return { guard: "turn-prefix-heading", responseChars, toolBlockTypes, shape };
     const historyIndices = positions(messages, convertToLlm(event.preparation.messagesToSummarize)) ?? [];
     const prefixIndices = positions(messages, convertToLlm(event.preparation.turnPrefixMessages), (historyIndices.at(-1) ?? -1) + 1) ?? [];
-    if (repeatsTailOnlyFact(`${history}\n${prefix}`, messages, [...historyIndices, ...prefixIndices], event.preparation.previousSummary ? withoutFileTracking(event.preparation.previousSummary) : "")) return { guard: "tail-provenance", responseChars, toolBlockTypes, shape };
+    const tailMatch = repeatsTailOnlyFact(`${history}\n${prefix}`, messages, [...historyIndices, ...prefixIndices], event.preparation.previousSummary ? withoutFileTracking(event.preparation.previousSummary) : "");
+    if (tailMatch) return { guard: "tail-provenance", tailMatch: tailMatch.match, repairHint: tailMatch.hint, responseChars, toolBlockTypes, shape };
     return { parsed: { history, prefix }, responseChars, toolBlockTypes };
 }
 
@@ -468,6 +477,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
         if (!current) return;
         current.phase = result.parsed ? "apply" : "parse";
         if (result.guard) current.validationGuard = result.guard;
+        if (result.tailMatch) current.tailMatch = result.tailMatch;
         if (!result.parsed && result.shape) current.shape = result.shape;
         current.stopReason = response.stopReason;
         current.toolBlocks = result.toolBlockTypes.length;
@@ -487,7 +497,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
         if (!result.parsed && (response.stopReason === "stop" || response.stopReason === "length")) {
             if (event.signal.aborted || contextChanged()) return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "context-changed", usage: totalUsage, ...diagnostics() };
             repairAttempts += 1;
-            response = await request(`${task}\n\n${repairInstruction(result.guard, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0)}`);
+            response = await request(`${task}\n\n${repairInstruction(result.guard, event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0, result.repairHint)}`);
             if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
             if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, repairAttempts, ...diagnostics() };
             if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, repairAttempts, ...diagnostics() };

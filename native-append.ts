@@ -440,7 +440,7 @@ export class NativeAppend {
 		// Only the service turn itself is guarded; ordinary turns may run while its message waits in the queue.
 		if (!run || run.phase === "drafted" || run.phase === "fallback" || !run.serviceId) return;
 		run.toolBlocks += 1;
-		// Only an abort stops the agent from answering the blocked tool results with an unguarded request.
+		// Automatic runs fall back at turn_end before another request; a manual run must abort its held compact.
 		this.reject(run, "invalid-result", ctx, true, true);
 		if (run.failure) {
 			run.failure.validationGuard = "tool-call";
@@ -464,7 +464,7 @@ export class NativeAppend {
 		}
 		run.phase = "failed";
 		if (run.timer) clearTimeout(run.timer);
-		if (abortCurrent && !(fallback && run.event.willRetry) && this.sameSession(run, ctx) && !ctx.isIdle()) { if (run.holding) run.selfAborted = true; ctx.abort(); }
+		if (abortCurrent && !(fallback && (run.event.willRetry || run.event.reason === "threshold")) && this.sameSession(run, ctx) && !ctx.isIdle()) { if (run.holding) run.selfAborted = true; ctx.abort(); }
 	}
 
 	/** Hide orphaned service turns as well as the current service response, using append-only edits. */
@@ -514,11 +514,11 @@ export class NativeAppend {
 		if (!run.failure) {
 			const splitTurn = run.event.preparation.isSplitTurn && run.event.preparation.turnPrefixMessages.length > 0;
 			let parsed = parseResult(response, splitTurn, run.messages!, run.event);
-			const receipt = (attempt: number, result: typeof parsed, message: AssistantMessage, repairs: number): AppendAttemptReceipt => ({ attempt, phase: result.parsed ? "apply" : "parse", stopReason: message.stopReason, ...(result.guard ? { validationGuard: result.guard } : {}), toolBlocks: Math.max(attempt === 1 ? run.toolBlocks : 0, result.toolBlockTypes.length), toolBlockTypes: result.toolBlockTypes, responseChars: result.responseChars, ...(!result.parsed && result.shape ? { shape: result.shape } : {}), repairAttempts: repairs });
+			const receipt = (attempt: number, result: typeof parsed, message: AssistantMessage, repairs: number): AppendAttemptReceipt => ({ attempt, phase: result.parsed ? "apply" : "parse", stopReason: message.stopReason, ...(result.guard ? { validationGuard: result.guard } : {}), ...(result.tailMatch ? { tailMatch: result.tailMatch } : {}), toolBlocks: Math.max(attempt === 1 ? run.toolBlocks : 0, result.toolBlockTypes.length), toolBlockTypes: result.toolBlockTypes, responseChars: result.responseChars, ...(!result.parsed && result.shape ? { shape: result.shape } : {}), repairAttempts: repairs });
 			const attempts = [receipt(1, parsed, response, 0)];
 			let repairAttempts = 0;
 			if (!parsed.parsed && (response.stopReason === "stop" || response.stopReason === "length") && parsed.guard !== "tool-call") {
-				const repaired = await this.repair(run, response, parsed.guard, splitTurn, ctx);
+				const repaired = await this.repair(run, response, parsed.guard, splitTurn, ctx, parsed.repairHint);
 				repairAttempts = run.repairAttempt ? 1 : 0;
 				if (repaired) {
 					repairAttempts = 1;
@@ -567,7 +567,7 @@ export class NativeAppend {
 	private async prepareStandard(ctx: ExtensionContext): Promise<{ entries: SessionBoundaryDraft[] } | undefined> {
 		const run = this.run;
 		// A released hold can no longer return a compaction, so a late summary would only strand the run.
-		if (!run?.failure || !run.fallbackAllowed || !(run.event.willRetry || run.holding) || (run.holding && !run.held) || run.phase !== "failed" || ctx.hasPendingMessages()) return;
+		if (!run?.failure || !run.fallbackAllowed || !(run.event.willRetry || run.holding || run.event.reason === "threshold") || (run.holding && !run.held) || run.phase !== "failed" || ctx.hasPendingMessages()) return;
 		// A held manual compact belongs to Pi's compact signal, not to the finished service turn.
 		const signal = run.holding ? run.event.signal : run.signal ?? run.event.signal;
 		if (!this.sameSession(run, ctx) || !this.sameModel(run, ctx) || !this.registrationOwned(ctx) || signal.aborted || run.event.signal.aborted) return;
@@ -605,12 +605,12 @@ export class NativeAppend {
 	 * Ask once more on the same cached prefix: the rejected reply and a short correction follow the original task.
 	 * The request bypasses the agent loop, so the reply stays private; it is refused unless the original payload is its exact prefix.
 	 */
-	private async repair(run: Run, response: AssistantMessage, guard: Parameters<typeof repairInstruction>[0], splitTurn: boolean, ctx: ExtensionContext): Promise<AssistantMessage | undefined> {
+	private async repair(run: Run, response: AssistantMessage, guard: Parameters<typeof repairInstruction>[0], splitTurn: boolean, ctx: ExtensionContext, hint?: string): Promise<AssistantMessage | undefined> {
 		const request = run.request, base = this.registration?.base;
 		if (!request?.payload || !base || !this.registrationOwned(ctx)) return;
 		const signal = AbortSignal.any([run.event.signal, ...(run.signal && !run.holding ? [run.signal] : [])]);
 		if (signal.aborted) return;
-		const correction: Message = { role: "user", content: repairInstruction(guard, splitTurn), timestamp: Date.now() };
+		const correction: Message = { role: "user", content: repairInstruction(guard, splitTurn, hint), timestamp: Date.now() };
 		let accepted = false;
 		run.repairAttempt = { attempt: 2, phase: "provider", toolBlocks: 0, toolBlockTypes: [], repairAttempts: 1 };
 		try {

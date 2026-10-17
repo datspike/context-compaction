@@ -306,7 +306,9 @@ describe("append compaction", () => {
         provenance.progress.content = [{ type: "text", text: "Jobs 0133 отправлены на проверку; завершение не подтверждено." }];
         provenance.tail.content = "Jobs 0133 validated: 138/138.";
         provenance.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nJob 0133 validated: 138 segments.", "") }] }) });
-        expect(await appendCompaction(provenance.event, provenance.ctx, provenance.snapshot)).toMatchObject({ validationGuard: "tail-provenance" });
+        const rejected = await appendCompaction(provenance.event, provenance.ctx, provenance.snapshot);
+        expect(rejected).toMatchObject({ validationGuard: "tail-provenance", appendAttempt: [{ tailMatch: { source: "user", kind: "number" } }, { tailMatch: { source: "user", kind: "number" } }] });
+        expect(JSON.stringify(rejected)).not.toContain("138");
     });
 
 });
@@ -381,4 +383,20 @@ test("append setting is default-on, supports opt-out, and rejects ambiguous valu
 		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { appendCompaction: false } })); expect(loadSummarySettings(dir).appendCompaction).toBe(false);
 		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { appendCompaction: "true" } })); expect(() => loadSummarySettings(dir)).toThrow("contextCompaction.appendCompaction must be a boolean");
 	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("tail provenance repair identifies the conflicting number without persisting it in receipts", async () => {
+	const f = fixture();
+	f.tail.content = "Частный номер заявки 981723, результат пока неизвестен.";
+	let calls = 0;
+	f.ctx.modelRegistry.streamSimple = (_model: any, context: any) => ({ result: async () => {
+		calls++;
+		if (calls === 1) return { ...answer(), content: [{ type: "text", text: "## Цель\nЗавершить заявку 981723." }] };
+		expect(context.messages.at(-1).content).toContain("Число 981723 отсутствует");
+		return answer();
+	} });
+	const outcome = await appendCompaction(f.event, f.ctx, f.snapshot);
+	expect(outcome.kind).toBe("success");
+	expect(calls).toBe(2);
+	expect(JSON.stringify(outcome)).not.toContain("981723");
 });
