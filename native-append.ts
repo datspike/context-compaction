@@ -370,6 +370,12 @@ export class NativeAppend {
 		// Other steering may precede the queued service message, or it may be queued after this request was assembled.
 		// It still arrives on a later turn of this run, so this request is ordinary work; agent_settled releases a message that never came.
 		if (run?.phase === "queued" && !this.sameSession(run, ctx)) { this.reject(run, "context-changed", ctx, false, false); void this.settled(ctx); }
+		// Steering queued after ours lands in the same request, so ours is no longer last and cannot become a guarded service turn.
+		// Sent as is, it would reach the model as an ordinary instruction; the next threshold check starts a fresh operation instead.
+		if (run?.phase === "queued" && last && !isService(last, ctx)) {
+			const own = filtered.filter((message) => !((message.role === "user" || message.role === "custom") && isService(message, ctx) && text(message) === run.service));
+			if (own.length !== filtered.length) { this.reject(run, "context-changed", ctx, false, false); void this.settled(ctx); return { messages: own }; }
+		}
 		if (run?.phase === "queued" && (!last || !isService(last, ctx))) return filtered.length !== messages.length ? { messages: filtered } : undefined;
 		if (run && (last?.role === "user" || last?.role === "custom") && !isService(last, ctx) && run.phase !== "drafted" && run.phase !== "fallback") {
 			this.reject(run, "context-changed", ctx, false, false);
