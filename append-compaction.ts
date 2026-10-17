@@ -44,6 +44,7 @@ function repeatsTailOnlyFact(output: string, messages: Message[], allowed: numbe
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Message, Provider } from "@earendil-works/pi-ai";
 import { convertToLlm, estimateTokens, sessionEntryToContextMessages, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
+import { calculateCompactBudget, type CompactBudgetReason, type CompactCapability } from "./compact-budget.js";
 import { collectFileLists, formatFileHints, withoutFileTracking } from "./file-hints.js";
 import { hasStructuralHeading, localizeSummaryStructure, RUSSIAN_COMPACTION_FOCUS, SPLIT_TURN_HEADER } from "./summary.js";
 
@@ -132,6 +133,8 @@ export interface AppendSnapshot {
     stream?: Provider["streamSimple"];
     /** Effective compact window; defaults to the registry declaration. */
     window?: number;
+    /** Compact capability of the route; when present the append request uses the same budget as the standard summary. */
+    capability?: CompactCapability;
 }
 /** Raw text of a rejected reply, for the private session record only. */
 export interface RejectedReply { attempt: number; guard?: ValidationGuard; tailMatch?: TailMatch; stopReason: string; text: string }
@@ -230,6 +233,18 @@ export function supported(ctx: ExtensionContext): boolean {
 /** Entries that never reach the model: naming, labels and extension metadata may arrive while a request runs. */
 export function outsideContext(entry: { type: string }): boolean {
 	return entry.type === "custom" || entry.type === "session_info" || entry.type === "label";
+}
+/**
+ * Entries Pi removed from the model context after a failed attempt (`context_edit` without replacement), with the edits themselves.
+ * An automatic retry resends the context without them, so they neither anchor nor extend a captured request.
+ */
+export function omittedFromContext(branch: readonly { type: string; id: string }[], from = 0): Set<string> {
+	const after = new Set(branch.slice(from).map((entry) => entry.id));
+	const omitted = new Set<string>();
+	for (const entry of branch.slice(from) as { type: string; id: string; targetId?: string; replacement?: unknown }[]) {
+		if (entry.type === "context_edit" && entry.replacement === null && entry.targetId && after.has(entry.targetId)) { omitted.add(entry.id); omitted.add(entry.targetId); }
+	}
+	return omitted;
 }
 function leaf(ctx: ExtensionContext): string | undefined {
 	return [...ctx.sessionManager.getBranch()].reverse().find((entry) => !outsideContext(entry))?.id;
@@ -389,7 +404,8 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
     const entries = ctx.sessionManager.getBranch();
     const anchorIndex = entries.findIndex((entry) => entry.id === snapshot.anchor);
     if (snapshot.sessionId !== session(ctx) || snapshot.provider !== ctx.model!.provider || snapshot.modelId !== ctx.model!.id || anchorIndex < 0) return preflight("context-changed");
-    const additions = entries.slice(anchorIndex + 1);
+    const omitted = omittedFromContext(entries, anchorIndex + 1);
+    const additions = entries.slice(anchorIndex + 1).filter((entry) => !omitted.has(entry.id));
     // New messages continue the captured prefix; anything that rewrites earlier context does not.
     if (additions.some((entry) => entry.type !== "message" && entry.type !== "custom_message" && entry.type !== "thinking_level_change" && !outsideContext(entry))) return preflight("context-changed");
     const added = convertToLlm(additions.flatMap(sessionEntryToContextMessages));
@@ -402,11 +418,17 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
     const serializedPayloadEstimate = Math.ceil(JSON.stringify(snapshot.payload).length / 3);
     const inputEstimate = ctx.getContextUsage()?.tokens ?? serializedPayloadEstimate + added.reduce((sum, message) => sum + estimateTokens(message), 0);
     const taskEstimate = Math.ceil(task.length / 3);
-    if (!(window > 0 && maxTokens > 0) || inputEstimate + taskEstimate + maxTokens + WINDOW_MARGIN > window) return preflight("insufficient-window");
+    // Without a confirmed output limit the whole model maxTokens is reserved, exactly as in the standard path.
+    const budget = (serializedChars?: number) => snapshot.capability
+        ? calculateCompactBudget({ capability: snapshot.capability, inputTokens: inputEstimate, taskTokens: taskEstimate, requestedOutputTokens: maxTokens, modelMaxTokens: model.maxTokens, ...(serializedChars === undefined ? {} : { serializedChars }) }).reason
+        : !(window > 0 && maxTokens > 0) || inputEstimate + taskEstimate + maxTokens + WINDOW_MARGIN > window ? "insufficient-window" as const : undefined;
+    const early = budget();
+    if (early) return preflight(early === "unsupported" ? "insufficient-window" : early);
     if (event.signal.aborted) return { kind: "cancel", reason: "aborted", appendAttempt: [attemptReceipt(0, undefined, "preflight", 0, 0)], cacheStatus: "not-attempted" };
     const initialLeaf = leaf(ctx);
     const prefix = withoutTrailingEffort(snapshot.payload);
     let payloadRejected = false;
+    let lateRefusal: Exclude<CompactBudgetReason, "unsupported"> | undefined;
     let totalUsage: Usage | undefined;
     let repairAttempts = 0;
     let payloadMismatch: PayloadMismatch | undefined;
@@ -428,7 +450,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
     const captured = snapshot.request;
     const stream = snapshot.stream ?? ((...args: StreamArgs) => ctx.modelRegistry.streamSimple(...args));
     const request = async (content: string): Promise<AssistantMessage> => {
-        payloadRejected = false;
+        payloadRejected = false; lateRefusal = undefined;
         const attempt = appendAttempt.length + 1;
         const started = Date.now();
         // A captured request keeps its own options (cache retention, session, reasoning, headers) and its payload hooks,
@@ -444,6 +466,12 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
                     if (!preservesPayloadPrefix(prefix, nextPayload) || snapshot.payload!.prompt_cache_key !== next?.prompt_cache_key) {
                         payloadRejected = true; payloadMismatch = describePayloadMismatch(prefix, nextPayload, snapshot);
                         throw new Error("APPEND_COMPACTION_PAYLOAD_MISMATCH");
+                    }
+                    // Late hooks may still grow the payload; the final request must fit the same budget before the network.
+                    const refusal = budget(JSON.stringify(nextPayload).length);
+                    if (refusal) {
+                        payloadRejected = true; lateRefusal = refusal === "unsupported" ? "insufficient-window" : refusal;
+                        throw new Error("APPEND_COMPACTION_BUDGET_REFUSED");
                     }
                     return nextPayload;
                 },
@@ -479,7 +507,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
     const splitTurn = event.preparation.isSplitTurn && event.preparation.turnPrefixMessages.length > 0;
     try {
         let response = await request(task);
-        if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
+        if (payloadRejected) return { kind: "fallback", ...(lateRefusal ? { reason: lateRefusal } : { reason: "payload-mismatch" as const, payloadMismatch }), ...diagnostics() };
         if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, ...diagnostics() };
         if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, ...diagnostics() };
         if (response.stopReason === "error") return { kind: "cancel", reason: "request-failed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
@@ -489,7 +517,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
             if (event.signal.aborted || contextChanged()) return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "context-changed", usage: totalUsage, ...diagnostics() };
             repairAttempts += 1;
             response = await request(`${task}\n\n${repairInstruction(result.guard, splitTurn)}`);
-            if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
+            if (payloadRejected) return { kind: "fallback", ...(lateRefusal ? { reason: lateRefusal } : { reason: "payload-mismatch" as const, payloadMismatch }), ...diagnostics() };
             if (event.signal.aborted || response.stopReason === "aborted") return { kind: "cancel", reason: "aborted", usage: totalUsage, repairAttempts, ...diagnostics() };
             if (contextChanged()) return { kind: "cancel", reason: "context-changed", usage: totalUsage, repairAttempts, ...diagnostics() };
             if (response.stopReason === "error") return { kind: "cancel", reason: "request-failed", usage: totalUsage, repairAttempts, ...diagnostics() };
@@ -502,7 +530,7 @@ export async function appendCompaction(event: SessionBeforeCompactEvent, ctx: Ex
         }
         return { kind: "success", ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics(), compaction: buildAppendCompaction(result.parsed, event, totalUsage ?? response.usage) };
     } catch {
-        if (payloadRejected) return { kind: "fallback", reason: "payload-mismatch", payloadMismatch, ...diagnostics() };
+        if (payloadRejected) return { kind: "fallback", ...(lateRefusal ? { reason: lateRefusal } : { reason: "payload-mismatch" as const, payloadMismatch }), ...diagnostics() };
         return { kind: "cancel", reason: event.signal.aborted ? "aborted" : "request-failed", usage: totalUsage, ...(repairAttempts ? { repairAttempts } : {}), ...diagnostics() };
     }
 }

@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Provider } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { outsideContext, supported, systemShape, type AppendFallback, type AppendSnapshot } from "./append-compaction.js";
+import { omittedFromContext, outsideContext, supported, systemShape, type AppendFallback, type AppendSnapshot } from "./append-compaction.js";
 import { isNativeCompactionMessage } from "./checkpoint.js";
 import type { CompactCapability } from "./compact-budget.js";
 
@@ -117,7 +117,8 @@ export class AppendRoute {
 	private anchorOf(context: StreamArgs[1]): string | undefined {
 		const last = context.messages.at(-1) as { role?: string; timestamp?: number } | undefined;
 		if (!this.manager || !last || typeof last.timestamp !== "number") return;
-		const entry = [...this.manager.getBranch()].reverse().find((item) => !outsideContext(item) && item.type !== "thinking_level_change");
+		const branch = this.manager.getBranch(), omitted = omittedFromContext(branch);
+		const entry = [...branch].reverse().find((item) => !outsideContext(item) && item.type !== "thinking_level_change" && !omitted.has(item.id));
 		if (entry?.type === "message" && entry.message.role === last.role && entry.message.timestamp === last.timestamp) return entry.id;
 		// Pi turns a custom message into a user message with the entry timestamp.
 		if (entry?.type === "custom_message" && last.role === "user" && new Date(entry.timestamp).getTime() === last.timestamp) return entry.id;
@@ -131,7 +132,9 @@ export class AppendRoute {
 		if (!working) return base.streamSimple(model, context, options);
 		const previous = this.capture;
 		// Pi's cache warmer replays the same context; it refreshes the entry instead of replacing the capture.
-		if (previous && previous.model.id === model.id && sameMessages(previous.context.messages, context.messages)) {
+		// Only a settled, successful capture is warm; an automatic retry of a failed request replaces it instead.
+		const warm = previous?.settledAt !== undefined && previous.stopReason !== "error" && previous.stopReason !== "aborted";
+		if (previous && warm && previous.model.id === model.id && sameMessages(previous.context.messages, context.messages)) {
 			const replay = base.streamSimple(model, context, options);
 			void replay.result().then((message) => { if (this.capture === previous && message.stopReason !== "error" && message.stopReason !== "aborted") previous.refreshedAt = Date.now(); }, () => undefined);
 			return replay;
@@ -179,7 +182,7 @@ export class AppendRoute {
 			sessionId: capture.sessionId, anchor: capture.anchor, provider: capture.model.provider, modelId: capture.model.id,
 			messages, systemShape: systemShape(messages[0]), payload: capture.payload as AppendSnapshot["payload"],
 			request: { model: capture.model, context: capture.context, options: capture.options },
-			stream: (...args) => this.registration!.base.streamSimple(...args), window: capability.window,
+			stream: (...args) => this.registration!.base.streamSimple(...args), window: capability.window, capability,
 		} };
 	}
 }

@@ -18,7 +18,7 @@ const kindOf = (payload: any): "append" | "work" | "standard" => {
 	return (payload?.input?.length ?? 0) <= 2 && /<conversation>|# Conversation|context summarization/.test(JSON.stringify(payload?.input?.at(-1) ?? "")) ? "standard" : "work";
 };
 
-type Options = { tui?: boolean; append?: boolean; promptCache?: Record<string, number>; unstableTools?: boolean; appendReply?: string[] };
+type Options = { tui?: boolean; append?: boolean; promptCache?: Record<string, number>; unstableTools?: boolean; appendReply?: string[]; maxTokens?: number; growAppend?: boolean; failFirstWork?: boolean };
 
 /** Real SDK and Responses conversion; every provider response is synthetic and the network is forbidden. */
 async function setup(options: Options = {}) {
@@ -27,11 +27,11 @@ async function setup(options: Options = {}) {
 	const profile = join(root, "profile"); mkdirSync(profile);
 	writeFileSync(join(profile, "settings.json"), JSON.stringify({ contextCompaction: { appendCompaction: options.append ?? true, summaryLanguage: "ru" } }));
 	const payloads: { kind: ReturnType<typeof kindOf>; payload: any }[] = [];
-	let network = 0, toolsCounter = 0, appendReplies = 0;
+	let network = 0, toolsCounter = 0, appendReplies = 0, works = 0;
 	const runtime = await ModelRuntime.create({ authPath: join(profile, "auth.json"), modelsPath: join(profile, "models.json") });
 	runtime.registerProvider("route-fixture", {
 		api: "openai-responses", apiKey: "offline-fixture", baseUrl: "https://fixture.invalid/v1",
-		models: [{ id: "route-model", name: "Synthetic route fixture", api: "openai-responses", reasoning: true, input: ["text"], cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 8192, compat: { supportsMidConvoSystemMessages: true }, ...(options.promptCache ? { promptCache: options.promptCache } : {}) } as any],
+		models: [{ id: "route-model", name: "Synthetic route fixture", api: "openai-responses", reasoning: true, input: ["text"], cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: options.maxTokens ?? 8192, compat: { supportsMidConvoSystemMessages: true }, ...(options.promptCache ? { promptCache: options.promptCache } : {}) } as any],
 		streamSimple(model, context, streamOptions) {
 			const events = new AssistantMessageEventStream();
 			void (async () => {
@@ -45,8 +45,10 @@ async function setup(options: Options = {}) {
 				// Pi cuts this fixture inside the last turn, so a valid summary also carries the turn prefix.
 				const split = JSON.stringify(final?.input?.at(-1) ?? "").includes(APPEND_TURN_SEPARATOR);
 				const text = kind === "append" ? options.appendReply?.[appendReplies++] ?? (split ? `${history}\n${APPEND_TURN_SEPARATOR}\n${prefix}` : history) : kind === "standard" ? `${history}\n${prefix}` : "Импорт проверен, продолжаю.";
-				const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, stopReason: final ? "stop" : "error", errorMessage: final ? undefined : "payload refused", usage, timestamp: Date.now(), content: final ? [{ type: "text", text }] : [] };
-				if (!final) events.push({ type: "error", reason: "error", error: message });
+				// A transient provider failure after the payload was sent; Pi retries the same context.
+				const transient = kind === "work" && options.failFirstWork && works++ === 0;
+				const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, stopReason: final && !transient ? "stop" : "error", errorMessage: transient ? "503 service unavailable" : final ? undefined : "payload refused", usage, timestamp: Date.now(), content: final && !transient ? [{ type: "text", text }] : [] };
+				if (!final || transient) events.push({ type: "error", reason: "error", error: message });
 				else { events.push({ type: "start", partial: { ...message, content: [] } }); events.push({ type: "done", reason: "stop", message }); }
 				events.end();
 			})();
@@ -54,7 +56,7 @@ async function setup(options: Options = {}) {
 		},
 	});
 	const model = runtime.getModel("route-fixture", "route-model")!;
-	const settings = SettingsManager.inMemory({ compaction: { enabled: false, reserveTokens: 4096, keepRecentTokens: 100 }, retry: { enabled: false, maxRetries: 0 }, cacheWarming: "off", transport: "sse" } as any);
+	const settings = SettingsManager.inMemory({ compaction: { enabled: false, reserveTokens: 4096, keepRecentTokens: 100 }, retry: options.failFirstWork ? { enabled: true, maxRetries: 1, baseDelayMs: 1 } : { enabled: false, maxRetries: 0 }, cacheWarming: "off", transport: "sse" } as any);
 	const manager = SessionManager.create(root, join(root, "sessions"));
 	manager.appendMessage(createInitialSystemMessage("Follow the current task.", [{ name: "read", description: "Read a synthetic fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }])!);
 	manager.appendMessage({ role: "user", content: "Решение пользователя: локальный JSON для автономной работы. " + "Обсуждаем варианты хранения. ".repeat(300), timestamp: Date.now() - 10_000 });
@@ -66,7 +68,9 @@ async function setup(options: Options = {}) {
 		(pi) => pi.on("before_provider_request", (event) => {
 			const payload = event.payload as any;
 			const extra = options.unstableTools ? [{ type: "function", name: `unstable_${toolsCounter++}`, parameters: { type: "object", properties: {} } }] : [];
-			return { ...payload, tools: [...(payload.tools ?? []), { type: "web_search" }, ...extra], metadata: { shapedBy: "fixture" } };
+			// A late hook may grow fields the prefix check does not compare.
+			const grown = options.growAppend && JSON.stringify(payload.input ?? []).includes(APPEND_CANDIDATE_START) ? { padding: "x".repeat(17 * 1024 * 1024) } : {};
+			return { ...payload, tools: [...(payload.tools ?? []), { type: "web_search" }, ...extra], metadata: { shapedBy: "fixture", ...grown } };
 		}),
 		(pi) => { const old = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = profile; try { extension(pi); } finally { if (old === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = old; } },
 	] });
@@ -182,5 +186,35 @@ test("during append the working line shows the compact, not the generation of th
 		// The append request reuses the working payload hooks, yet only the compact label is shown, and the line is released after.
 		expect(shown).toEqual(["Compact: append по кэшу последнего запроса · compact длится 0:00"]);
 		expect(during.at(-1)).toBeUndefined();
+	} finally { await f.close(); }
+});
+
+test("without a confirmed output limit append reserves the whole model output, like the standard summary", async () => {
+	const f = await setup({ maxTokens: 98_000 });
+	try {
+		await f.session.prompt("Проверь импорт.");
+		try { await f.session.compact(); } catch { /* the standard summary has the same budget and may refuse too */ }
+		expect(f.payloads.some((p) => p.kind === "append")).toBe(false);
+		expect(f.custom("context-compaction-append").at(-1)).toMatchObject({ outcome: "fallback", reason: "insufficient-window", cacheStatus: "not-attempted" });
+	} finally { await f.close(); }
+});
+
+test("a late hook that grows the append payload past the request limit is refused before the provider", async () => {
+	const f = await setup({ growAppend: true });
+	try {
+		await f.session.prompt("Проверь импорт.");
+		await f.compact();
+		expect(kinds(f)).toEqual(["work", "standard"]);
+		expect(f.custom("context-compaction-append").at(-1)).toMatchObject({ outcome: "fallback", reason: "request-too-large" });
+	} finally { await f.close(); }
+});
+
+test("a successful automatic retry of a failed working request is a warm prefix for append", async () => {
+	const f = await setup({ failFirstWork: true });
+	try {
+		await f.session.prompt("Проверь импорт.");
+		expect(f.payloads.filter((p) => p.kind === "work")).toHaveLength(2);
+		await f.compact();
+		expect(f.custom("context-compaction-append").at(-1)).toMatchObject({ outcome: "success", cacheCheck: { warmed: true, stopReason: "stop" } });
 	} finally { await f.close(); }
 });
