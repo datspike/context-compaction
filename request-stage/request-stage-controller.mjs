@@ -381,7 +381,7 @@ export class RequestStageController {
       generationRate: generationMs > 0 ? countedTokens * 1000 / generationMs : null, averageRate: state.averageRate,
       apiWaitBeforeFirstTokenMs: firstWait, apiWaitBetweenGenerationWindowsMs: betweenWait, apiWaitAfterLastTokenMs: tailWait, apiWaitTotalMs: apiWaitTotal,
       stopReason: reason ?? finalMessage?.stopReason, complete, estimated: settled?.estimated, thinkingHidden: settled?.thinkingHidden,
-      flags: { missingProviderRequest: timing.providerRequestStartedAt == null, missingFirstGenerationDelta: timing.firstDeltaAt == null, missingLastGenerationDelta: timing.lastDeltaAt == null, missingProviderResponseEnd: timing.providerResponseEndAt == null, incompleteReason: complete ? undefined : "controller_reset" },
+      flags: { providerResponseId: typeof finalMessage?.responseId === "string" ? finalMessage.responseId : undefined, missingProviderRequest: timing.providerRequestStartedAt == null, missingFirstGenerationDelta: timing.firstDeltaAt == null, missingLastGenerationDelta: timing.lastDeltaAt == null, missingProviderResponseEnd: timing.providerResponseEndAt == null, incompleteReason: complete ? undefined : "controller_reset" },
     });
     this.lastRecordedResponse = { responseKey: timing.responseKey, lastDeltaAt: timing.lastDeltaAt };
     this.responseTelemetry = undefined;

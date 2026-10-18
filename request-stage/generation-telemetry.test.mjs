@@ -76,13 +76,14 @@ test("controller records generation rate and decomposed api wait", () => {
   now = 2_000;
   controller.handle({ type: "message_update", message: message(50), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(40) } }, ctx);
   now = 2_300;
-  controller.handle({ type: "message_end", message: message(50) }, ctx);
+  controller.handle({ type: "message_end", message: { ...message(50), responseId: "resp-exact" } }, ctx);
   now = 2_400;
   controller.handle({ type: "after_provider_response" }, ctx);
 
   assert.equal(writes.responses.length, 1);
   const response = writes.responses[0];
   assert.equal(response.complete, true);
+  assert.equal(response.flags.providerResponseId, "resp-exact");
   assert.equal(response.countedTokens, 50);
   assert.equal(response.generationMsTotal, 1_000);
   assert.equal(response.generationRate, 50);
