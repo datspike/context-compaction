@@ -8,7 +8,7 @@ import { APPEND_CANDIDATE_START, APPEND_TURN_SEPARATOR, preservesPayloadPrefix, 
 import extension from "./index.js";
 
 const usage = { input: 2000, output: 10, cacheRead: 1800, cacheWrite: 0, totalTokens: 3810, cost: { input: 0.002, output: 0.001, cacheRead: 0.0002, cacheWrite: 0, total: 0.0032 } };
-const history = "## Цель\nСохранить локальный JSON ради автономной работы без сети.\n## Следующие шаги\nРешение пользователя: проверить импорт.";
+const history = "## Цель\nСохранить локальный JSON ради автономной работы без сети.\n## Прогресс\nИмпорт прочитан.\n## Следующие шаги\nРешение пользователя: проверить импорт.";
 /** Request kinds in order, with the history and turn-prefix calls of one standard summary counted once. */
 const kinds = (f: { payloads: { kind: string }[] }): string[] => f.payloads.map((p) => p.kind).filter((kind, index, all) => kind !== "standard" || all[index - 1] !== "standard");
 const prefix = "## Исходный запрос\nПроверить экспорт.";

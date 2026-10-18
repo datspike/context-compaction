@@ -16,7 +16,7 @@ const model: any = {
 };
 const usage = { input: 20, output: 10, cacheRead: 100, cacheWrite: 0, totalTokens: 130, cost: { input: 0.01, output: 0.01, cacheRead: 0.01, cacheWrite: 0, total: 0.03 } };
 const reply = (history: string, prefix = ""): string => prefix ? `${history}\n${APPEND_TURN_SEPARATOR}\n${prefix}` : history;
-const answer = () => ({ role: "assistant", content: [{ type: "text", text: reply("## Цель\nСохранить замысел.\n## Следующие шаги\nПроверить без публикации.", "") }], api: model.api, provider: model.provider, model: model.id, usage, stopReason: "stop", timestamp: 4 });
+const answer = () => ({ role: "assistant", content: [{ type: "text", text: reply("## Цель\nСохранить замысел.\n## Прогресс\nИмпорт прочитан.\n## Следующие шаги\nПроверить без публикации.", "") }], api: model.api, provider: model.provider, model: model.id, usage, stopReason: "stop", timestamp: 4 });
 
 function fixture() {
 	const request: any = { role: "user", content: "Сделай локально, не публикуй. Сохрани содержание.", timestamp: 1 };
@@ -234,7 +234,7 @@ describe("append compaction", () => {
 		f.progress.content = [{ type: "text", text: "Jobs 0133 и 0134 отправлены на проверку; завершение ещё не подтверждено." }];
 		f.tail.content = "Jobs 0133 validated: 138/138; 0134 validated: 90/90.";
 		let calls = 0;
-		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => { calls++; return { ...answer(), content: [{ type: "text", text: reply("## Цель\nJob 0133 validated: 138 segments; job 0134 validated: 90 segments.", "") }] }; } });
+		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => { calls++; return { ...answer(), content: [{ type: "text", text: reply("## Цель\nJob 0133 validated: 138 segments; job 0134 validated: 90 segments.\n## Прогресс\nПроверки идут.", "") }] }; } });
 		const outcome = await appendCompaction(f.event, f.ctx, f.snapshot);
 		expect(outcome).toMatchObject({ kind: "success", appendAttempt: [{ attempt: 1, tailMatch: { source: "user", kind: "number" } }] });
 		expect(outcome).not.toHaveProperty("validationGuard"); expect(calls).toBe(1);
@@ -253,7 +253,7 @@ describe("append compaction", () => {
 		const f = fixture(); f.event.preparation.messagesToSummarize = [f.messages[1]]; f.event.preparation.turnPrefixMessages = [f.progress]; f.event.preparation.isSplitTurn = true;
 		const task = appendTask([...f.messages, f.progress, f.tail], f.event)!;
 		expect(task).toContain("Номера сообщений (с 1, включая system и toolResult): 2."); expect(task).toContain("Номера сообщений (с 1, включая system и toolResult): 3."); expect(task).not.toContain("НОВЫЙ ХВОСТ");
-		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nИстория", "## Исходный запрос\nЛокальная проверка\n## Контекст для продолжения\nРабота ещё не завершена.") }] }) });
+		f.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nИстория\n## Прогресс\nГотово.", "## Исходный запрос\nЛокальная проверка\n## Контекст для продолжения\nРабота ещё не завершена.") }] }) });
 		const result = await appendCompaction(f.event, f.ctx, f.snapshot); expect(result.kind).toBe("success");
 		if (result.kind === "success") { expect(result.compaction.summary).toContain(SPLIT_TURN_HEADER); expect(result.compaction.firstKeptEntryId).toBe("c"); }
 	});
@@ -275,6 +275,8 @@ describe("append compaction", () => {
     test("records a distinct validation guard without persisting response text", async () => {
         const cases: Array<[string, any]> = [
             ["history-heading", { ...answer(), content: [{ type: "text", text: reply("Нет заголовка", "") }] }],
+            // Only the goal survived: the work loses everything else it found.
+            ["history-progress", { ...answer(), content: [{ type: "text", text: reply("## Цель\nПрочитать восемь частей.", "") }] }],
             ["empty-result", { ...answer(), content: [{ type: "text", text: "" }] }],
             ["tool-call", { ...answer(), content: [{ type: "toolCall", id: "tool", name: "bash", arguments: { command: "secret-command" } }] }],
             ["stop-reason", { ...answer(), stopReason: "length" }],
@@ -288,10 +290,10 @@ describe("append compaction", () => {
         }
         const split = fixture();
         split.event.preparation.isSplitTurn = true; split.event.preparation.messagesToSummarize = [split.messages[1]]; split.event.preparation.turnPrefixMessages = [split.progress];
-        split.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nЕсть", "Нет заголовка") }] }) });
+        split.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text: reply("## Цель\nЕсть\n## Прогресс\nЕсть", "Нет заголовка") }] }) });
         expect(await appendCompaction(split.event, split.ctx, split.snapshot)).toMatchObject({ validationGuard: "turn-prefix-heading" });
         // A repeated or unneeded separator is cut, not rejected.
-        for (const [splitTurn, text] of [[false, `## Цель\nА\n${APPEND_TURN_SEPARATOR}\nB`], [true, `## Цель\nА\n${APPEND_TURN_SEPARATOR}\n## Исходный запрос\nx\n${APPEND_TURN_SEPARATOR}\ny`]] as const) {
+        for (const [splitTurn, text] of [[false, `## Цель\nА\n## Прогресс\nП\n${APPEND_TURN_SEPARATOR}\nB`], [true, `## Цель\nА\n## Прогресс\nП\n${APPEND_TURN_SEPARATOR}\n## Исходный запрос\nx\n${APPEND_TURN_SEPARATOR}\ny`]] as const) {
             const g = fixture();
             if (splitTurn) { g.event.preparation.isSplitTurn = true; g.event.preparation.messagesToSummarize = [g.messages[1]]; g.event.preparation.turnPrefixMessages = [g.progress]; }
             g.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ ...answer(), content: [{ type: "text", text }] }) });
