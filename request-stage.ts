@@ -3,8 +3,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RequestStageController } from "./request-stage/request-stage-controller.mjs";
 // @ts-ignore
 import { GenerationTelemetry } from "./request-stage/generation-telemetry.mjs";
-// @ts-ignore
-import { showRateOverlay } from "./request-stage/rate-overlay.mjs";
+import { createRateBorder } from "./request-stage/rate-border.js";
 
 /** Events the request stage follows; the extension forwards each one exactly once. */
 export const REQUEST_STAGE_EVENTS = [
@@ -24,13 +23,14 @@ export interface RequestStage {
 const tui = (ctx: ExtensionContext): boolean => (ctx as { mode?: string }).mode === "tui";
 
 /**
- * The single owner of Pi's working line: request stage and generation rate during agent runs,
- * and the compact label while this extension compacts. The settled rate uses a passive overlay.
+ * Owns the working line and shows the generation rate on the editor's top border.
  */
 export function createRequestStage(): RequestStage {
+	const border = createRateBorder();
 	const controller = new RequestStageController({
 		telemetry: new GenerationTelemetry(),
-		onState: (state: { visible: boolean; message?: string }, ui: ExtensionContext["ui"] | undefined) => {
+		onState: (state: { visible: boolean; message?: string; rate?: string }, ui: ExtensionContext["ui"] | undefined) => {
+			border.setRate(state.rate);
 			if (!ui) return;
 			try {
 				ui.setWorkingMessage(state.visible ? state.message : undefined);
@@ -40,18 +40,13 @@ export function createRequestStage(): RequestStage {
 			}
 		},
 	});
-	let hideRateOverlay = (): void => {};
-	const hideOverlay = (): void => { hideRateOverlay(); hideRateOverlay = () => {}; };
 	return {
 		observe(type, event, ctx) {
 			if (!tui(ctx)) return;
-			if (type === "session_start" || type === "session_shutdown" || type === "before_agent_start" || type === "agent_start" || type === "before_provider_request" || type === "model_select") hideOverlay();
+			if (type === "session_start") border.install(ctx.ui);
 			controller.handle({ ...(event as object), type }, ctx);
-			if (type === "agent_settled") {
-				const rate = controller.rateText();
-				hideOverlay();
-				if (rate) hideRateOverlay = showRateOverlay(ctx.ui, rate);
-			}
+			border.setRate(controller.rateText());
+			if (type === "session_shutdown") border.uninstall();
 		},
 		beginCompaction(ctx, label) { if (tui(ctx)) controller.beginCompaction(ctx, label); },
 		endCompaction() { controller.endCompaction(); },

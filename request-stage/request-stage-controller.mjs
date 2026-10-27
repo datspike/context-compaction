@@ -126,6 +126,8 @@ export class RequestStageController {
     this.onState = onState;
     this.meter = new GenerationMeter({ now: this.now });
     this.telemetry = telemetry;
+    this.waitingTokens = 0;
+    this.waitingMs = 0;
     this.width = width;
     this.owner = undefined;
     this.ui = undefined;
@@ -194,7 +196,11 @@ export class RequestStageController {
     const api = typeof model.api === "string" ? model.api : undefined;
     const changed = (this.lastModelProvider !== undefined && provider !== undefined && this.lastModelProvider !== provider)
       || (this.lastModelId !== undefined && modelId !== undefined && this.lastModelId !== modelId);
-    if (changed) this.meter.reset();
+    if (changed) {
+      this.meter.reset();
+      this.waitingTokens = 0;
+      this.waitingMs = 0;
+    }
     this.lastModelProvider = provider;
     this.lastModelId = modelId;
     this.expectedProvider = provider;
@@ -254,29 +260,22 @@ export class RequestStageController {
     const state = this.meter.snapshot(now);
     const current = state.streaming ? state.rate : null;
     const average = state.averageRate;
-    if (current == null && average == null) return undefined;
+    const waiting = this.waitingMs > 0 ? this.waitingTokens * 1000 / this.waitingMs : null;
+    if (current == null && average == null && waiting == null) return undefined;
     const estimated = Boolean(current?.estimated || state.tokens.estimated || state.averageEstimated);
+    const averageText = average == null ? undefined : formatRateNumber(average);
+    const waitingText = waiting == null ? undefined : formatRateNumber(waiting);
+    const pair = [averageText, waitingText].filter((value) => value !== undefined).join(" / ");
     let body;
-    if (current != null && average != null) body = `${formatRateNumber(current.value)} ток/с (ср. ${formatRateNumber(average)})`;
+    if (current != null && pair) body = `${formatRateNumber(current.value)} ток/с (ср. ${averageText == null ? "— / " : ""}${pair})`;
     else if (current != null) body = `${formatRateNumber(current.value)} ток/с`;
-    else body = `ср. ${formatRateNumber(average)} ток/с`;
+    else body = `ср. ${averageText == null ? "— / " : ""}${pair} ток/с`;
     return `${estimated ? "≈" : ""}${body}`;
   }
 
   composeMessage(now = this.now()) {
     if (this.compaction) return `${this.compaction.label} · compact длится ${formatDuration(now - this.compaction.startedAt)}`;
-    const stage = this.stageText(now);
-    if (stage === undefined) return undefined;
-    const rate = this.rateText(now);
-    if (rate === undefined) return stage;
-    const width = this.width();
-    const available = Math.max(0, width - WORKING_BORDER_RESERVE - WORKING_SPINNER_WIDTH);
-    const pad = available - visibleLength(stage) - visibleLength(rate);
-    if (pad >= 2) return `${stage}${" ".repeat(pad)}${rate}`;
-    const separator = " · ";
-    const stageWidth = available - visibleLength(rate) - visibleLength(separator);
-    if (stageWidth <= 0) return rate;
-    return `${truncateToVisibleWidth(stage, stageWidth)}${separator}${rate}`;
+    return this.stageText(now);
   }
 
   stageText(now = this.now()) {
@@ -314,12 +313,14 @@ export class RequestStageController {
     const now = this.now();
     const message = this.composeMessage(now);
     const visible = this.active || Boolean(this.compaction);
-    const signature = `${visible ? "1" : "0"}\0${message ?? ""}`;
+    const rate = this.rateText(now);
+    const signature = `${visible ? "1" : "0"}\0${message ?? ""}\0${rate ?? ""}`;
     if (!force && signature === this.lastEmission) return;
     this.lastEmission = signature;
     this.onState({
       visible,
       message,
+      rate,
       stage: this.stage,
       elapsedMs: this.startedAt === undefined ? 0 : Math.max(0, now - this.startedAt),
       stageElapsedMs: this.stageStartedAt === undefined ? 0 : Math.max(0, now - this.stageStartedAt),
@@ -353,11 +354,25 @@ export class RequestStageController {
 
   finishResponseTelemetry(message, now, complete, reason, meterAlreadySettled = false) {
     const timing = this.responseTelemetry;
-    if (!timing || !this.telemetry) return;
+    if (!timing) return;
     if (!meterAlreadySettled) this.meter.endResponse(message ?? timing.lastMessage, now);
     const settled = this.meter.settledSnapshot();
     const state = this.meter.snapshot(now);
     const finalMessage = message ?? timing.lastMessage;
+    const output = finalMessage?.usage?.output;
+    // Claude's bridge stamps its response before starting the SDK query; it has no provider hook.
+    const bridgeStart = timing.provider === "claude-bridge" && Number.isFinite(finalMessage?.timestamp)
+      && finalMessage.timestamp <= timing.startedAt && finalMessage.timestamp >= (this.startedAt ?? 0)
+      ? finalMessage.timestamp : undefined;
+    const requestStart = timing.providerRequestStartedAt ?? bridgeStart;
+    const elapsed = now - requestStart;
+    if (complete && !terminalMessageKind(finalMessage) && requestStart != null
+      && timing.firstDeltaAt != null && timing.firstDeltaAt >= requestStart
+      && now >= timing.firstDeltaAt && Number.isFinite(output) && output > 0
+      && elapsed > 0 && elapsed >= (settled?.measuredMs ?? 0)) {
+      this.waitingTokens += output;
+      this.waitingMs += elapsed;
+    }
     const providerEnd = timing.providerResponseEndAt;
     const firstWait = timing.providerRequestStartedAt != null && timing.firstDeltaAt != null
       ? Math.max(0, timing.firstDeltaAt - timing.providerRequestStartedAt) : null;
@@ -369,7 +384,7 @@ export class RequestStageController {
     const apiWaitTotal = waits.every((value) => value != null) ? waits.reduce((sum, value) => sum + value, 0) : null;
     const countedTokens = settled?.countedTokens ?? 0;
     const generationMs = settled?.measuredMs ?? 0;
-    this.telemetry.writeResponse({
+    this.telemetry?.writeResponse({
       responseKey: timing.responseKey, sessionId: timing.sessionId, messageId: timing.messageId, generation: timing.generation,
       provider: timing.provider, model: timing.model, api: timing.api, startedAt: timing.startedAt,
       firstDeltaAt: timing.firstDeltaAt, lastDeltaAt: timing.lastDeltaAt, providerResponseEndAt: providerEnd, endedAt: now,
@@ -470,12 +485,16 @@ export class RequestStageController {
     if (type === "session_start") {
       this.reset();
       this.meter.reset();
+      this.waitingTokens = 0;
+      this.waitingMs = 0;
       this.adoptSession(ctx);
       return;
     }
     if (type === "session_shutdown") {
       this.reset();
       this.meter.reset();
+      this.waitingTokens = 0;
+      this.waitingMs = 0;
       this.owner = undefined;
       this.ui = undefined;
       return;
@@ -483,7 +502,7 @@ export class RequestStageController {
     if (type === "before_agent_start") {
       if (!this.isOwned(ctx)) {
         // A real session switch without session_start: session totals must not leak.
-        if (this.owner) this.meter.reset();
+        if (this.owner) { this.meter.reset(); this.waitingTokens = 0; this.waitingMs = 0; }
         this.reset();
       }
       this.adoptSession(ctx);
@@ -492,13 +511,19 @@ export class RequestStageController {
     }
     if (type === "agent_start") {
       if (!this.isOwned(ctx)) {
-        if (this.owner) this.meter.reset();
+        if (this.owner) { this.meter.reset(); this.waitingTokens = 0; this.waitingMs = 0; }
         this.reset();
       }
       this.start(ctx);
       return;
     }
     if (!this.isOwned(ctx)) return;
+
+    if (type === "model_select") {
+      this.captureModel(ctx);
+      this.emit(true);
+      return;
+    }
 
     if (type === "session_before_compact") {
       if (this.active) {
@@ -530,6 +555,7 @@ export class RequestStageController {
 
     if (type === "turn_start") {
       this.providerWindow = false;
+      this.providerRequestStartedAt = undefined;
       this.setStage("request_sent");
       this.emit(true);
       return;
@@ -557,7 +583,7 @@ export class RequestStageController {
       this.assistantStreamStarted = true;
       const now = this.now();
       this.meter.startResponse(event.message, now);
-      if (this.telemetry) this.startResponseTelemetry(event.message, now);
+      this.startResponseTelemetry(event.message, now);
       this.setStage("reasoning");
       this.emit(true);
       return;
@@ -565,7 +591,7 @@ export class RequestStageController {
     if (type === "message_update" && event.message?.role === "assistant") {
       const now = this.now();
       this.meter.record(event.assistantMessageEvent, event.message, now);
-      if (this.telemetry) this.noteGenerationDelta(event.assistantMessageEvent, event.message, now);
+      this.noteGenerationDelta(event.assistantMessageEvent, event.message, now);
       const kinds = assistantContentKinds(event.message);
       if (kinds.has("toolCall")) this.setStage("prepare_tool");
       else if (kinds.has("text")) this.setStage("text_stream");
@@ -606,7 +632,8 @@ export class RequestStageController {
     if (type === "message_end" && event.message?.role === "assistant") {
       const now = this.now();
       this.meter.endResponse(event.message, now);
-      if (this.telemetry) this.finishResponseTelemetry(event.message, now, true, undefined, true);
+      this.finishResponseTelemetry(event.message, now, true, undefined, true);
+      this.providerRequestStartedAt = undefined;
       this.providerWindow = false;
       this.assistantStreamStarted = false;
       const terminal = terminalMessageKind(event.message);
@@ -627,7 +654,7 @@ export class RequestStageController {
         const message = [...messages].reverse().find((item) => item?.role === "assistant") ?? this.responseTelemetry.lastMessage;
         const now = this.now();
         this.meter.endResponse(message, now);
-        if (this.telemetry) this.finishResponseTelemetry(message, now, false, terminalMessageKind(message), true);
+        this.finishResponseTelemetry(message, now, false, terminalMessageKind(message), true);
       }
       const terminal = finalMessageKind(event.messages);
       if (terminal) this.setStage(terminal);

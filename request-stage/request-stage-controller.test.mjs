@@ -143,13 +143,11 @@ test("working line reports the exact arrival rate from usage samples", () => {
   h.controller.handle({ type: "message_update", message: message(50), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(40) } }, h.ctx);
   const line = h.states.at(-1).message;
   assert.match(line, /^Поток текста · запрос длится 0:01 · этап длится 0:01/);
-  assert.match(line, /50 ток\/с \(ср\. 50\)$/);
-  // The rate segment is pinned to the right edge of the working line.
-  assert.equal(line.length, 73);
+  assert.match(h.states.at(-1).rate, /50 ток\/с \(ср\. 50\)$/);
+  assert.doesNotMatch(line, /ток\/с/);
   h.controller.handle({ type: "message_end", message: message(50) }, h.ctx);
   assert.match(h.states.at(-1).message, /^Ответ завершён · ожидание следующего шага · запрос длился/);
-  assert.match(h.states.at(-1).message, /ср\. 50 ток\/с$/);
-  assert.equal(h.states.at(-1).message.length, 73);
+  assert.match(h.states.at(-1).rate, /ср\. 50 ток\/с$/);
 });
 
 test("estimated rate is marked approximate until usage settles", () => {
@@ -166,9 +164,9 @@ test("estimated rate is marked approximate until usage settles", () => {
   h.controller.handle({ type: "message_update", message: message(0), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(40) } }, h.ctx);
   h.setNow(1_000);
   h.controller.handle({ type: "message_update", message: message(0), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(40) } }, h.ctx);
-  assert.match(h.states.at(-1).message, /≈20 ток\/с \(ср\. 20\)$/);
+  assert.match(h.states.at(-1).rate, /≈20 ток\/с \(ср\. 20\)$/);
   h.controller.handle({ type: "message_end", message: message(95) }, h.ctx);
-  assert.match(h.states.at(-1).message, /ср\. 95 ток\/с$/);
+  assert.match(h.states.at(-1).rate, /ср\. 95 ток\/с$/);
 });
 
 test("working line shows only the rate readout without token breakdown", () => {
@@ -189,7 +187,7 @@ test("working line shows only the rate readout without token breakdown", () => {
   h.controller.handle({ type: "message_update", message: message(40, 30), assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "x".repeat(20) } }, h.ctx);
   h.setNow(2_000);
   h.controller.handle({ type: "message_update", message: message(50, 30), assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "x".repeat(20) } }, h.ctx);
-  const line = h.states.at(-1).message;
+  const line = h.states.at(-1).rate;
   assert.match(line, /33 ток\/с \(ср\. 33\)$/);
   assert.equal(line.includes("финг"), false);
   assert.equal(line.includes("токенов"), false);
@@ -221,13 +219,13 @@ test("session average accumulates across requests and resets on session_start", 
     h.controller.handle({ type: "message_end", message: message(output) }, h.ctx);
   };
   runRequest(0, 50);
-  assert.match(h.states.at(-1).message, /ср\. 50 ток\/с$/);
+  assert.match(h.states.at(-1).rate, /ср\. 50 ток\/с$/);
   h.controller.handle({ type: "agent_settled" }, h.ctx);
   runRequest(2_000, 20);
-  assert.match(h.states.at(-1).message, /ср\. 35 ток\/с$/);
+  assert.match(h.states.at(-1).rate, /ср\. 35 ток\/с$/);
   h.controller.handle({ type: "session_start", reason: "startup" }, h.ctx);
   runRequest(5_000, 30);
-  assert.match(h.states.at(-1).message, /ср\. 30 ток\/с$/);
+  assert.match(h.states.at(-1).rate, /ср\. 30 ток\/с$/);
 });
 
 test("rate segment falls back to an inline join when the line is too narrow", () => {
@@ -246,10 +244,8 @@ test("rate segment falls back to an inline join when the line is too narrow", ()
   h.controller.handle({ type: "message_update", message: message(25), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(40) } }, h.ctx);
   h.setNow(1_000);
   h.controller.handle({ type: "message_update", message: message(50), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(40) } }, h.ctx);
-  const line = h.states.at(-1).message;
-  assert.match(line, / · 50 ток\/с \(ср\. 50\)$/);
-  assert.equal(line.includes("  50 ток/с"), false);
-  assert.equal(line.length, 53);
+  assert.match(h.states.at(-1).rate, /^50 ток\/с \(ср\. 50\)$/);
+  assert.doesNotMatch(h.states.at(-1).message, /ток\/с/);
 });
 
 test("model change resets the session average", () => {
@@ -271,12 +267,12 @@ test("model change resets the session average", () => {
     h.controller.handle({ type: "message_end", message: message(output) }, h.ctx);
   };
   runRequest(0, 50);
-  assert.match(h.states.at(-1).message, /ср\. 50 ток\/с$/);
+  assert.match(h.states.at(-1).rate, /ср\. 50 ток\/с$/);
   h.controller.handle({ type: "agent_settled" }, h.ctx);
   h.ctx.model = { provider: "openai", id: "gpt-5.7-luna" };
   runRequest(2_000, 20);
-  assert.match(h.states.at(-1).message, /ср\. 20 ток\/с$/);
-  assert.equal(h.states.at(-1).message.includes("ср. 35 ток/с"), false);
+  assert.match(h.states.at(-1).rate, /ср\. 20 ток\/с$/);
+  assert.equal(h.states.at(-1).rate.includes("ср. 35 ток/с"), false);
 });
 
 test("compaction owns the working line through payload hooks and timer ticks of the agent run", () => {
@@ -306,4 +302,47 @@ test("a manual compact outside an agent run shows and then releases the working 
   h.controller.endCompaction();
   assert.equal(h.states.at(-1).visible, false);
   assert.equal(h.controller.timer, undefined);
+});
+
+test("waiting rate weights complete responses and excludes tool time and incomplete data", () => {
+  const h = makeHarness();
+  const message = (output, stopReason = "stop") => ({ role: "assistant", provider: "openai", model: "gpt-5.6-luna", stopReason, content: [{ type: "text", text: "" }], usage: assistantUsage(output, 80) });
+  const run = (start, first, end, output, stopReason = "stop") => {
+    h.setNow(start);
+    h.controller.handle({ type: "before_agent_start" }, h.ctx);
+    h.controller.handle({ type: "before_provider_request" }, h.ctx);
+    h.controller.handle({ type: "message_start", message: message(0) }, h.ctx);
+    h.setNow(first);
+    h.controller.handle({ type: "message_update", message: message(0), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(40) } }, h.ctx);
+    h.setNow(end);
+    h.controller.handle({ type: "message_update", message: message(output), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(40) } }, h.ctx);
+    h.controller.handle({ type: "message_end", message: message(output, stopReason) }, h.ctx);
+    h.controller.handle({ type: "agent_settled" }, h.ctx);
+  };
+  run(0, 1000, 3000, 120);
+  assert.match(h.controller.rateText(), /\/ 40 ток\/с$/);
+  run(10000, 11000, 14000, 80);
+  assert.match(h.controller.rateText(), /\/ 29 ток\/с$/);
+  run(15000, 16000, 18000, 100, "aborted");
+  assert.match(h.controller.rateText(), /\/ 29 ток\/с$/);
+  h.controller.handle({ type: "session_start" }, h.ctx);
+  assert.equal(h.controller.rateText(), undefined);
+});
+
+test("Claude bridge uses its request timestamp and does not borrow a previous provider start", () => {
+  const h = makeHarness();
+  h.ctx.model = { provider: "claude-bridge", id: "claude" };
+  const msg = (output, timestamp) => ({ role: "assistant", provider: "claude-bridge", model: "claude", timestamp, stopReason: "stop", content: [{ type: "text", text: "" }], usage: assistantUsage(output) });
+  h.controller.handle({ type: "before_agent_start" }, h.ctx);
+  h.controller.handle({ type: "turn_start" }, h.ctx);
+  h.setNow(500);
+  h.controller.handle({ type: "message_start", message: msg(0, 100) }, h.ctx);
+  h.controller.handle({ type: "message_update", message: msg(0, 100), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(40) } }, h.ctx);
+  h.setNow(2100);
+  h.controller.handle({ type: "message_update", message: msg(100, 100), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(40) } }, h.ctx);
+  h.controller.handle({ type: "message_end", message: msg(100, 100) }, h.ctx);
+  assert.match(h.controller.rateText(), /\/ 50 ток\/с$/);
+  h.ctx.model = { provider: "openai", id: "other" };
+  h.controller.handle({ type: "model_select" }, h.ctx);
+  assert.equal(h.controller.rateText(), undefined);
 });

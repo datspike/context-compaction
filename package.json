@@ -24,7 +24,7 @@
     "request-stage/request-stage-controller.mjs",
     "request-stage/generation-meter.mjs",
     "request-stage/generation-telemetry.mjs",
-    "request-stage/rate-overlay.mjs",
+    "request-stage/rate-border.ts",
     "file-hints.ts",
     "README.md",
     "docs/workflows.md",
