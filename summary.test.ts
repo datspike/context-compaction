@@ -118,6 +118,25 @@ test("Russian compact keeps localized headings, split-turn context and cumulativ
 	expect(split?.compaction.summary).toContain("действует он; разделы выше описывают состояние до хода.\n## Исходный запрос");
 });
 
+test("split-turn compact sends custom instructions to every summary request", async () => {
+	const message = { role: "user", content: [{ type: "text", text: "Continue the feature" }], timestamp: 1 };
+	for (const includeHistory of [false, true]) {
+		const requests: string[] = [];
+		const ctx = {
+			model: { maxTokens: 8192 },
+			modelRegistry: { complete: async (_model: unknown, context: any) => {
+				requests.push(JSON.stringify(context.messages));
+				return { content: [{ type: "text", text: requests.length === 1 && includeHistory ? "## Goal\nExisting work" : "## Original Request\nComplete the feature" }], usage: { input: 1 } };
+			} },
+		} as any;
+		const preparation = { settings: { reserveTokens: 8192 }, isSplitTurn: true, messagesToSummarize: includeHistory ? [message] : [], previousSummary: undefined, turnPrefixMessages: [message], fileOps: { read: new Set<string>(), edited: new Set<string>() }, firstKeptEntryId: "kept", tokensBefore: 100 };
+		const result = await russianCompaction({ preparation, branchEntries: [], signal: new AbortController().signal, customInstructions: "SPECIAL-OMEGA" } as any, ctx);
+		expect(result).toHaveProperty("compaction");
+		expect(requests).toHaveLength(includeHistory ? 2 : 1);
+		for (const request of requests) expect(request).toContain("SPECIAL-OMEGA");
+	}
+});
+
 test("Russian /tree keeps localized headings and usage", async () => {
 	const ctx = { model: { contextWindow: 128000, maxTokens: 8192 }, modelRegistry: { complete: async () => ({ content: [{ type: "text", text: "## Goal\nRead src/a.ts" }], usage: { input: 3 } }) } } as any;
 	const event = { preparation: { userWantsSummary: true, entriesToSummarize: [{ type: "message", message: { role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 } }] }, signal: new AbortController().signal } as any;

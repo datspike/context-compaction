@@ -461,7 +461,7 @@ async function summarizeMessages(ctx: ExtensionContext, messages: any[], instruc
     return completeSummary(ctx, conversationPrompt(messages, instructions, previousSummary, sources), maxTokens, signal, guard);
 }
 
-async function summarizeTurnPrefix(ctx: ExtensionContext, messages: any[], signal: AbortSignal, maxTokens: number, sources: readonly unknown[], guard?: CompactionRequestGuard): Promise<SummaryResponse> {
+async function summarizeTurnPrefix(ctx: ExtensionContext, messages: any[], signal: AbortSignal, maxTokens: number, sources: readonly unknown[], customInstructions: string | undefined, guard?: CompactionRequestGuard): Promise<SummaryResponse> {
     const instructions = `Это ранняя часть пользовательского хода, а его недавняя часть сохранена отдельно. Составь краткий контекст для продолжения на русском языке и используй ровно этот формат:
 
 ## Исходный запрос
@@ -474,7 +474,8 @@ async function summarizeTurnPrefix(ctx: ExtensionContext, messages: any[], signa
 - [Что нужно знать, чтобы понять сохранённую недавнюю часть]
 
 Сохраняй точные пути, команды, имена функций и сообщения ошибок. Выведи только summary.`;
-    return summarizeMessages(ctx, messages, instructions, undefined, maxTokens, signal, sources, guard);
+    const focusedInstructions = customInstructions ? `${instructions}\n\nДополнительный checkpoint-контекст и инструкции текущей операции:\n${customInstructions}` : instructions;
+    return summarizeMessages(ctx, messages, focusedInstructions, undefined, maxTokens, signal, sources, guard);
 }
 
 /** Генерирует русское summary для automatic/manual compaction; отказ всегда имеет явный исход. */
@@ -510,7 +511,7 @@ export async function russianCompaction(event: SessionBeforeCompactEvent, ctx: E
             else if (preparation.previousSummary && !hasLocalizedSummaryStructure(historyText, false) && !hasLocalizedPrefixStructure(historyText)) {
                 throw new SummaryFailure("invalid-response");
             }
-            const prefix = await summarizeTurnPrefix(ctx, preparation.turnPrefixMessages, event.signal, Math.min(Math.floor(preparation.settings.reserveTokens * 0.5), serviceMaxTokens > 0 ? serviceMaxTokens : Number.POSITIVE_INFINITY), sources, guard);
+            const prefix = await summarizeTurnPrefix(ctx, preparation.turnPrefixMessages, event.signal, Math.min(Math.floor(preparation.settings.reserveTokens * 0.5), serviceMaxTokens > 0 ? serviceMaxTokens : Number.POSITIVE_INFINITY), sources, event.customInstructions, guard);
             guard.validate();
             const prefixText = localizeSummaryStructure(prefix.text);
             if (!hasLocalizedPrefixStructure(prefixText))
