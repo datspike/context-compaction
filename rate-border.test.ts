@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { createRateBorder } from "./request-stage/rate-border.js";
 
 function setup() {
@@ -49,6 +50,58 @@ describe("rate border", () => {
 		border.setRate("ср. 65 / 48 ток/с");
 		expect(factory).toBe(previous);
 		expect(factory().render()[0]).toBe("──── foreign status ─────────────");
+		border.uninstall();
+		expect(factory).toBe(previous);
+	});
+
+	test("composes the inline slash editor without changing its input handling", () => {
+		class InlineSlashEditor extends CustomEditor {
+			override handleInput(data: string) { super.handleInput(data); }
+		}
+		const previous = (tui: any, theme: any, keys: any) => new InlineSlashEditor(tui, theme, keys);
+		let factory: any = previous;
+		const ui: any = { getEditorComponent: () => factory, setEditorComponent: (f: any) => { factory = f; } };
+		const border = createRateBorder();
+		border.install(ui);
+		const editor = factory({ terminal: { rows: 20 }, requestRender() {} }, { borderColor: (s: string) => s }, { matches: () => false });
+		border.setRate("ср. 65 / 48 ток/с");
+		editor.handleInput("x");
+		expect(editor.getText()).toBe("x");
+		expect(editor.embedWorkingStatus).toBe(true);
+		expect(editor.render(80)[0]).toContain("ср. 65 / 48 ток/с");
+		border.uninstall();
+		expect(factory).toBe(previous);
+	});
+
+	test("reinstalls after inline slash replaces the default factory", () => {
+		class InlineSlashEditor extends CustomEditor {}
+		const previous = (tui: any, theme: any, keys: any) => new InlineSlashEditor(tui, theme, keys);
+		let factory: any;
+		const ui: any = { getEditorComponent: () => factory, setEditorComponent: (f: any) => { factory = f; } };
+		const border = createRateBorder();
+		border.install(ui);
+		factory = previous;
+		border.install(ui);
+		const editor = factory({ terminal: { rows: 20 }, requestRender() {} }, { borderColor: (s: string) => s }, {});
+		border.setRate("ср. 65 / 48 ток/с");
+		expect(editor.render(80)[0]).toContain("ср. 65 / 48 ток/с");
+		border.uninstall();
+		expect(factory).toBe(previous);
+	});
+
+	test("does not modify an inline-named editor with its own rendering", () => {
+		class InlineSlashEditor extends CustomEditor {
+			override render(_width: number) { return ["──── foreign status ─────────────"]; }
+		}
+		const previous = (tui: any, theme: any, keys: any) => new InlineSlashEditor(tui, theme, keys);
+		let factory: any = previous;
+		const ui: any = { getEditorComponent: () => factory, setEditorComponent: (f: any) => { factory = f; } };
+		const border = createRateBorder();
+		border.install(ui);
+		const editor = factory({ terminal: { rows: 20 }, requestRender() {} }, { borderColor: (s: string) => s }, {});
+		border.setRate("ср. 65 / 48 ток/с");
+		expect(editor.render(80)[0]).toBe("──── foreign status ─────────────");
+		expect(editor.embedWorkingStatus).toBe(false);
 		border.uninstall();
 		expect(factory).toBe(previous);
 	});

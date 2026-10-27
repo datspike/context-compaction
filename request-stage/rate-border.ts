@@ -14,11 +14,20 @@ export function createRateBorder() {
 			if (installedFactory && ui.getEditorComponent?.() === installedFactory) { installedUi = ui; return; }
 			if (typeof ui.setEditorComponent !== "function" || typeof ui.getEditorComponent !== "function") return;
 			previousFactory = ui.getEditorComponent();
-			// A foreign editor owns its rendering contract; do not infer a border from its text.
-			if (previousFactory) return;
+			// Only the known inline-slash factory is composed; unrelated editors keep ownership.
+			if (previousFactory && !/\bnew\s+InlineSlashEditor\s*\(/.test(Function.prototype.toString.call(previousFactory))) return;
 			installedUi = ui;
+			const previous = previousFactory;
 			installedFactory = (tui, theme, keybindings) => {
-				const editor = new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
+				const editor = previous ? previous(tui, theme, keybindings) : new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
+				if (previous) {
+					const proto = Object.getPrototypeOf(editor);
+					const base = proto && Object.getPrototypeOf(proto);
+					if (proto?.constructor?.name !== "InlineSlashEditor" || base?.constructor?.name !== "CustomEditor"
+						|| Object.hasOwn(proto, "render") || Object.hasOwn(proto, "renderTopBorder")
+						|| !("embedWorkingStatus" in editor) || typeof (editor as any).setWorkingStatusIndicator !== "function") return editor;
+					try { (editor as any).embedWorkingStatus = true; } catch { return editor; }
+				}
 				const render = editor.render.bind(editor);
 				redraw = () => tui.requestRender();
 				editor.render = (width: number) => {

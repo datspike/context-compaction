@@ -43,7 +43,7 @@ export function createRequestStage(): RequestStage {
 	return {
 		observe(type, event, ctx) {
 			if (!tui(ctx)) return;
-			if (type === "session_start") border.install(ctx.ui);
+			if (type === "session_start" || type === "before_agent_start") border.install(ctx.ui);
 			controller.handle({ ...(event as object), type }, ctx);
 			border.setRate(controller.rateText());
 			if (type === "session_shutdown") border.uninstall();
