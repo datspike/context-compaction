@@ -12,12 +12,13 @@ export function createRateBorder() {
 	return {
 		install(ui: ExtensionContext["ui"]) {
 			if (installedFactory && ui.getEditorComponent?.() === installedFactory) { installedUi = ui; return; }
-			if (typeof ui.setEditorComponent !== "function") return;
-			previousFactory = ui.getEditorComponent?.();
+			if (typeof ui.setEditorComponent !== "function" || typeof ui.getEditorComponent !== "function") return;
+			previousFactory = ui.getEditorComponent();
+			// A foreign editor owns its rendering contract; do not infer a border from its text.
+			if (previousFactory) return;
 			installedUi = ui;
-			const previous = previousFactory;
 			installedFactory = (tui, theme, keybindings) => {
-				const editor = previous ? previous(tui, theme, keybindings) : new CustomEditor(tui, theme, keybindings);
+				const editor = new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
 				const render = editor.render.bind(editor);
 				redraw = () => tui.requestRender();
 				editor.render = (width: number) => {
@@ -27,10 +28,10 @@ export function createRateBorder() {
 					const labelWidth = visibleWidth(label);
 					const plain = lines[0].replace(/\x1b\[[0-9;]*m/g, "");
 					if (!plain.startsWith("─")) return lines;
-					const scroll = /↑\s*\d+\s+more/.exec(plain);
-					const scrollEnd = scroll ? visibleWidth(plain.slice(0, scroll.index + scroll[0].length)) : 1;
+					// Preserve both Pi's working status and its scroll indicator before adding the label.
+					const protectedWidth = Math.max(1, visibleWidth(plain.replace(/─+\s*$/, "").trimEnd()));
 					const remaining = width - labelWidth - 1;
-					if (remaining < scrollEnd) return lines;
+					if (remaining < protectedWidth) return lines;
 					lines[0] = `${truncateToWidth(lines[0], remaining, "")}${label}${editor.borderColor?.("─") ?? "─"}`;
 					return lines;
 				};
