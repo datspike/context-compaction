@@ -1,4 +1,3 @@
-import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import type { SummaryLanguage } from "./language.js";
 
@@ -82,7 +81,10 @@ export function checkpointParamsSchema(language: SummaryLanguage) {
 	return Type.Object({
 		mainObjective: Type.String({ description: en ? "The main user objective to continue after compaction." : "Главная цель пользователя, которую нужно продолжить после compact." }),
 		completedCheckpoint: Type.String({ description: en ? "Work already completed before compaction." : "Что уже завершено перед compact." }),
-		continuationMode: Type.Optional(StringEnum(["explicit_prompt", "plan_phase", "resume_existing_plan", "goal_loop", "auto_context_pressure"] as const)),
+		continuationMode: Type.Optional(Type.Union([
+			Type.Literal("explicit_prompt"), Type.Literal("plan_phase"), Type.Literal("resume_existing_plan"),
+			Type.Literal("goal_loop"), Type.Literal("auto_context_pressure"),
+		])),
 		continuationTarget: Type.String({ description: en ? "The next concrete step after compaction." : "Следующий конкретный шаг после compact." }),
 		planPath: Type.Optional(Type.String()),
 		currentPhase: Type.Optional(Type.String()),

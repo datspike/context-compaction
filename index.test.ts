@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { Check } from "typebox/value";
+import { checkpointParamsSchema, prepareArguments } from "./checkpoint.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -363,4 +365,19 @@ for (const change of ["none", "model", "route", "api", "fork", "tree", "pending"
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	expect(runtime.sent).toHaveLength(change === "none" ? 1 : 0);
 	expect(runtime.audits.filter((e) => e.data.phase === "send-attempted")).toHaveLength(change === "none" ? 1 : 0);
+});
+
+test("checkpoint schema preserves optional modes and legacy argument preparation in both languages", () => {
+	for (const language of ["ru", "en"] as const) {
+		const schema = checkpointParamsSchema(language);
+		expect(Check(schema, params)).toBe(true);
+		for (const continuationMode of ["explicit_prompt", "plan_phase", "resume_existing_plan", "goal_loop", "auto_context_pressure"]) {
+			expect(Check(schema, { ...params, continuationMode })).toBe(true);
+		}
+		expect(Check(schema, { ...params, continuationMode: "unknown" })).toBe(false);
+		expect(Check(schema, { ...params, continuationMode: null })).toBe(false);
+		const prepared = prepareArguments({ mainObjective: params.mainObjective, completedCheckpoint: params.completedCheckpoint, nextStep: params.continuationTarget });
+		expect(Check(schema, prepared)).toBe(true);
+		expect(prepared.continuationMode).toBeUndefined();
+	}
 });
