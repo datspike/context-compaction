@@ -1,3 +1,4 @@
+import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import { describe, expect, test } from "bun:test";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-responses";
 import { Type } from "typebox";
@@ -323,4 +324,75 @@ test("append setting is default-on, supports opt-out, and rejects ambiguous valu
 		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { appendCompaction: false } })); expect(loadSummarySettings(dir).appendCompaction).toBe(false);
 		writeFileSync(join(dir, "settings.json"), JSON.stringify({ contextCompaction: { appendCompaction: "true" } })); expect(() => loadSummarySettings(dir)).toThrow("contextCompaction.appendCompaction must be a boolean");
 	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+describe("compaction source projections", () => {
+  const factualText = "KEEP_PROJECTED_DECISION: retain the response fields.\n" + "KEEP_MIDDLE_EVIDENCE ".repeat(60) + "\nKEEP_PROJECTED_REASON: compatibility.";
+  const original = { role: "custom" as const, customType: "projection-fixture", display: false,
+    content: `EXCLUDED_SERVICE_BEGIN\n${factualText}\nEXCLUDED_SERVICE_END`, timestamp: 7 };
+  const projected = { ...original, content: factualText,
+    details: { compactionProjection: { version: 1, originalContent: original.content } } };
+
+  test("catalogs include complete projections with original ordinals and separate regions", () => {
+    const f = fixture();
+    const prefixOriginal = { ...original, content: "EXCLUDED_PREFIX_SERVICE\nKEEP_PREFIX_FACT", timestamp: 8 };
+    const prefix = { ...prefixOriginal, content: "KEEP_PREFIX_FACT",
+      details: { compactionProjection: { version: 1, originalContent: prefixOriginal.content } } };
+    f.event.preparation.messagesToSummarize = [projected];
+    f.event.preparation.turnPrefixMessages = [prefix];
+    const messages = [...f.messages, ...convertToLlm([original, prefixOriginal]), f.tail];
+    const before = JSON.stringify(messages);
+    const task = appendTask(messages, f.event)!;
+    expect(task).toBeDefined();
+    const catalogs = task.split("ИСТОРИЯ: ")[1].split("Предыдущая сводка");
+    const [history, early] = catalogs[0].split("РАННЯЯ ЧАСТЬ ХОДА: ");
+    expect(history).toContain(JSON.stringify({ ordinal: 3, role: "user", projection: true, text: factualText }));
+    expect(history).not.toContain("KEEP_PREFIX_FACT");
+    expect(early).toContain(JSON.stringify({ ordinal: 4, role: "user", projection: true, text: "KEEP_PREFIX_FACT" }));
+    expect(early).not.toContain("KEEP_PROJECTED_DECISION");
+    expect(task).not.toContain("EXCLUDED_SERVICE");
+    expect(task).not.toContain("EXCLUDED_PREFIX_SERVICE");
+    expect(task).toContain("используй только его, а не исходное сообщение из кэша");
+    expect(JSON.stringify(messages)).toBe(before);
+  });
+
+  test("identical cached messages still map to distinct history and early-turn positions", () => {
+    const f = fixture();
+    f.event.preparation.messagesToSummarize = [projected];
+    f.event.preparation.turnPrefixMessages = [projected];
+    const task = appendTask(convertToLlm([original, original]), f.event)!;
+    const sources = task.split("\n").filter(line => line.startsWith('{"ordinal":')).map(line => JSON.parse(line));
+    expect(sources.map(source => source.ordinal)).toEqual([1, 2]);
+    expect(sources.every(source => source.projection && source.text === factualText)).toBe(true);
+  });
+
+  test("unknown versions, malformed sources, and user metadata cannot alias a cached message", () => {
+    for (const projection of [undefined, null, {}, { version: 2, originalContent: original.content },
+      { version: 1, originalContent: 17 }, { version: 1, originalContent: "not in this cache" }]) {
+      const f = fixture();
+      f.event.preparation.messagesToSummarize = [{ ...projected, details: { compactionProjection: projection } }];
+      expect(appendTask(convertToLlm([original]), f.event)).toBeUndefined();
+    }
+    const f = fixture();
+    f.event.preparation.messagesToSummarize = [{ ...projected, role: "user" }];
+    expect(appendTask(convertToLlm([{ ...original, role: "user" }]), f.event)).toBeUndefined();
+    const unknown = { ...original, details: { compactionProjection: { version: 2, originalContent: "ignored" } } };
+    f.event.preparation.messagesToSummarize = [unknown];
+    expect(appendTask(convertToLlm([unknown]), f.event)).toBeDefined();
+  });
+
+  test("the actual append path succeeds with a projection without changing the original branch or payload", async () => {
+    const f = fixture();
+    f.branch.splice(1, 0, { type: "message", id: "projection", message: original });
+    f.event.preparation.messagesToSummarize = [f.branch[0].message, projected, f.progress];
+    const branchBefore = JSON.stringify(f.branch), payloadBefore = JSON.stringify(f.payload);
+    const result = await appendCompaction(f.event, f.ctx, f.snapshot);
+    expect(result.kind).toBe("success");
+    expect(f.calls()).toBe(1);
+    const task = f.submitted().messages.at(-1).content;
+    expect(task).toContain(JSON.stringify(factualText));
+    expect(task).not.toContain("EXCLUDED_SERVICE");
+    expect(JSON.stringify(f.branch)).toBe(branchBefore);
+    expect(JSON.stringify(f.payload)).toBe(payloadBefore);
+  });
 });
